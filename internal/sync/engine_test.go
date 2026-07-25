@@ -327,6 +327,192 @@ func TestSyncAllBaselinesSuccessfulSkipDespiteUnrelatedProviderFailure(t *testin
 	assert.Equal(t, path, ownership[0].FilePath)
 }
 
+func TestSyncAllWarmCodexSessionMissingFromIndexDoesNotRewrite(t *testing.T) {
+	database := openTestDB(t)
+	base := t.TempDir()
+	codexRoot := filepath.Join(base, "sessions")
+	dayDir := filepath.Join(codexRoot, "2026", "07", "24")
+	require.NoError(t, os.MkdirAll(dayDir, 0o755))
+
+	const uuid = "11111111-2222-4333-8444-555555555555"
+	path := filepath.Join(
+		dayDir, "rollout-2026-07-24T12-00-00-"+uuid+".jsonl",
+	)
+	require.NoError(t, os.WriteFile(path, []byte(testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			uuid, "/workspace/project", "user", "2026-07-24T12:00:00Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "keep this session stable", "2026-07-24T12:00:01Z",
+		),
+	)), 0o600))
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+
+	indexPath := filepath.Join(base, parser.CodexSessionIndexFilename)
+	require.NoError(t, os.WriteFile(indexPath, []byte(
+		`{"id":"`+uuid+`","thread_name":"Persisted title"}`+"\n",
+	), 0o600))
+	indexTime := info.ModTime().Add(time.Second)
+	require.NoError(t, os.Chtimes(indexPath, indexTime, indexTime))
+	require.Equal(t, "Persisted title",
+		parser.LookupCodexThreadName(path, uuid))
+
+	newEngine := func() *Engine {
+		return NewEngine(database, EngineConfig{
+			AgentDirs: map[parser.AgentType][]string{
+				parser.AgentCodex: {codexRoot},
+			},
+			Machine: "local",
+		})
+	}
+	engine := newEngine()
+	first := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, first.Synced)
+	engine.Close()
+
+	// session_index.jsonl is a rolling index. Aging an unchanged session out
+	// is not a title deletion signal: the prior title remains authoritative.
+	require.NoError(t, os.WriteFile(indexPath, []byte(
+		`{"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","thread_name":"Other"}`+"\n",
+	), 0o600))
+	indexTime = indexTime.Add(time.Second)
+	require.NoError(t, os.Chtimes(indexPath, indexTime, indexTime))
+	parser.EvictCodexSessionIndex(indexPath)
+
+	engine = newEngine()
+	agedOut := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, agedOut.Synced,
+		"aging out of the rolling index must not rewrite an unchanged transcript")
+	engine.Close()
+
+	engine = newEngine()
+	warm := engine.SyncAll(t.Context(), nil)
+	assert.Zero(t, warm.Synced,
+		"a second unchanged startup sync must produce zero writes")
+	engine.Close()
+
+	storedName, found, err := database.GetSessionName(
+		t.Context(), "codex:"+uuid,
+	)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "Persisted title", storedName)
+
+	// An unreadable index is not evidence that the UUID aged out. Preserve the
+	// conservative reparse path until a successful index read can prove absence.
+	require.NoError(t, os.Remove(indexPath))
+	require.NoError(t, os.Mkdir(indexPath, 0o700))
+	indexTime = indexTime.Add(time.Second)
+	require.NoError(t, os.Chtimes(indexPath, indexTime, indexTime))
+	parser.EvictCodexSessionIndex(indexPath)
+
+	engine = newEngine()
+	unreadableIndex := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, unreadableIndex.Synced,
+		"an unreadable rolling index must retain conservative refresh behavior")
+	engine.Close()
+	require.NoError(t, os.Remove(indexPath))
+
+	appendFile, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = appendFile.WriteString(testjsonl.CodexMsgJSON(
+		"assistant", "new appended reply", "2026-07-24T12:00:02Z",
+	) + "\n")
+	require.NoError(t, err)
+	require.NoError(t, appendFile.Close())
+
+	engine = newEngine()
+	appended := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, appended.Synced,
+		"a Codex transcript append must still update its stored session")
+	engine.Close()
+
+	stored, err := database.GetSession(t.Context(), "codex:"+uuid)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, 2, stored.MessageCount)
+}
+
+func TestSyncAllWarmGeminiSessionDoesNotRewrite(t *testing.T) {
+	database := openTestDB(t)
+	root := t.TempDir()
+	const sessionID = "11111111-2222-4333-8444-555555555555"
+	path := filepath.Join(
+		root, "tmp", "project-alias", "chats",
+		"session-2026-07-24T12-00-"+sessionID+".json",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.NoError(t, os.WriteFile(path, []byte(testjsonl.GeminiSessionJSON(
+		sessionID,
+		"project-alias",
+		"2026-07-24T12:00:00Z",
+		"2026-07-24T12:00:01Z",
+		[]map[string]any{
+			testjsonl.GeminiUserMsg(
+				"user-1", "2026-07-24T12:00:00Z", "stable prompt",
+			),
+			testjsonl.GeminiAssistantMsg(
+				"assistant-1", "2026-07-24T12:00:01Z", "stable reply", nil,
+			),
+		},
+	)), 0o600))
+
+	newEngine := func() *Engine {
+		return NewEngine(database, EngineConfig{
+			AgentDirs: map[parser.AgentType][]string{
+				parser.AgentGemini: {root},
+			},
+			Machine: "local",
+		})
+	}
+	engine := newEngine()
+	first := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, first.Synced)
+	engine.Close()
+
+	engine = newEngine()
+	warm := engine.SyncAll(t.Context(), nil)
+	assert.Zero(t, warm.Synced,
+		"an unchanged Gemini source must produce zero writes after restart")
+	assert.Positive(t, warm.Skipped)
+	engine.Close()
+
+	stored, err := database.GetSession(t.Context(), "gemini:"+sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, 2, stored.MessageCount)
+
+	require.NoError(t, os.WriteFile(path, []byte(testjsonl.GeminiSessionJSON(
+		sessionID,
+		"project-alias",
+		"2026-07-24T12:00:00Z",
+		"2026-07-24T12:00:02Z",
+		[]map[string]any{
+			testjsonl.GeminiUserMsg(
+				"user-1", "2026-07-24T12:00:00Z", "stable prompt",
+			),
+			testjsonl.GeminiAssistantMsg(
+				"assistant-1", "2026-07-24T12:00:01Z", "stable reply", nil,
+			),
+			testjsonl.GeminiUserMsg(
+				"user-2", "2026-07-24T12:00:02Z", "genuine source change",
+			),
+		},
+	)), 0o600))
+
+	engine = newEngine()
+	changed := engine.SyncAll(t.Context(), nil)
+	require.Equal(t, 1, changed.Synced,
+		"a genuine Gemini source edit must still sync")
+	engine.Close()
+
+	stored, err = database.GetSession(t.Context(), "gemini:"+sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, 3, stored.MessageCount)
+}
+
 func TestReconcileWatchRootsAfterLostEventsBaselinesParsedSourceOnce(t *testing.T) {
 	database := openTestDB(t)
 	claudeRoot := filepath.Join(t.TempDir(), "claude")

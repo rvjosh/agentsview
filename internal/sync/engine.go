@@ -8868,7 +8868,23 @@ func (e *Engine) codexIndexSessionNameChanged(path string) bool {
 	if uuid == "" {
 		return false
 	}
-	currentName := parser.LookupCodexThreadName(path, uuid)
+	indexPath := parser.CodexSessionIndexPath(path)
+	if indexPath == "" {
+		return false
+	}
+	indexTitles := parser.CodexSessionIndexTitles(indexPath)
+	if indexTitles == nil {
+		// Preserve the conservative legacy behavior when the index cannot be
+		// read. Only a successful read can prove that a UUID aged out.
+		return true
+	}
+	currentName, indexed := indexTitles[uuid]
+	if !indexed {
+		// session_index.jsonl is a rolling index. Older transcripts age out
+		// while their stored title remains valid, so absence is not a title
+		// deletion signal and must not permanently invalidate DB freshness.
+		return false
+	}
 	storedName, found, err := e.db.GetSessionName(
 		context.Background(), e.idPrefix+"codex:"+uuid,
 	)
