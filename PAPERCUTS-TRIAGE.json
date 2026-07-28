@@ -1,4 +1,21 @@
 {
   "version": 2,
-  "groups": []
+  "groups": [
+    {
+      "id": "AV-001",
+      "title": "Focused Go checks did not restore required embedded artifacts",
+      "status": "already-resolved",
+      "entries": [1],
+      "owner": "agentsview Go verification",
+      "evidence": "Current Makefile routes Go-compiling test, vet, lint, benchmark, build, and release targets through pricing-snapshot; the required internal/pricing/snapshot/litellm_snapshot.json.gz is present in this checkout."
+    },
+    {
+      "id": "AV-002",
+      "title": "API client generation produces incompatible tracked drift",
+      "status": "open",
+      "entries": [2, 3],
+      "owner": "agentsview frontend code generation",
+      "note": "Generation changed required request arguments and left tracked generated files needing exact restoration; reconcile the generator output with current call sites before making generate:api part of verification."
+    }
+  ]
 }
