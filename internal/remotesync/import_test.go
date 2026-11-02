@@ -5,17 +5,19 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
@@ -45,10 +47,12 @@ func TestPreparedHTTPSyncRebuildContributor(t *testing.T) {
 	}
 	mtime := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
 	manifest := Manifest{Files: []ManifestEntry{
-		{Path: remoteFile, Size: int64(len(sessionBody)), MtimeNS: mtime.UnixNano()},
 		{Path: skippedFile, Size: int64(len(usageBody)), MtimeNS: mtime.UnixNano()},
+		{Path: remoteFile, Size: int64(len(sessionBody)), MtimeNS: mtime.UnixNano()},
 	}}
 	archive := func(t *testing.T) []byte {
+		t.Helper()
+
 		t.Helper()
 		var buf bytes.Buffer
 		tw := tar.NewWriter(&buf)
@@ -72,7 +76,7 @@ func TestPreparedHTTPSyncRebuildContributor(t *testing.T) {
 	require.NoError(t, err)
 	manifestJSON, err := json.Marshal(manifest)
 	require.NoError(t, err)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newCurrentProtocolServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/remote-sync/targets":
 			w.Header().Set("Content-Type", "application/json")
@@ -89,55 +93,63 @@ func TestPreparedHTTPSyncRebuildContributor(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	database, err := db.Open(filepath.Join(t.TempDir(), "active.db"))
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "active.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
-	require.NoError(t, database.ReplaceRemoteSkippedFiles("devbox", map[string]int64{
+	require.NoError(t, database.ReplaceRemoteSkippedFiles(t.Context(), "devbox", map[string]int64{
 		remoteFile: mtime.UnixNano(),
 	}))
-	hs := HTTPSync{
-		Host: "devbox", URL: server.URL, DataDir: t.TempDir(), DB: database,
+	hs := RemoteSync{
+		Host: "devbox", Source: HTTPSource{URL: server.URL}, DataDir: t.TempDir(), DB: database,
 	}
-	prepared, err := hs.Prepare(context.Background())
+	prepared, err := hs.Prepare(t.Context())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, prepared.Close()) })
 	assert.FileExists(t, remappedRemotePath(prepared.Root(), remoteFile))
-	contributor, err := prepared.RebuildContributor()
+	contributor, err := prepared.RebuildContributor(t.Context())
 	require.NoError(t, err)
 
-	localEngine := syncpkg.NewEngine(database, syncpkg.EngineConfig{})
+	localEngine := syncpkg.NewEngine(t.Context(), database, syncpkg.EngineConfig{})
 	t.Cleanup(localEngine.Close)
 	stats, err := localEngine.ResyncAllWithOptions(
-		context.Background(), nil,
+		t.Context(), nil,
 		syncpkg.RebuildOptions{Contributors: []syncpkg.RebuildContributor{contributor}},
 	)
 	require.NoError(t, err)
 	assert.False(t, stats.Aborted)
+	journalPath := mirrorJournalPath(MirrorDir(hs.DataDir, hs.Host))
+	assert.FileExists(t, journalPath,
+		"AfterSync runs before swap and must retain the journal")
+	require.NotNil(t, prepared.mirrorImport)
+	assert.Equal(t, JournalPendingSwap, prepared.mirrorImport.outcome)
+	require.NoError(t, prepared.Commit())
+	assert.NoFileExists(t, journalPath)
+	require.NoError(t, prepared.Commit(), "post-swap commit is idempotent")
 
-	full, err := database.GetSessionFull(context.Background(), "devbox~"+sessionID)
+	full, err := database.GetSessionFull(t.Context(), "devbox~"+sessionID)
 	require.NoError(t, err)
 	require.NotNil(t, full)
 	assert.Equal(t, "devbox", full.Machine)
 	require.NotNil(t, full.FilePath)
 	assert.Equal(t, "devbox:"+remoteFile, *full.FilePath)
 	messages, err := database.GetMessages(
-		context.Background(), "devbox~"+sessionID, 0, 10, true,
+		t.Context(), "devbox~"+sessionID, 0, 10, true,
 	)
 	require.NoError(t, err)
 	require.Len(t, messages, 1)
 	assert.Equal(t, "remote rebuild searchable", messages[0].Content)
-	search, err := database.SearchContent(context.Background(), db.ContentSearchFilter{
+	search, err := database.SearchContent(t.Context(), db.ContentSearchFilter{
 		Pattern: "searchable", Limit: 10, IncludeOneShot: true,
 	})
 	require.NoError(t, err)
 	require.Len(t, search.Matches, 1)
 	assert.Equal(t, "devbox~"+sessionID, search.Matches[0].SessionID)
-	remoteCache, err := database.LoadRemoteSkippedFiles("devbox")
+	remoteCache, err := database.LoadRemoteSkippedFiles(t.Context(), "devbox")
 	require.NoError(t, err)
 	require.Len(t, remoteCache, 1)
 	for cachedPath := range remoteCache {
 		assert.True(t, strings.HasPrefix(
-			cachedPath, skippedFile+"?source_hash=",
+			cachedPath, skippedFile+"?agent=claude?source_hash=",
 		), "rowless Claude skips must persist their content hash")
 	}
 	assert.NotContains(t, remoteCache, remoteFile,
@@ -146,10 +158,89 @@ func TestPreparedHTTPSyncRebuildContributor(t *testing.T) {
 	prepared.targets = TargetSet{Dirs: map[parser.AgentType][]string{
 		parser.AgentClaude: {skippedDir},
 	}}
-	activeStats, err := prepared.ImportActive(context.Background())
+	activeStats, err := prepared.ImportActive(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, 0, activeStats.Failed)
-	assert.Equal(t, 1, activeStats.Skipped)
+	assert.Equal(t, 0, activeStats.Skipped,
+		"reusing a prepared bootstrap import must preserve its full-parse scope")
+}
+
+func TestPreparedHTTPSyncRebuildOutcomeClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		err          error
+		cachePersist bool
+		want         JournalOutcome
+	}{
+		{name: "cancelled", err: context.Canceled, want: JournalCancelled},
+		{name: "cache persistence", cachePersist: true, want: JournalCachePersistFailed},
+		{name: "processing", err: errors.New("processing sentinel"), want: JournalProcessingFailures},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := newMirrorTestRemote(t)
+			remote.writeSession(t, "session.jsonl",
+				time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC), "rebuild outcome")
+			database, hs := newMirrorSync(t, remote, t.TempDir())
+			prepared, err := hs.Prepare(t.Context())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, prepared.Close()) })
+			contributor, err := prepared.RebuildContributor(t.Context())
+			require.NoError(t, err)
+
+			outcomeErr := tc.err
+			if tc.cachePersist {
+				engine := syncpkg.NewEngine(t.Context(), database, syncpkg.EngineConfig{})
+				t.Cleanup(engine.Close)
+				replacement, openErr := db.Open(t.Context(), filepath.Join(t.TempDir(), "replacement.db"))
+				require.NoError(t, openErr)
+				require.NoError(t, replacement.Close())
+				outcomeErr = contributor.AfterSync(engine, replacement)
+				require.Error(t, outcomeErr)
+			}
+			contributor.Finished(syncpkg.SyncStats{}, outcomeErr)
+			assert.Equal(t, tc.want, prepared.mirrorImport.outcome)
+			assert.Equal(t, tc.want, prepared.mirrorImport.pending.Stats.JournalOutcome)
+		})
+	}
+}
+
+func TestPreparedHTTPSyncDeferredRebuildIsNotCommitReady(t *testing.T) {
+	remote := newMirrorTestRemote(t)
+	remote.writeSession(t, "session.jsonl",
+		time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC), "deferred rebuild")
+	_, hs := newMirrorSync(t, remote, t.TempDir())
+	prepared, err := hs.Prepare(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, prepared.Close()) })
+	contributor, err := prepared.RebuildContributor(t.Context())
+	require.NoError(t, err)
+
+	contributor.Finished(syncpkg.SyncStats{Deferred: 1}, nil)
+	assert.False(t, prepared.commitReady)
+	assert.Equal(t, JournalProcessingFailures, prepared.mirrorImport.outcome)
+	require.ErrorContains(t, prepared.Commit(), "not ready to commit")
+	assert.FileExists(t, mirrorJournalPath(MirrorDir(hs.DataDir, hs.Host)))
+}
+
+func TestPreparedHTTPSyncRebuildRetirementFailureRecordsDuration(t *testing.T) {
+	remote := newMirrorTestRemote(t)
+	remote.writeSession(t, "session.jsonl",
+		time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC), "rebuild retirement")
+	_, hs := newMirrorSync(t, remote, t.TempDir())
+	prepared, err := hs.Prepare(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, prepared.Close()) })
+	prepared.commitReady = true
+	synctest.Test(t, func(t *testing.T) {
+		prepared.retireJournal = func(string) error {
+			time.Sleep(time.Second)
+			return errors.New("retirement sentinel")
+		}
+
+		require.ErrorContains(t, prepared.Commit(), "retirement sentinel")
+		assert.Equal(t, JournalRetirementFailed, prepared.mirrorImport.outcome)
+		assert.Equal(t, time.Second, prepared.mirrorImport.pending.Stats.RetirementDuration)
+	})
 }
 
 func TestPreparedHTTPSyncImportActiveImportsPreparedRoot(t *testing.T) {
@@ -158,24 +249,24 @@ func TestPreparedHTTPSyncImportActiveImportsPreparedRoot(t *testing.T) {
 		time.Date(2026, 7, 8, 10, 0, 0, 0, time.UTC), "prepared import")
 	database, hs := newMirrorSync(t, remote, t.TempDir())
 
-	prepared, err := hs.Prepare(context.Background())
+	prepared, err := hs.Prepare(t.Context())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, prepared.Close()) })
-	before, err := database.ListSessions(context.Background(), db.SessionFilter{Limit: 10})
+	before, err := database.ListSessions(t.Context(), db.SessionFilter{Limit: 10})
 	require.NoError(t, err)
 	assert.Empty(t, before.Sessions, "Prepare must not import active sessions")
 
-	stats, err := prepared.ImportActive(context.Background())
+	stats, err := prepared.ImportActive(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.SessionsSynced)
-	after, err := database.ListSessions(context.Background(), db.SessionFilter{Limit: 10})
+	after, err := database.ListSessions(t.Context(), db.SessionFilter{Limit: 10})
 	require.NoError(t, err)
 	require.Len(t, after.Sessions, 1)
 	assert.Equal(t, "devbox", after.Sessions[0].Machine)
 }
 
 func TestImporterImportsExtractedRemoteFiles(t *testing.T) {
-	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
 
@@ -193,7 +284,7 @@ func TestImporterImportsExtractedRemoteFiles(t *testing.T) {
 	stats, err := Importer{
 		Host: "devbox",
 		DB:   database,
-	}.ImportExtracted(context.Background(), TargetSet{
+	}.ImportExtracted(t.Context(), TargetSet{
 		Dirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {remoteDir},
 		},
@@ -201,19 +292,296 @@ func TestImporterImportsExtractedRemoteFiles(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.SessionsSynced)
-	page, err := database.ListSessions(context.Background(), db.SessionFilter{Limit: 10})
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{Limit: 10})
 	require.NoError(t, err)
 	require.Len(t, page.Sessions, 1)
 	assert.Equal(t, "devbox", page.Sessions[0].Machine)
-	full, err := database.GetSessionFull(context.Background(), page.Sessions[0].ID)
+	full, err := database.GetSessionFull(t.Context(), page.Sessions[0].ID)
 	require.NoError(t, err)
 	require.NotNil(t, full)
 	require.NotNil(t, full.FilePath)
 	assert.Contains(t, *full.FilePath, "devbox:/home/wes/.claude/projects/test-project/session.jsonl")
 }
 
+func TestImporterAppliesDBOwnedToolResultImagePolicy(t *testing.T) {
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	database.SetToolResultImages(config.ToolResultImagesDrop)
+
+	extracted := t.TempDir()
+	remoteRoot := "/home/remote/.codex/sessions"
+	const sessionUUID = "019eb791-cf7d-75c1-8439-9ed74c1229f6"
+	localDir := filepath.Join(
+		remappedRemotePath(extracted, remoteRoot), "2024", "01", "01",
+	)
+	require.NoError(t, os.MkdirAll(localDir, 0o755))
+	imageContent := `[{
+  "type":"input_image",
+  "image_url":"data:image/png;base64,AAEC"
+}]`
+	transcript := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON(
+			sessionUUID, "/work", "codex", "2024-01-01T00:00:00Z",
+		),
+		testjsonl.CodexMsgJSON(
+			"user", "show the image", "2024-01-01T00:00:01Z",
+		),
+		testjsonl.CodexFunctionCallWithCallIDJSON(
+			"Read", "call_image", map[string]string{
+				"file_path": "image.png",
+			}, "2024-01-01T00:00:02Z",
+		),
+		testjsonl.CodexFunctionCallOutputJSON(
+			"call_image", imageContent, "2024-01-01T00:00:03Z",
+		),
+	)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(
+			localDir,
+			"rollout-2024-01-01T10-00-00-"+sessionUUID+".jsonl",
+		),
+		[]byte(transcript), 0o644,
+	))
+
+	stats, err := (Importer{Host: "devbox", DB: database}).ImportExtracted(
+		t.Context(), TargetSet{Dirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {remoteRoot},
+		}}, extracted,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.SessionsSynced)
+
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, page.Sessions, 1)
+	messages, err := database.GetAllMessages(
+		t.Context(), page.Sessions[0].ID,
+	)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	require.Len(t, messages[1].ToolCalls, 1)
+	call := messages[1].ToolCalls[0]
+	require.Len(t, call.ResultEvents, 1)
+	assert.Contains(t, call.ResultContent, "agentsview_image")
+	assert.NotContains(t, call.ResultContent, "input_image")
+	assert.Contains(t, call.ResultEvents[0].Content, "agentsview_image")
+	assert.NotContains(t, call.ResultEvents[0].Content, "input_image")
+}
+
+func TestImporterHonorsUsageOnlyStorageBoundary(t *testing.T) {
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	database.SetArchiveContent(config.ArchiveContentUsage)
+
+	extracted := t.TempDir()
+	remoteDir := "/home/remote-user/.claude/projects"
+	localDir := filepath.Join(
+		extracted, "home", "remote-user", ".claude", "projects", "private-project",
+	)
+	require.NoError(t, os.MkdirAll(localDir, 0o755))
+	const sessionID = "usage-only-remote"
+	body := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithSessionID(
+			"2026-08-31T10:00:00Z", "private remote prompt", sessionID,
+		).
+		AddClaudeAssistantUsage(
+			"2026-08-31T10:00:01Z", "private remote response",
+			testjsonl.ClaudeAssistantUsage{
+				MessageID: "message-id", RequestID: "request-id",
+				Model: "claude-sonnet-4-6", InputTokens: 100, OutputTokens: 20,
+			},
+		).
+		String()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(localDir, "session.jsonl"), []byte(body), 0o600,
+	))
+
+	stats, err := (Importer{Host: "remote-host", DB: database}).ImportExtracted(
+		t.Context(), TargetSet{Dirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {remoteDir},
+		}}, extracted,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.SessionsSynced)
+
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, page.Sessions, 1)
+	stored, err := database.GetSessionFull(t.Context(), page.Sessions[0].ID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Nil(t, stored.FirstMessage)
+	assert.Nil(t, stored.DisplayName)
+	assert.Nil(t, stored.SessionName)
+	messages, err := database.GetAllMessages(t.Context(), stored.ID)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	assert.Equal(t, "assistant", messages[0].Role)
+	assert.Empty(t, messages[0].Content)
+	assert.Empty(t, messages[0].ToolCalls)
+}
+
+func TestRequireCompleteRejectsDeferredWithoutHardFailure(t *testing.T) {
+	err := requireCompleteProcessing(syncpkg.SyncStats{Deferred: 1})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed=0")
+	assert.Contains(t, err.Error(), "deferred=1")
+}
+
+func TestImporterHydratesIcodematePersistedToolResult(t *testing.T) {
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	extracted := t.TempDir()
+	remoteRoot := "/remote/icodemate/projects"
+	remoteSession := remoteRoot + "/project/sidecar.jsonl"
+	remoteResult := remoteRoot + "/project/sidecar/tool-results/output.txt"
+	localSession := remappedRemotePath(extracted, remoteSession)
+	localResult := remappedRemotePath(extracted, remoteResult)
+	require.NoError(t, os.MkdirAll(filepath.Dir(localResult), 0o755))
+	require.NoError(t, os.WriteFile(localResult, []byte("remote persisted output\n"), 0o644))
+
+	persistedPath, err := json.Marshal(remoteResult)
+	require.NoError(t, err)
+	placeholder := "<persisted-output>\nOutput too large. Full output saved to: " +
+		remoteResult + "\n</persisted-output>"
+	placeholderJSON, err := json.Marshal(placeholder)
+	require.NoError(t, err)
+	transcript := strings.Join([]string{
+		`{"type":"user","timestamp":"2024-01-01T00:00:00Z","uuid":"u1","message":{"content":"run it"}}`,
+		`{"type":"assistant","timestamp":"2024-01-01T00:00:01Z","uuid":"a1","parentUuid":"u1","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"make logs"}}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T00:00:02Z","uuid":"u2","parentUuid":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":` + string(placeholderJSON) + `}]},"toolUseResult":{"persistedOutputPath":` + string(persistedPath) + `}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(localSession, []byte(transcript), 0o644))
+
+	stats, err := Importer{Host: "devbox", DB: database}.ImportExtracted(
+		t.Context(), TargetSet{Dirs: map[parser.AgentType][]string{
+			parser.AgentIcodemate: {remoteRoot},
+		}}, extracted,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, stats.SessionsSynced)
+	messages, err := database.GetMessages(
+		t.Context(), "devbox~icodemate:sidecar", 0, 10, true,
+	)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	require.Len(t, messages[1].ToolCalls, 1)
+	assert.Equal(t, "remote persisted output\n",
+		messages[1].ToolCalls[0].ResultContent)
+}
+
+func TestImporterReturnsPartialStatsWhenOneSourceFails(t *testing.T) {
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	extracted := t.TempDir()
+	claudeRoot := "/remote/claude"
+	claudeDir := filepath.Join(remappedRemotePath(extracted, claudeRoot), "project")
+	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(claudeDir, "healthy.jsonl"),
+		[]byte(testjsonl.NewSessionBuilder().AddClaudeUserWithSessionID(
+			"2026-08-15T10:00:00Z", "healthy remote source", "healthy",
+		).String()),
+		0o644,
+	))
+	qwenPawRoot := "/remote/qwenpaw"
+	qwenPawDir := filepath.Join(
+		remappedRemotePath(extracted, qwenPawRoot), "default", "sessions",
+	)
+	require.NoError(t, os.MkdirAll(qwenPawDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(qwenPawDir, "broken.json"), []byte("{not valid json"), 0o644,
+	))
+
+	stats, err := Importer{Host: "devbox", DB: database}.ImportExtracted(
+		t.Context(), TargetSet{Dirs: map[parser.AgentType][]string{
+			parser.AgentClaude:  {claudeRoot},
+			parser.AgentQwenPaw: {qwenPawRoot},
+		}}, extracted,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.SessionsSynced)
+	assert.Positive(t, stats.Failed)
+	session, err := database.GetSession(t.Context(), "devbox~healthy")
+	require.NoError(t, err)
+	assert.NotNil(t, session)
+}
+
+func TestImporterImportsEveryRemoteProviderTarget(t *testing.T) {
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+
+	extracted := t.TempDir()
+	claudeRoot := "/remote/claude"
+	claudeDir := filepath.Join(
+		remappedRemotePath(extracted, claudeRoot), "project",
+	)
+	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(claudeDir, "enabled.jsonl"),
+		[]byte(testjsonl.NewSessionBuilder().
+			AddClaudeUserWithSessionID(
+				"2026-08-09T10:00:00Z", "enabled remote", "enabled-remote",
+			).
+			String()),
+		0o644,
+	))
+
+	geminiRoot := "/remote/gemini"
+	geminiDir := filepath.Join(
+		remappedRemotePath(extracted, geminiRoot),
+		"tmp", "project", "chats",
+	)
+	require.NoError(t, os.MkdirAll(geminiDir, 0o755))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(geminiDir,
+			"session-2026-08-09T10-00-disabled-remote.json"),
+		[]byte(testjsonl.GeminiSessionJSON(
+			"disabled-remote",
+			"project",
+			"2026-08-09T10:00:00Z",
+			"2026-08-09T10:01:00Z",
+			[]map[string]any{
+				testjsonl.GeminiUserMsg(
+					"user", "2026-08-09T10:00:00Z", "disabled remote",
+				),
+			},
+		)),
+		0o644,
+	))
+
+	stats, err := Importer{
+		Host: "devbox",
+		DB:   database,
+	}.ImportExtracted(t.Context(), TargetSet{
+		Dirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {claudeRoot},
+			parser.AgentGemini: {geminiRoot},
+		},
+	}, extracted)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, stats.SessionsSynced)
+	page, err := database.ListSessions(t.Context(), db.SessionFilter{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, page.Sessions, 2)
+	ids := []string{page.Sessions[0].ID, page.Sessions[1].ID}
+	assert.ElementsMatch(t, []string{
+		"devbox~enabled",
+		"devbox~gemini:disabled-remote",
+	}, ids)
+}
+
 func TestImporterImportsHermesDatabaseOnlySession(t *testing.T) {
-	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
 
@@ -230,7 +598,7 @@ func TestImporterImportsHermesDatabaseOnlySession(t *testing.T) {
 	stats, err := Importer{
 		Host: "devbox",
 		DB:   database,
-	}.ImportExtracted(context.Background(), TargetSet{
+	}.ImportExtracted(t.Context(), TargetSet{
 		Dirs: map[parser.AgentType][]string{
 			parser.AgentHermes: {remoteSessionsDir},
 		},
@@ -239,7 +607,7 @@ func TestImporterImportsHermesDatabaseOnlySession(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.SessionsSynced)
 	session, err := database.GetSession(
-		context.Background(), "devbox~hermes:database-only",
+		t.Context(), "devbox~hermes:database-only",
 	)
 	require.NoError(t, err)
 	require.NotNil(t, session)
@@ -257,7 +625,7 @@ func writeHermesImportStateDB(t *testing.T, path string) {
 	require.NoError(t, err)
 	defer func() { require.NoError(t, stateDB.Close()) }()
 
-	_, err = stateDB.Exec(`
+	_, err = stateDB.ExecContext(t.Context(), `
 		CREATE TABLE sessions (
 			id TEXT PRIMARY KEY,
 			source TEXT NOT NULL,
@@ -313,13 +681,14 @@ func writeHermesImportStateDB(t *testing.T, path string) {
 // WAL-only metadata update must invalidate the skip entry even though the main
 // state.db file remains unchanged.
 func TestImporterMapsHermesStateDBExtraFileAndRefreshesWALChanges(t *testing.T) {
-	database, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "test.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, database.Close()) })
 
+	const root = "/srv/hermes/profile"
 	extracted := t.TempDir()
-	remoteSessionsDir := "/home/remote/.hermes/profiles/research/sessions"
-	remoteStateDB := "/home/remote/.hermes/profiles/research/state.db"
+	remoteSessionsDir := root + "/sessions"
+	remoteStateDB := root + "/state.db"
 	localStateDB := remappedRemotePath(extracted, remoteStateDB)
 	require.NoError(t, os.MkdirAll(filepath.Dir(localStateDB), 0o755))
 	require.NoError(t, os.MkdirAll(
@@ -339,17 +708,17 @@ func TestImporterMapsHermesStateDBExtraFileAndRefreshesWALChanges(t *testing.T) 
 	stats, err := Importer{
 		Host: "devbox",
 		DB:   database,
-	}.ImportExtracted(context.Background(), targets, extracted)
+	}.ImportExtracted(t.Context(), targets, extracted)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.SessionsSynced)
 
 	full, err := database.GetSessionFull(
-		context.Background(), "devbox~hermes:database-only",
+		t.Context(), "devbox~hermes:database-only",
 	)
 	require.NoError(t, err)
 	require.NotNil(t, full)
 	require.NotNil(t, full.FilePath)
-	assert.Equal(t, "devbox:"+remoteStateDB, *full.FilePath,
+	assert.Equal(t, "devbox:"+remoteStateDB+"#database-only", *full.FilePath,
 		"state.db extra file must map to its original remote path")
 	assert.NotContains(t, *full.FilePath, extracted,
 		"the import must not leak the local extraction dir into FilePath")
@@ -362,23 +731,23 @@ func TestImporterMapsHermesStateDBExtraFileAndRefreshesWALChanges(t *testing.T) 
 	second, err := Importer{
 		Host: "devbox",
 		DB:   database,
-	}.ImportExtracted(context.Background(), targets, extracted)
+	}.ImportExtracted(t.Context(), targets, extracted)
 	require.NoError(t, err)
 	assert.Zero(t, second.SessionsSynced,
 		"unchanged state.db must not re-sync on the second import")
 
-	remoteCache, err := database.LoadRemoteSkippedFiles("devbox")
+	remoteCache, err := database.LoadRemoteSkippedFiles(t.Context(), "devbox")
 	require.NoError(t, err)
 	require.NotEmpty(t, remoteCache,
 		"the state.db skip entry must survive the import, not be discarded")
-	_, ok := remoteCache[remoteStateDB]
+	_, ok := remoteCache[remoteStateDB+"#database-only?agent=hermes"]
 	assert.True(t, ok,
 		"skip cache must key the state.db entry by its remote path, got %v",
 		remoteCache)
 
 	stateBefore, err := os.Stat(localStateDB)
 	require.NoError(t, err)
-	_, err = writer.Exec(`
+	_, err = writer.ExecContext(t.Context(), `
 		UPDATE sessions
 		SET title = 'WAL-refreshed profile'
 		WHERE id = 'database-only'
@@ -397,12 +766,12 @@ func TestImporterMapsHermesStateDBExtraFileAndRefreshesWALChanges(t *testing.T) 
 	changed, err := Importer{
 		Host: "devbox",
 		DB:   database,
-	}.ImportExtracted(context.Background(), targets, extracted)
+	}.ImportExtracted(t.Context(), targets, extracted)
 	require.NoError(t, err)
 	assert.Equal(t, 1, changed.SessionsSynced,
 		"a WAL-only commit must invalidate the remote archive skip entry")
 	refreshed, err := database.GetSession(
-		context.Background(), "devbox~hermes:database-only",
+		t.Context(), "devbox~hermes:database-only",
 	)
 	require.NoError(t, err)
 	require.NotNil(t, refreshed)
@@ -412,15 +781,16 @@ func TestImporterMapsHermesStateDBExtraFileAndRefreshesWALChanges(t *testing.T) 
 
 func openHermesImportWALWriter(t *testing.T, stateDB string) *sql.DB {
 	t.Helper()
+
 	writer, err := sql.Open("sqlite3", stateDB)
 	require.NoError(t, err)
 	writer.SetMaxOpenConns(1)
 	t.Cleanup(func() { require.NoError(t, writer.Close()) })
 
 	var journalMode string
-	require.NoError(t, writer.QueryRow(`PRAGMA journal_mode = WAL`).Scan(&journalMode))
+	require.NoError(t, writer.QueryRowContext(t.Context(), `PRAGMA journal_mode = WAL`).Scan(&journalMode))
 	assert.Equal(t, "wal", journalMode)
-	_, err = writer.Exec(`PRAGMA wal_autocheckpoint = 0`)
+	_, err = writer.ExecContext(t.Context(), `PRAGMA wal_autocheckpoint = 0`)
 	require.NoError(t, err)
 	return writer
 }
@@ -439,8 +809,7 @@ func TestRemotePathMappingHandlesWindowsDrivePath(t *testing.T) {
 
 	assert.Equal(t, wantLocalDir, RemappedDir(tempDir, remoteDir))
 	assert.Equal(t, wantLocalFile, remappedRemotePath(tempDir, remoteFile))
-	assert.Equal(t,
-		remoteFile,
+	assert.Equal(t, remoteFile,
 		RemapToRemotePath(tempDir, remoteDir, wantLocalFile),
 	)
 }
@@ -459,8 +828,7 @@ func TestRemotePathMappingHandlesForwardSlashUNCPath(t *testing.T) {
 
 	assert.Equal(t, wantLocalDir, RemappedDir(tempDir, remoteDir))
 	assert.Equal(t, wantLocalFile, remappedRemotePath(tempDir, remoteFile))
-	assert.Equal(t,
-		remoteFile,
+	assert.Equal(t, remoteFile,
 		RemapToRemotePath(tempDir, remoteDir, wantLocalFile),
 	)
 }
@@ -468,7 +836,7 @@ func TestRemotePathMappingHandlesForwardSlashUNCPath(t *testing.T) {
 func TestImporterRejectsEscapingRemoteTargets(t *testing.T) {
 	stats, err := Importer{
 		Host: "devbox",
-	}.ImportExtracted(context.Background(), TargetSet{
+	}.ImportExtracted(t.Context(), TargetSet{
 		Dirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {"../../outside"},
 		},
@@ -506,4 +874,59 @@ func TestRemoteSkipCacheUsesArchivePathMapping(t *testing.T) {
 	)
 	require.True(t, ok)
 	assert.Equal(t, remoteFile, got)
+}
+
+func TestRemoteSkipCacheRoundTripsQualifiedExtraFile(t *testing.T) {
+	root := t.TempDir()
+	const (
+		host       = "devbox"
+		remoteFile = "/home/remote/.hermes/state.db"
+		qualified  = remoteFile + "?agent=hermes"
+	)
+	targets := TargetSet{ExtraFiles: []string{remoteFile}}
+	layout, cfg, err := newImportInputs(host, nil, targets, root)
+	require.NoError(t, err)
+
+	localFile := remappedRemotePath(root, remoteFile) + "?agent=hermes"
+	translated := translateRemoteCacheToTemp(
+		map[string]int64{qualified: 123},
+		layout.paths.remoteDirs,
+		layout.paths.localDirs,
+	)
+	require.Equal(t, map[string]int64{localFile: 123}, translated,
+		"remote translation must preserve the provider qualifier")
+
+	database, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "test.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, database.Close()) })
+	engine := syncpkg.NewEngine(t.Context(), database, cfg)
+	t.Cleanup(engine.Close)
+	engine.InjectSkipCache(translated)
+	require.NoError(t, saveEngineSkipCache(t.Context(), database, engine, layout.paths))
+
+	remoteCache, err := database.LoadRemoteSkippedFiles(t.Context(), host)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int64{qualified: 123}, remoteCache,
+		"temporary translation must restore the identical remote cache key")
+}
+
+func TestRemoteHermesMemberPathsRoundTrip(t *testing.T) {
+	for _, remoteDB := range []string{"/srv/hermes/state.db", `C:\Users\remote\.hermes\state.db`, `\\server\share\.hermes\state.db`} {
+		t.Run(remoteDB, func(t *testing.T) {
+			root := t.TempDir()
+			localDB := remappedRemotePath(root, remoteDB)
+			remoteMember := remoteDB + "#cron_job.daily_20261012_120000"
+			localMember := localDB + "#cron_job.daily_20261012_120000"
+			paths := remotePathMap{host: "devbox", root: root, remoteDirs: []string{remoteDB}, localDirs: []string{localDB}}
+			assert.Equal(t, "devbox:"+remoteMember, paths.pathRewriter()(localMember))
+			resolved, ok := paths.storedPathResolver()("devbox:" + remoteMember)
+			require.True(t, ok)
+			assert.Equal(t, localMember, resolved)
+			remoteCache := map[string]int64{remoteMember + "?agent=hermes": 123}
+			localCache := translateRemoteCacheToTemp(remoteCache, paths.remoteDirs, paths.localDirs)
+			assert.Equal(t, map[string]int64{localMember + "?agent=hermes": 123}, localCache)
+			assert.Equal(t, remoteCache, remoteTempSkipCache(localCache, paths))
+			assert.True(t, remotePathWithinAnyRoot(remoteMember, []string{remoteDB}))
+		})
+	}
 }

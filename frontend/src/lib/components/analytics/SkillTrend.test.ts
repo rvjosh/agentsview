@@ -1,21 +1,16 @@
 // @vitest-environment jsdom
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 // @ts-ignore
 import SkillTrend from "./SkillTrend.svelte";
 import { analytics } from "../../stores/analytics.svelte.js";
+import { settings } from "../../stores/settings.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 
 describe("SkillTrend", () => {
   beforeEach(() => {
     setLocale("en");
+    settings.chartPalette = "agentsview";
     vi.stubGlobal(
       "ResizeObserver",
       class {
@@ -30,6 +25,7 @@ describe("SkillTrend", () => {
     setLocale("en");
     analytics.skills = null;
     analytics.skillsGranularity = "week";
+    settings.chartPalette = "agentsview";
     // @ts-ignore
     analytics.errors = {
       ...analytics.errors,
@@ -40,9 +36,7 @@ describe("SkillTrend", () => {
     vi.unstubAllGlobals();
   });
 
-  function skillsResponse(
-    trend: { date: string; by_skill: Record<string, number> }[],
-  ) {
+  function skillsResponse(trend: { date: string; by_skill: Record<string, number> }[]) {
     return {
       total_skill_calls: 0,
       distinct_skills: 0,
@@ -77,9 +71,7 @@ describe("SkillTrend", () => {
 
     expect(document.body.textContent).toContain("Skill Usage Over Time");
 
-    const chips = document.querySelectorAll<HTMLButtonElement>(
-      ".legend-chip",
-    );
+    const chips = document.querySelectorAll<HTMLButtonElement>(".legend-chip");
     expect(chips).toHaveLength(3);
     // Legend ordered by total volume: commit (10), review (2), deploy (1).
     expect(chips[0]!.textContent).toContain("commit");
@@ -95,13 +87,25 @@ describe("SkillTrend", () => {
     await unmount(component);
   });
 
+  it("renders a visible y-axis and horizontal scale guides", async () => {
+    const component = mountWithData();
+    await tick();
+
+    const labels = [...document.querySelectorAll<SVGTextElement>(".y-label")].map((label) =>
+      label.textContent?.trim(),
+    );
+    expect(labels).toContain("0");
+    expect(labels.some((label) => label !== "0")).toBe(true);
+    expect(document.querySelectorAll(".grid-line").length).toBeGreaterThan(0);
+
+    await unmount(component);
+  });
+
   it("hides a series line when its legend chip is toggled", async () => {
     const component = mountWithData();
     await tick();
 
-    const chips = document.querySelectorAll<HTMLButtonElement>(
-      ".legend-chip",
-    );
+    const chips = document.querySelectorAll<HTMLButtonElement>(".legend-chip");
     expect(chips[0]!.getAttribute("aria-pressed")).toBe("true");
     chips[0]!.click();
     await tick();
@@ -121,19 +125,85 @@ describe("SkillTrend", () => {
     await tick();
 
     const lineStyles = () =>
-      [...document.querySelectorAll<SVGPathElement>(".series-line")]
-        .map((line) => line.getAttribute("style") ?? "");
+      [...document.querySelectorAll<SVGPathElement>(".series-line")].map(
+        (line) => line.getAttribute("style") ?? "",
+      );
     // "review" is series slot 2 while all three lines are visible.
     expect(lineStyles()[1]).toContain("--chart-series-2");
 
-    document
-      .querySelectorAll<HTMLButtonElement>(".legend-chip")[0]!
-      .click();
+    document.querySelectorAll<HTMLButtonElement>(".legend-chip")[0]!.click();
     await tick();
 
     // With "commit" hidden, "review" keeps its slot-2 hue.
     expect(lineStyles()[0]).toContain("--chart-series-2");
 
+    await unmount(component);
+  });
+
+  it("assigns Matplotlib colors lexically while rendering by volume", async () => {
+    settings.chartPalette = "matplotlib";
+    const component = mountWithData();
+    await tick();
+
+    const legendColorBySkill = Object.fromEntries(
+      [...document.querySelectorAll<HTMLElement>(".legend-chip")].map((chip) => [
+        chip.querySelector(".legend-name")?.textContent?.trim(),
+        chip.querySelector<HTMLElement>(".legend-key")?.style.background,
+      ]),
+    );
+    const lineColors = [...document.querySelectorAll<SVGPathElement>(".series-line")].map(
+      (line) => line.style.stroke,
+    );
+    expect(legendColorBySkill).toEqual({
+      commit: "rgb(31, 119, 180)",
+      review: "rgb(44, 160, 44)",
+      deploy: "rgb(255, 127, 14)",
+    });
+    expect(lineColors).toEqual(["rgb(31, 119, 180)", "rgb(44, 160, 44)", "rgb(255, 127, 14)"]);
+
+    await unmount(component);
+  });
+
+  it("draws legend and lines in color-blind safe colors when chosen", async () => {
+    settings.chartPalette = "colorblind";
+    const component = mountWithData();
+    await tick();
+
+    const legendColorBySkill = Object.fromEntries(
+      [...document.querySelectorAll<HTMLElement>(".legend-chip")].map((chip) => [
+        chip.querySelector(".legend-name")?.textContent?.trim(),
+        chip.querySelector<HTMLElement>(".legend-key")?.style.background,
+      ]),
+    );
+    // Petroff's six-color sequence, in skill name order.
+    expect(legendColorBySkill).toEqual({
+      commit: "rgb(87, 144, 252)",
+      deploy: "rgb(248, 156, 32)",
+      review: "rgb(228, 37, 54)",
+    });
+    const lineColors = [...document.querySelectorAll<SVGPathElement>(".series-line")].map(
+      (line) => line.style.stroke,
+    );
+    expect(new Set(lineColors)).toEqual(new Set(Object.values(legendColorBySkill)));
+
+    await unmount(component);
+  });
+
+  it("keeps a Matplotlib survivor color stable when a series is hidden", async () => {
+    settings.chartPalette = "matplotlib";
+    const component = mountWithData();
+    await tick();
+
+    const lineColors = () =>
+      [...document.querySelectorAll<SVGPathElement>(".series-line")].map(
+        (line) => line.style.stroke,
+      );
+    expect(lineColors()[1]).toBe("rgb(44, 160, 44)");
+
+    document.querySelectorAll<HTMLButtonElement>(".legend-chip")[0]!.click();
+    await tick();
+
+    expect(lineColors()[0]).toBe("rgb(44, 160, 44)");
     await unmount(component);
   });
 
@@ -149,15 +219,18 @@ describe("SkillTrend", () => {
     const component = mount(SkillTrend, { target: document.body });
     await tick();
 
-    const chips = document.querySelectorAll<HTMLButtonElement>(
-      ".legend-chip",
-    );
+    const chips = document.querySelectorAll<HTMLButtonElement>(".legend-chip");
     expect(chips).toHaveLength(7);
     expect(chips[6]!.textContent).toContain("Other");
     // skill-6 (2) + skill-7 (1) fold into Other in both buckets.
     expect(chips[6]!.textContent).toContain("6");
+    expect(chips[6]!.querySelector<HTMLElement>(".legend-key")?.style.background).toBe(
+      "var(--chart-series-other)",
+    );
 
-    expect(document.querySelectorAll(".series-line")).toHaveLength(7);
+    const lines = document.querySelectorAll<SVGPathElement>(".series-line");
+    expect(lines).toHaveLength(7);
+    expect(lines[6]!.style.stroke).toBe("var(--chart-series-other)");
 
     await unmount(component);
   });
@@ -188,8 +261,7 @@ describe("SkillTrend", () => {
     expect(rows[2]!.textContent).toContain("deploy");
     expect(document.querySelectorAll(".crosshair")).toHaveLength(1);
 
-    document.querySelector<HTMLElement>(".chart")!
-      .dispatchEvent(new MouseEvent("mouseleave"));
+    document.querySelector<HTMLElement>(".chart")!.dispatchEvent(new MouseEvent("mouseleave"));
     await tick();
     expect(document.querySelector(".tooltip")).toBeNull();
 
@@ -203,9 +275,7 @@ describe("SkillTrend", () => {
     const chart = document.querySelector<HTMLElement>(".chart")!;
     expect(chart.getAttribute("role")).toBe("slider");
     expect(chart.getAttribute("tabindex")).toBe("0");
-    expect(chart.getAttribute("aria-describedby")).toBe(
-      "skill-trend-data",
-    );
+    expect(chart.getAttribute("aria-describedby")).toBe("skill-trend-data");
 
     const dataTable = document.querySelector("#skill-trend-data")!;
     expect(dataTable.textContent).toContain("commit");
@@ -214,8 +284,7 @@ describe("SkillTrend", () => {
 
     chart.dispatchEvent(new FocusEvent("focus"));
     await tick();
-    expect(document.querySelector(".tooltip-date")?.textContent)
-      .toContain("Jan 1, 2024");
+    expect(document.querySelector(".tooltip-date")?.textContent).toContain("Jan 1, 2024");
 
     chart.dispatchEvent(
       new KeyboardEvent("keydown", {
@@ -224,8 +293,7 @@ describe("SkillTrend", () => {
       }),
     );
     await tick();
-    expect(document.querySelector(".tooltip-date")?.textContent)
-      .toContain("Jan 8, 2024");
+    expect(document.querySelector(".tooltip-date")?.textContent).toContain("Jan 8, 2024");
 
     await unmount(component);
   });
@@ -245,24 +313,19 @@ describe("SkillTrend", () => {
     );
     await tick();
 
-    expect(document.querySelector(".tooltip-date")?.textContent)
-      .toContain("2024年1月1日");
+    expect(document.querySelector(".tooltip-date")?.textContent).toContain("2024年1月1日");
 
     await unmount(component);
   });
 
   it("requests granularity changes through the shared picker", async () => {
-    const fetchSpy = vi
-      .spyOn(analytics, "fetchSkills")
-      .mockResolvedValue("ok");
+    const fetchSpy = vi.spyOn(analytics, "fetchSkills").mockResolvedValue("ok");
     const component = mountWithData();
     await tick();
 
-    const monthBtn = [
-      ...document.querySelectorAll<HTMLButtonElement>(
-        ".trend-header button",
-      ),
-    ].find((b) => b.textContent?.trim() === "Month");
+    const monthBtn = [...document.querySelectorAll<HTMLButtonElement>(".trend-header button")].find(
+      (b) => b.textContent?.trim() === "Month",
+    );
     expect(monthBtn).toBeTruthy();
     monthBtn!.click();
     await tick();
@@ -290,9 +353,7 @@ describe("SkillTrend", () => {
       ...analytics.errors,
       skills: "Failed to load",
     };
-    const retrySpy = vi
-      .spyOn(analytics, "fetchSkills")
-      .mockResolvedValue("ok");
+    const retrySpy = vi.spyOn(analytics, "fetchSkills").mockResolvedValue("ok");
     const component = mount(SkillTrend, { target: document.body });
     await tick();
 

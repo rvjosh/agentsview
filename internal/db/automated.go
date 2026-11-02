@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // automatedPrefixes are first_message prefixes that identify
@@ -63,6 +65,17 @@ const userPatternMaxLen = 1024
 // AutomationEvidencePrefixBytes is the bounded prefix size used by backend
 // integrity audits. It is large enough to hold every accepted user pattern.
 const AutomationEvidencePrefixBytes = userPatternMaxLen
+
+// IsAutomatedSessionMetadata classifies durable provider-owned session
+// metadata that explicitly identifies an automated invocation.
+func IsAutomatedSessionMetadata(sessionKind string) bool {
+	switch sessionKind {
+	case parser.SessionKindRoborev:
+		return true
+	default:
+		return false
+	}
+}
 
 var (
 	userPatternsMu   sync.RWMutex
@@ -297,18 +310,6 @@ type AutomationTextEvidence struct {
 	Valid          bool
 }
 
-// AutomationVerdictFromEvidence combines the first stored user message and
-// fallback first_message using the same ordering and single-turn rule as the
-// full-text classifier. An inconclusive result requires full-text fallback.
-func AutomationVerdictFromEvidence(
-	userMessageCount int,
-	firstUser, firstMessage AutomationTextEvidence,
-) (matched, conclusive bool) {
-	return SnapshotAutomationClassifier().VerdictFromEvidence(
-		userMessageCount, firstUser, firstMessage,
-	)
-}
-
 // VerdictFromEvidence classifies bounded evidence using this snapshot.
 func (classifier AutomationClassifier) VerdictFromEvidence(
 	userMessageCount int,
@@ -366,7 +367,7 @@ func IsAutomatedTranscript(
 
 func firstUserMessageContent(msgs []Message) (string, bool) {
 	for _, m := range msgs {
-		if m.Role != "user" || m.IsSystem {
+		if m.Role != "user" || m.IsSystem || m.SourceSubtype == parser.SourceSubtypeToolResult {
 			continue
 		}
 		if strings.TrimSpace(m.Content) == "" {

@@ -3,6 +3,8 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +21,7 @@ func fakeClock(start time.Time) (now func() time.Time, step func(time.Duration))
 }
 
 func TestStartupStateRoundTrip(t *testing.T) {
+	setTestVersion(t, "v1.2.3-test")
 	dir := t.TempDir()
 	base := time.Date(2026, 7, 2, 22, 0, 0, 0, time.UTC)
 	now, _ := fakeClock(base)
@@ -29,6 +32,9 @@ func TestStartupStateRoundTrip(t *testing.T) {
 	st := readStartupState(dir)
 	require.NotNil(t, st, "state must be readable after SetPhase")
 	assert.Equal(t, os.Getpid(), st.PID)
+	assert.Equal(t, "v1.2.3-test", st.Version)
+	assert.NotEmpty(t, st.CreateTime)
+	assert.True(t, processCreateTimeMatches(st.PID, st.CreateTime))
 	assert.Equal(t, "opening database", st.Phase)
 	assert.Empty(t, st.Detail)
 	assert.True(t, st.StartedAt.Equal(base), "started_at = %v", st.StartedAt)
@@ -73,6 +79,18 @@ func TestStartupStateDetailThrottle(t *testing.T) {
 	assert.Empty(t, st.Detail)
 }
 
+func TestStartupStatePublishesManagedCaddyIdentity(t *testing.T) {
+	dir := t.TempDir()
+	w := newStartupStateWriter(dir, time.Now)
+	w.SetCaddyProcess(os.Getpid())
+
+	st := readStartupState(dir)
+	require.NotNil(t, st)
+	assert.Equal(t, os.Getpid(), st.CaddyPID)
+	assert.NotEmpty(t, st.CaddyCreateTime)
+	assert.True(t, processCreateTimeMatches(st.CaddyPID, st.CaddyCreateTime))
+}
+
 func TestReadStartupStateMissingOrCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	assert.Nil(t, readStartupState(dir), "missing file must read as nil")
@@ -81,6 +99,34 @@ func TestReadStartupStateMissingOrCorrupt(t *testing.T) {
 		startupStatePath(dir), []byte("{not json"), 0o600,
 	))
 	assert.Nil(t, readStartupState(dir), "corrupt file must read as nil")
+}
+
+func TestStartupStateConcurrentReaders(t *testing.T) {
+	dir := t.TempDir()
+	w := newStartupStateWriter(dir, time.Now)
+	w.SetPhase("opening archive")
+	stop := make(chan struct{})
+	var readers sync.WaitGroup
+	for range 4 {
+		readers.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					assert.NotNil(t, readStartupState(dir))
+				}
+			}
+		})
+	}
+	defer func() { close(stop); readers.Wait() }()
+	for i := range 100 {
+		phase := strconv.Itoa(i)
+		w.SetPhase(phase)
+		state := readStartupState(dir)
+		require.NotNil(t, state)
+		require.Equal(t, phase, state.Phase, "readers must allow snapshot replacement")
+	}
 }
 
 func TestRemoveStartupState(t *testing.T) {
@@ -122,6 +168,7 @@ func TestServeStartingStatusLines(t *testing.T) {
 			name: "full state",
 			st: &startupState{
 				PID:       48151,
+				Version:   "v1.2.3-test",
 				StartedAt: base,
 				Phase:     "full resync",
 				Detail:    "claude: 12/38 sessions (32%)",
@@ -129,6 +176,7 @@ func TestServeStartingStatusLines(t *testing.T) {
 			},
 			want: []string{
 				"  pid:     48151",
+				"  version: v1.2.3-test",
 				"  elapsed: 1m12s",
 				"  phase:   full resync: claude: 12/38 sessions (32%)",
 				"  log:     " + logPath,

@@ -1,11 +1,15 @@
 package remotesync
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // ManifestEntry describes one regular file available for remote sync.
@@ -18,7 +22,8 @@ type ManifestEntry struct {
 	MtimeNS int64  `json:"mtime_ns"`
 }
 
-// Manifest lists every syncable regular file under a TargetSet.
+// Manifest lists every syncable regular file under a TargetSet, sorted by
+// the path each file takes in the collector's mirror.
 type Manifest struct {
 	Files []ManifestEntry `json:"files"`
 }
@@ -35,20 +40,23 @@ type Manifest struct {
 // the full-archive flow. Verbatim file-scoped agents (RooCode) are
 // listed by their curated files instead of a raw walk — the manifest
 // never advertises settings or caches under their directory roots.
-func BuildManifest(targets TargetSet) (Manifest, error) {
+func BuildManifest(ctx context.Context, targets TargetSet) (Manifest, error) {
 	if targets.HasSanitizedFileScopedAgents() {
-		return Manifest{}, fmt.Errorf(
-			"manifest not supported for sanitized file-scoped agents")
+		return Manifest{}, errors.New("manifest not supported for sanitized file-scoped agents")
 	}
 	m := Manifest{Files: []ManifestEntry{}}
-	hermesStateDBs := hermesStateDBTargets(targets)
-	hermesSQLite := make(map[string]struct{}, len(hermesStateDBs)*4)
-	for _, stateDB := range hermesStateDBs {
-		for _, path := range hermesSQLitePaths(stateDB) {
-			hermesSQLite[path] = struct{}{}
+	forbidden := newForbiddenRootMatcher(targets.ForbiddenRoots)
+	snapshotTargets := sqliteSnapshotTargets(targets)
+	snapshotPaths := make(map[string]struct{}, len(snapshotTargets)*4)
+	for stateDB := range snapshotTargets {
+		for _, path := range sqliteSnapshotPaths(stateDB) {
+			snapshotPaths[path] = struct{}{}
 		}
 	}
 	add := func(path string, info os.FileInfo) {
+		if _, snapshot := snapshotPaths[filepath.Clean(path)]; snapshot {
+			return
+		}
 		m.Files = append(m.Files, ManifestEntry{
 			Path:    path,
 			Size:    info.Size(),
@@ -56,6 +64,9 @@ func BuildManifest(targets TargetSet) (Manifest, error) {
 		})
 	}
 	addLstat := func(path string) error {
+		if forbidden.within(path) {
+			return nil
+		}
 		info, err := os.Lstat(path)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -69,21 +80,27 @@ func BuildManifest(targets TargetSet) (Manifest, error) {
 		return nil
 	}
 	for agent, dirs := range targets.Dirs {
-		if _, fileScoped := targets.Files[agent]; fileScoped {
+		if parser.RemoteSyncExcludedAgent(agent) {
+			continue
+		}
+		if targets.isFileScoped(agent) {
 			continue
 		}
 		for _, root := range dirs {
-			if _, ok := hermesSQLite[filepath.Clean(root)]; ok {
+			if _, ok := snapshotPaths[filepath.Clean(root)]; ok {
 				continue
 			}
-			if err := manifestWalk(root, add); err != nil {
+			if err := manifestWalk(root, forbidden, add); err != nil {
 				return Manifest{}, err
 			}
 		}
 	}
-	for _, files := range targets.Files {
+	for agent, files := range targets.Files {
+		if parser.RemoteSyncExcludedAgent(agent) {
+			continue
+		}
 		for _, path := range files {
-			if _, ok := hermesSQLite[filepath.Clean(path)]; ok {
+			if _, ok := snapshotPaths[filepath.Clean(path)]; ok {
 				continue
 			}
 			if err := addLstat(path); err != nil {
@@ -91,29 +108,54 @@ func BuildManifest(targets TargetSet) (Manifest, error) {
 			}
 		}
 	}
-	for _, path := range targets.ExtraFiles {
-		if _, ok := hermesSQLite[filepath.Clean(path)]; ok {
+	for _, path := range targets.AllExtraFiles() {
+		if _, ok := snapshotPaths[filepath.Clean(path)]; ok {
 			continue
 		}
 		if err := addLstat(path); err != nil {
 			return Manifest{}, err
 		}
 	}
-	for _, stateDB := range hermesStateDBs {
-		size, modTime, exists := hermesSQLiteSnapshotIdentity(stateDB)
+	for stateDB := range snapshotTargets {
+		if forbidden.within(stateDB) {
+			continue
+		}
+		size, modTime, exists := sqliteSnapshotIdentity(ctx, stateDB)
 		if exists {
 			m.Files = append(m.Files, ManifestEntry{
 				Path: stateDB, Size: size, MtimeNS: modTime.UnixNano(),
 			})
 		}
 	}
-	sort.Slice(m.Files, func(i, j int) bool {
-		return m.Files[i].Path < m.Files[j].Path
-	})
+	sortManifestByMirrorPath(m.Files)
 	return m, nil
 }
 
-func manifestWalk(root string, add func(string, os.FileInfo)) error {
+// sortManifestByMirrorPath orders entries by the path each one takes in the
+// collector's mirror, the order the collector's diff walks the mirror in.
+// Raw path order differs from it for Windows paths, whose separator is a
+// backslash. A path with no mirror form sorts by its raw text; the
+// collector rejects it.
+func sortManifestByMirrorPath(entries []ManifestEntry) {
+	keys := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		key, err := safeRemotePathArchiveName(entry.Path)
+		if err != nil {
+			key = entry.Path
+		}
+		keys[entry.Path] = key
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		return keys[entries[i].Path] < keys[entries[j].Path]
+	})
+}
+
+func manifestWalk(
+	root string, forbidden forbiddenRootMatcher, add func(string, os.FileInfo),
+) error {
+	if forbidden.within(root) {
+		return nil
+	}
 	info, err := os.Lstat(root)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -136,6 +178,12 @@ func manifestWalk(root string, add func(string, os.FileInfo)) error {
 				return nil
 			}
 			return err
+		}
+		if forbidden.within(path) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		info, err := entry.Info()
 		if err != nil {

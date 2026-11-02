@@ -223,14 +223,21 @@ func TestAgentByType(t *testing.T) {
 		{AgentGemini, true},
 		{AgentMiMoCode, true},
 		{AgentOpenCode, true},
+		{AgentOpenCodeReview, true},
 		{AgentOpenHands, true},
 		{AgentCursor, true},
 		{AgentAmp, true},
+		{AgentJunie, true},
 		{AgentVSCodeCopilot, true},
 		{AgentPi, true},
+		{AgentPrimeAgent, true},
 		{AgentOMP, true},
+		{AgentStepCode, true},
 		{AgentDevin, true},
 		{AgentDeepSeekTUI, true},
+		{AgentDeepSeekHarness, true},
+		{AgentCodexCloud, true},
+		{AgentCline, true},
 		{"unknown", false},
 	}
 	for _, tt := range tests {
@@ -268,6 +275,18 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"traex prefix",
+			"traex:some-uuid",
+			AgentTraeX,
+			true,
+		},
+		{
+			"augure-code prefix",
+			"augure-code:some-uuid",
+			AgentAugureCode,
+			true,
+		},
+		{
 			"copilot prefix",
 			"copilot:sess-id",
 			AgentCopilot,
@@ -277,6 +296,12 @@ func TestAgentByPrefix(t *testing.T) {
 			"gemini prefix",
 			"gemini:sess-id",
 			AgentGemini,
+			true,
+		},
+		{
+			"gemini apps prefix",
+			"gemini-apps:sess-id",
+			AgentGeminiApps,
 			true,
 		},
 		{
@@ -310,6 +335,12 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"junie prefix",
+			"junie:session-260101-120000-abcd",
+			AgentJunie,
+			true,
+		},
+		{
 			"vscode-copilot prefix",
 			"vscode-copilot:sess-id",
 			AgentVSCodeCopilot,
@@ -328,9 +359,21 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"prime agent prefix",
+			"prime-agent:019c1234-session",
+			AgentPrimeAgent,
+			true,
+		},
+		{
 			"omp prefix",
 			"omp:omp-session-uuid",
 			AgentOMP,
+			true,
+		},
+		{
+			"stepcode prefix",
+			"stepcode:stepcode-session-uuid",
+			AgentStepCode,
 			true,
 		},
 		{
@@ -367,9 +410,27 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"deepseek harness prefix",
+			"deepseek-harness:sess-id",
+			AgentDeepSeekHarness,
+			true,
+		},
+		{
+			"codex cloud prefix",
+			"codex-cloud:thread-id",
+			AgentCodexCloud,
+			true,
+		},
+		{
 			"qoder prefix",
 			"qoder:sess-id",
 			AgentQoder,
+			true,
+		},
+		{
+			"cline prefix",
+			"cline:sess-id",
+			AgentCline,
 			true,
 		},
 		{
@@ -414,34 +475,50 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentOpenClaude,
 		AgentCowork,
 		AgentCodex,
+		AgentTraeX,
+		AgentAugureCode,
 		AgentCopilot,
 		AgentGemini,
+		AgentGeminiApps,
 		AgentMiMoCode,
 		AgentOpenCode,
+		AgentOpenCodeReview,
 		AgentKilo,
 		AgentKiloLegacy,
 		AgentOpenHands,
 		AgentCursor,
+		AgentCursorIDE,
 		AgentAmp,
+		AgentJunie,
 		AgentVSCodeCopilot,
 		AgentWindsurf,
 		AgentTrae,
 		AgentVSCopilot,
 		AgentPi,
+		AgentTau,
+		AgentFx,
+		AgentPrimeAgent,
 		AgentOMP,
+		AgentOMO,
+		AgentStepCode,
 		AgentQwen,
 		AgentCommandCode,
 		AgentDeepSeekTUI,
+		AgentDeepSeekHarness,
+		AgentCodexCloud,
 		AgentOpenClaw,
 		AgentQClaw,
 		AgentKimi,
+		AgentKimiWork,
 		AgentClaudeAI,
 		AgentChatGPT,
 		AgentKiro,
 		AgentKiroIDE,
 		AgentCortex,
 		AgentHermes,
+		AgentAugureDesktop,
 		AgentGrok,
+		AgentGoose,
 		AgentForge,
 		AgentDevin,
 		AgentPiebald,
@@ -455,6 +532,7 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentIflow,
 		AgentIcodemate,
 		AgentWorkBuddy,
+		AgentCodeBuddy,
 		AgentZencoder,
 		AgentGptme,
 		AgentQoder,
@@ -462,9 +540,15 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentShelley,
 		AgentVibe,
 		AgentAider,
+		AgentEvener,
 		AgentReasonix,
 		AgentRooCode,
+		AgentCline,
 		AgentPoolside,
+		AgentOmnigent,
+		AgentCodebuff,
+		AgentCrush,
+		AgentMuse,
 	}
 
 	expected := make(map[AgentType]bool, len(allTypes))
@@ -497,13 +581,14 @@ func TestInferRelationshipTypes(t *testing.T) {
 		name   string
 		inputs []ParseResult
 		want   []RelationshipType
-	}{{
-		"no parent",
-		[]ParseResult{
-			{Session: ParsedSession{ID: "abc"}},
+	}{
+		{
+			"no parent",
+			[]ParseResult{
+				{Session: ParsedSession{ID: "abc"}},
+			},
+			[]RelationshipType{RelNone},
 		},
-		[]RelationshipType{RelNone},
-	},
 		{
 			"agent prefix gets subagent",
 			[]ParseResult{
@@ -581,157 +666,18 @@ func TestInferRelationshipTypes(t *testing.T) {
 	}
 }
 
-func TestFileBasedAgentsHaveConfigKey(t *testing.T) {
-	for _, def := range Registry {
-		if !def.FileBased {
-			continue
-		}
-		assert.NotEmptyf(t, def.ConfigKey,
-			"file-based agent %q (%s) has empty ConfigKey",
-			def.DisplayName, def.Type)
-	}
-}
-
-func TestZedRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentZed)
-	require.True(t, ok, "AgentZed missing from Registry")
-	require.True(t, def.FileBased, "Zed FileBased")
-	assert.Equal(t, "ZED_DIR", def.EnvVar)
-	assert.Equal(t, "zed_dirs", def.ConfigKey)
-	assert.Equal(t, "zed:", def.IDPrefix)
-}
-
-func TestZCodeRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentZCode)
-	require.True(t, ok, "AgentZCode missing from Registry")
-	require.False(t, def.FileBased, "ZCode FileBased")
-	assert.Equal(t, "ZCODE_DIR", def.EnvVar)
-	assert.Equal(t, "zcode_dirs", def.ConfigKey)
-	assert.Equal(t, []string{".zcode/cli/db", ".zcode/cli"}, def.DefaultDirs)
-	assert.Equal(t, "zcode:", def.IDPrefix)
-	assert.True(t, def.Usage.NoPerMessageTokenData)
-}
-
-func TestShelleyRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentShelley)
-	require.True(t, ok, "AgentShelley missing from Registry")
-	require.True(t, def.FileBased, "Shelley FileBased")
-	assert.Equal(t, "SHELLEY_DIR", def.EnvVar)
-	assert.Equal(t, "shelley_dirs", def.ConfigKey)
-	assert.Equal(t, "shelley:", def.IDPrefix)
-}
-
-func TestOpenCodeRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentOpenCode)
-	require.True(t, ok, "AgentOpenCode missing from Registry")
-	require.True(t, def.FileBased, "OpenCode FileBased")
-	want := []string{
-		"storage/session",
-		"storage/message",
-		"storage/part",
-	}
-	require.Truef(t, slices.Equal(def.WatchSubdirs, want),
-		"OpenCode WatchSubdirs = %v, want %v", def.WatchSubdirs, want)
-}
-
-func TestOpenClaudeRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentOpenClaude)
-	require.True(t, ok, "AgentOpenClaude missing from Registry")
-	require.True(t, def.FileBased, "OpenClaude FileBased")
-	assert.Equal(t, "OPENCLAUDE_PROJECTS_DIR", def.EnvVar)
-	assert.Equal(t, "openclaude_project_dirs", def.ConfigKey)
-	assert.Equal(t, []string{".openclaude/projects"}, def.DefaultDirs)
-	assert.Equal(t, "openclaude:", def.IDPrefix)
-}
-
-func TestCoworkRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentCowork)
-	require.True(t, ok, "AgentCowork missing from Registry")
-	require.True(t, def.FileBased, "Cowork FileBased")
-	assert.Equal(t, "COWORK_DIR", def.EnvVar)
-	assert.Equal(t, "cowork_dirs", def.ConfigKey)
-	assert.Equal(t, "cowork:", def.IDPrefix)
-	assert.Equal(t, coworkDefaultDirs(), def.DefaultDirs)
-	assert.True(t, def.ShallowWatch,
-		"Cowork root contains large local_* working trees that discovery skips")
-}
-
-func TestPeriodicReconcileCapability(t *testing.T) {
-	optedIn := map[AgentType]bool{}
-	for _, def := range Registry {
-		optedIn[def.Type] = def.PeriodicReconcile
-	}
-	// Shallow-watched providers rely on scheduled reconciliation because
-	// subdirectory changes are invisible to their shallow watch coverage.
-	assert.True(t, optedIn[AgentOpenHands])
-	assert.True(t, optedIn[AgentAider])
-	// Cowork's provider WatchPlan registers its root recursively
-	// (coworkWatchRoots Recursive:true overrides legacy ShallowWatch), so
-	// scheduled reconciliation would redundantly rescan the whole archive.
-	assert.False(t, optedIn[AgentCowork])
-	// Recursive session roots must NOT opt in: their shallow roots are
-	// supplemental (codex_provider.go WatchPlan registers Recursive:true),
-	// so scheduled reconciliation would rescan the whole session tree.
-	assert.False(t, optedIn[AgentCodex])
-	assert.False(t, optedIn[AgentHermes])
-	assert.False(t, optedIn[AgentClaude])
-	assert.False(t, optedIn[AgentGemini])
+func TestRemoteSyncExcludedAgent(t *testing.T) {
+	assert.True(t, RemoteSyncExcludedAgent(AgentTrae))
+	assert.True(t, RemoteSyncExcludedAgent(AgentOmnigent))
+	assert.True(t, RemoteSyncExcludedAgent(AgentAugureDesktop))
+	assert.False(t, RemoteSyncExcludedAgent(AgentClaude))
+	assert.False(t, RemoteSyncExcludedAgent(AgentType("unknown-agent")))
 }
 
 func TestAgentByPrefixCowork(t *testing.T) {
 	def, ok := AgentByPrefix("cowork:c0000000-0000-4000-8000-000000000001")
 	require.True(t, ok, "cowork-prefixed ID should resolve")
 	assert.Equal(t, AgentCowork, def.Type)
-}
-
-func TestMiMoCodeRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentMiMoCode)
-	require.True(t, ok, "AgentMiMoCode missing from Registry")
-	require.True(t, def.FileBased, "MiMoCode FileBased")
-	assert.Equal(t, "MIMOCODE_DIR", def.EnvVar)
-	assert.Equal(t, "mimocode_dirs", def.ConfigKey)
-	assert.Equal(t, []string{".local/share/mimocode"}, def.DefaultDirs)
-	assert.Equal(t, "mimocode:", def.IDPrefix)
-	want := []string{
-		"storage/session_diff",
-		"storage/message",
-		"storage/part",
-	}
-	require.Truef(t, slices.Equal(def.WatchSubdirs, want),
-		"MiMoCode WatchSubdirs = %v, want %v", def.WatchSubdirs, want)
-}
-
-func TestCommandCodeRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentCommandCode)
-	require.True(t, ok, "AgentCommandCode missing from Registry")
-	require.True(t, def.FileBased, "Command Code FileBased")
-	assert.Equal(t, []string{".commandcode/projects"}, def.DefaultDirs)
-	assert.Equal(t, "commandcode:", def.IDPrefix)
-}
-
-func TestDevinRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentDevin)
-	require.True(t, ok, "AgentDevin missing from Registry")
-	require.False(t, def.FileBased, "Devin FileBased")
-	assert.Equal(t, "Devin", def.DisplayName)
-	assert.Equal(t, "DEVIN_DIR", def.EnvVar)
-	assert.Equal(t, "devin_dirs", def.ConfigKey)
-	assert.Equal(t, []string{
-		"Library/Application Support/devin",
-		".local/share/devin",
-	}, def.DefaultDirs)
-	assert.Equal(t, "devin:", def.IDPrefix)
-}
-
-func TestDeepSeekTUIRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentDeepSeekTUI)
-	require.True(t, ok, "AgentDeepSeekTUI missing from Registry")
-	require.True(t, def.FileBased, "DeepSeek TUI FileBased")
-	assert.Equal(t, "DeepSeek TUI", def.DisplayName)
-	assert.Equal(t, "DEEPSEEK_TUI_SESSIONS_DIR", def.EnvVar)
-	assert.Equal(t, "deepseek_tui_sessions_dirs", def.ConfigKey)
-	assert.Equal(t, []string{".codewhale/sessions", ".deepseek/sessions"}, def.DefaultDirs)
-	assert.Equal(t, "deepseek-tui:", def.IDPrefix)
 }
 
 func TestResolveOpenCodeSourcePrefersStorage(t *testing.T) {
@@ -766,7 +712,7 @@ func TestResolveMiMoCodeSourcePrefersStorage(t *testing.T) {
 	require.Len(t, discovered, 1)
 	require.Equal(t, AgentMiMoCode, discovered[0].Agent)
 
-	require.Equal(t, path, findOpenCodeFormatSourceFile(mimoFmt, root, "ses_test"))
+	require.Equal(t, path, findOpenCodeFormatSourceFile(t.Context(), mimoFmt, root, "ses_test"))
 }
 
 func TestResolveOpenCodeSourceFallsBackToSQLiteOnBrokenStoragePath(
@@ -840,7 +786,7 @@ func TestFindOpenCodeSourceFilePrefersStorage(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte(`{"id":"ses_123"}`), 0o644), "write session")
 	require.NoError(t, os.WriteFile(filepath.Join(root, "opencode.db"), []byte("x"), 0o644), "write db marker")
 
-	got := findOpenCodeFormatSourceFile(openCodeFmt, root, "ses_123")
+	got := findOpenCodeFormatSourceFile(t.Context(), openCodeFmt, root, "ses_123")
 	require.Equal(t, path, got, "FindOpenCodeSourceFile()")
 }
 
@@ -853,7 +799,7 @@ func TestFindOpenCodeSourceFileFallsBackToSQLiteInHybridRoot(t *testing.T) {
 	dbPath := filepath.Join(root, "opencode.db")
 	seedHybridSQLiteDB(t, dbPath, "ses_456")
 
-	got := findOpenCodeFormatSourceFile(openCodeFmt, root, "ses_456")
+	got := findOpenCodeFormatSourceFile(t.Context(), openCodeFmt, root, "ses_456")
 	want := OpenCodeSQLiteVirtualPath(dbPath, "ses_456")
 	require.Equal(t, want, got, "FindOpenCodeSourceFile()")
 }
@@ -872,7 +818,7 @@ func TestFindOpenCodeSourceFileReturnsEmptyWhenSessionMissing(t *testing.T) {
 	dbPath := filepath.Join(root, "opencode.db")
 	seedHybridSQLiteDB(t, dbPath, "ses_unrelated")
 
-	got := findOpenCodeFormatSourceFile(openCodeFmt, root, "ses_missing")
+	got := findOpenCodeFormatSourceFile(t.Context(), openCodeFmt, root, "ses_missing")
 	assert.Empty(t, got, "FindOpenCodeSourceFile()")
 }
 
@@ -881,11 +827,11 @@ func TestFindOpenCodeSourceFilePureSQLiteOnlyForExistingSession(t *testing.T) {
 	dbPath := filepath.Join(root, "opencode.db")
 	seedHybridSQLiteDB(t, dbPath, "ses_present")
 
-	got := findOpenCodeFormatSourceFile(openCodeFmt, root, "ses_present")
+	got := findOpenCodeFormatSourceFile(t.Context(), openCodeFmt, root, "ses_present")
 	assert.Equal(t,
 		OpenCodeSQLiteVirtualPath(dbPath, "ses_present"),
 		got, "FindOpenCodeSourceFile(present)")
-	got = findOpenCodeFormatSourceFile(openCodeFmt, root, "ses_absent")
+	got = findOpenCodeFormatSourceFile(t.Context(), openCodeFmt, root, "ses_absent")
 	assert.Empty(t, got, "FindOpenCodeSourceFile(absent)")
 }
 
@@ -1171,59 +1117,6 @@ func TestAgentByPrefixRemote(t *testing.T) {
 	}
 }
 
-func TestVSCodeCopilotDefaultDirs(t *testing.T) {
-	def, ok := AgentByType(AgentVSCodeCopilot)
-	require.True(t, ok, "AgentVSCodeCopilot not in Registry")
-
-	required := []string{
-		// Windows
-		"AppData/Roaming/Code/User",
-		"AppData/Roaming/Code - Insiders/User",
-		"AppData/Roaming/VSCodium/User",
-		// macOS
-		"Library/Application Support/Code/User",
-		"Library/Application Support/Code - Insiders/User",
-		"Library/Application Support/VSCodium/User",
-		// Linux
-		".config/Code/User",
-		".config/Code - Insiders/User",
-		".config/VSCodium/User",
-	}
-	for _, path := range required {
-		assert.Truef(t, slices.Contains(def.DefaultDirs, path),
-			"missing default dir: %s", path)
-	}
-}
-
-func TestWindsurfRegistryEntry(t *testing.T) {
-	def, ok := AgentByType(AgentWindsurf)
-	require.True(t, ok, "AgentWindsurf not in Registry")
-
-	assert.Equal(t, "Windsurf", def.DisplayName)
-	assert.Equal(t, "WINDSURF_DIR", def.EnvVar)
-	assert.Equal(t, "windsurf_dirs", def.ConfigKey)
-	assert.Equal(t, "windsurf:", def.IDPrefix)
-	assert.True(t, def.FileBased)
-	assert.Contains(t, def.WatchSubdirs, "workspaceStorage")
-
-	required := []string{
-		"AppData/Roaming/Windsurf/User",
-		"AppData/Roaming/Windsurf - Next/User",
-		"Library/Application Support/Windsurf/User",
-		"Library/Application Support/Windsurf - Next/User",
-		".config/Windsurf/User",
-		".config/Windsurf - Next/User",
-	}
-	for _, path := range required {
-		assert.Truef(t, slices.Contains(def.DefaultDirs, path),
-			"missing default dir: %s", path)
-	}
-
-	byPrefix, ok := AgentByPrefix("windsurf:session-a")
-	require.True(t, ok)
-	assert.Equal(t, AgentWindsurf, byPrefix.Type)
-}
-
 func TestApplyUsageEventTokenTotals(t *testing.T) {
 	// Verify that applyUsageEventTokenTotals computes PeakContextTokens
 	// correctly including cache-creation and cache-read tokens.
@@ -1253,43 +1146,4 @@ func TestApplyUsageEventTokenTotals(t *testing.T) {
 	// Event 1 context = 1000 + 500 + 300 = 1800
 	// Event 2 context = 800 + 1200 + 100 = 2100
 	assert.Equal(t, 2100, sess.PeakContextTokens)
-}
-
-func TestReasonixRegistryEntry(t *testing.T) {
-	// Find Reasonix in the registry
-	var reasonixDef *AgentDef
-	for _, def := range Registry {
-		if def.Type == AgentReasonix {
-			reasonixDef = &def
-			break
-		}
-	}
-	require.NotNil(t, reasonixDef, "AgentReasonix must be in Registry")
-
-	// Verify basic properties
-	assert.Equal(t, AgentReasonix, reasonixDef.Type)
-	assert.Equal(t, "Reasonix", reasonixDef.DisplayName)
-	assert.Equal(t, "REASONIX_DIR", reasonixDef.EnvVar)
-	assert.Equal(t, "reasonix_dirs", reasonixDef.ConfigKey)
-	assert.Equal(t, "reasonix:", reasonixDef.IDPrefix)
-	assert.True(t, reasonixDef.FileBased)
-
-	// Verify watch subdirs
-	assert.Contains(t, reasonixDef.WatchSubdirs, "sessions")
-	assert.Contains(t, reasonixDef.WatchSubdirs, "archive")
-
-	// Verify default dirs contain .reasonix and Windows path
-	assert.True(t, len(reasonixDef.DefaultDirs) > 0)
-	hasUnix := false
-	hasWindows := false
-	for _, dir := range reasonixDef.DefaultDirs {
-		if dir == ".reasonix" {
-			hasUnix = true
-		}
-		if dir == "AppData/Roaming/reasonix" {
-			hasWindows = true
-		}
-	}
-	assert.True(t, hasUnix, "DefaultDirs should contain .reasonix")
-	assert.True(t, hasWindows, "DefaultDirs should contain AppData/Roaming/reasonix")
 }

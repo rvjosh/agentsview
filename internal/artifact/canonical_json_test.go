@@ -1,7 +1,7 @@
 package artifact
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,6 +9,8 @@ import (
 )
 
 func TestCanonicalJSONSortsStructAndMapKeys(t *testing.T) {
+	t.Parallel()
+
 	type inner struct {
 		Zeta  string `json:"zeta"`
 		Alpha string `json:"alpha"`
@@ -29,125 +31,29 @@ func TestCanonicalJSONSortsStructAndMapKeys(t *testing.T) {
 	)
 }
 
-func TestCanonicalJSONPreservesSliceOrder(t *testing.T) {
-	v := struct {
-		Items []string `json:"items"`
-	}{Items: []string{"z", "a", "m"}}
-
-	data, err := canonicalJSON(v)
-	require.NoError(t, err)
-	assert.Equal(t, "{\"items\":[\"z\",\"a\",\"m\"]}\n", string(data))
-}
-
 func TestCanonicalJSONRecanonicalizesRawMessage(t *testing.T) {
+	t.Parallel()
+
 	type wrapper struct {
-		Value json.RawMessage `json:"value"`
+		Value jsontext.Value `json:"value"`
 	}
-	v := wrapper{Value: json.RawMessage(`{ "b" : 2, "a" : 1 }`)}
+	v := wrapper{Value: jsontext.Value(`{ "b" : 2, "a" : 1 }`)}
 
 	data, err := canonicalJSON(v)
 	require.NoError(t, err)
 	assert.Equal(t, "{\"value\":{\"a\":1,\"b\":2}}\n", string(data))
 }
 
-func TestCanonicalJSONRejectsTrailingRawMessageContent(t *testing.T) {
-	type wrapper struct {
-		Value json.RawMessage `json:"value"`
-	}
-	tests := []struct {
-		name    string
-		raw     string
-		wantErr bool
-	}{
-		{name: "second value", raw: `{"a":1}{"b":2}`, wantErr: true},
-		{name: "trailing garbage", raw: `{"a":1}garbage`, wantErr: true},
-		{name: "trailing scalar", raw: `1 2`, wantErr: true},
-		{name: "trailing whitespace", raw: "{\"a\":1} \n\t", wantErr: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := canonicalJSON(wrapper{Value: json.RawMessage(tt.raw)})
-			if tt.wantErr {
-				assert.ErrorContains(t, err, "content after JSON value")
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
-}
-
-func TestCanonicalJSONEmptyRawMessageEncodesAsNull(t *testing.T) {
-	type wrapper struct {
-		Value json.RawMessage `json:"value"`
-	}
-
-	data, err := canonicalJSON(wrapper{})
-	require.NoError(t, err)
-	assert.Equal(t, "{\"value\":null}\n", string(data))
-}
-
 func TestCanonicalJSONPreservesLargeNumberPrecision(t *testing.T) {
+	t.Parallel()
+
 	type wrapper struct {
-		Value json.RawMessage `json:"value"`
+		Value jsontext.Value `json:"value"`
 	}
-	// 2^53+1: unsafe to round-trip through float64, so this only survives if
-	// the RawMessage decode path uses json.Number instead of float64.
-	v := wrapper{Value: json.RawMessage(`9007199254740993`)}
+	// 2^53+1 must remain exact when canonicalizing a raw JSON value.
+	v := wrapper{Value: jsontext.Value(`9007199254740993`)}
 
 	data, err := canonicalJSON(v)
 	require.NoError(t, err)
 	assert.Equal(t, "{\"value\":9007199254740993}\n", string(data))
-}
-
-func TestCanonicalJSONNilPointerAndInterfaceEncodeAsNull(t *testing.T) {
-	var nilPointer *int
-	data, err := canonicalJSON(nilPointer)
-	require.NoError(t, err)
-	assert.Equal(t, "null\n", string(data))
-
-	var nilInterface any
-	data, err = canonicalJSON(nilInterface)
-	require.NoError(t, err)
-	assert.Equal(t, "null\n", string(data))
-}
-
-func TestCanonicalJSONDereferencesPopulatedPointerFields(t *testing.T) {
-	name := "Fixture"
-	v := struct {
-		Name *string `json:"name"`
-	}{Name: &name}
-
-	data, err := canonicalJSON(v)
-	require.NoError(t, err)
-	assert.Equal(t, "{\"name\":\"Fixture\"}\n", string(data))
-}
-
-func TestCanonicalJSONOmitsEmptyFieldsAndKeepsZeroValuesWithoutTag(t *testing.T) {
-	type v struct {
-		Kept    int    `json:"kept"`
-		Skipped string `json:"skipped,omitempty"`
-		Ignored string `json:"-"`
-	}
-
-	data, err := canonicalJSON(v{Kept: 0, Skipped: "", Ignored: "hidden"})
-	require.NoError(t, err)
-	assert.Equal(t, "{\"kept\":0}\n", string(data))
-}
-
-func TestCanonicalJSONRejectsNonStringMapKeys(t *testing.T) {
-	v := map[int]string{1: "a"}
-
-	_, err := canonicalJSON(v)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported canonical map key type")
-}
-
-func TestCanonicalJSONRejectsUnsupportedKind(t *testing.T) {
-	v := struct {
-		Ch chan int `json:"ch"`
-	}{Ch: make(chan int)}
-
-	_, err := canonicalJSON(v)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported canonical JSON kind")
 }

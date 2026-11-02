@@ -1,7 +1,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -96,10 +97,11 @@ func parseAmpSession(
 			role = RoleAssistant
 		}
 
-		content, thinkingText, hasThinking, hasToolUse, tcs, trs :=
-			ExtractTextContent(msg.Get("content"))
+		content, thinkingText, dialogueText, hasThinking, hasToolUse, tcs, trs := ExtractTextContent(context.Background(), msg.Get("content"))
 		trs = append(trs, extractAmpToolResults(msg.Get("content"))...)
-		if strings.TrimSpace(content) == "" && len(trs) == 0 {
+		usage := msg.Get("usage")
+		if strings.TrimSpace(content) == "" && len(trs) == 0 &&
+			(role != RoleAssistant || !ampUsageHasTokenCounters(usage)) {
 			return true
 		}
 
@@ -110,17 +112,21 @@ func parseAmpSession(
 			)
 		}
 
-		messages = append(messages, ParsedMessage{
+		parsed := ParsedMessage{
 			Ordinal:       ordinal,
 			Role:          role,
 			Content:       content,
 			HasThinking:   hasThinking,
+			DialogueText:  new(dialogueText),
 			ThinkingText:  thinkingText,
 			HasToolUse:    hasToolUse,
 			ContentLength: len(content),
 			ToolCalls:     tcs,
 			ToolResults:   trs,
-		})
+		}
+		applyAmpTokenUsage(&parsed, usage)
+
+		messages = append(messages, parsed)
 		ordinal++
 		return true
 	})
@@ -130,9 +136,12 @@ func parseAmpSession(
 		return nil, nil, nil
 	}
 
-	// Use title as FirstMessage when available.
-	if title != "" {
-		firstMessage = title
+	// The thread title is the session name; Amp generates it and
+	// Rename replaces it. It stands in for the first message only when
+	// the thread has no user text.
+	sessionName := strings.TrimSpace(title)
+	if firstMessage == "" {
+		firstMessage = truncate(sessionName, 300)
 	}
 
 	userCount := 0
@@ -148,6 +157,7 @@ func parseAmpSession(
 		Machine:          machine,
 		Agent:            AgentAmp,
 		FirstMessage:     firstMessage,
+		SessionName:      sessionName,
 		StartedAt:        startTime,
 		EndedAt:          endTime,
 		MessageCount:     len(messages),
@@ -159,7 +169,97 @@ func parseAmpSession(
 		},
 	}
 
+	accumulateMessageTokenUsage(sess, messages)
+
 	return sess, messages, nil
+}
+
+func ampUsageHasTokenCounters(usage gjson.Result) bool {
+	return usage.Get("inputTokens").Exists() ||
+		usage.Get("outputTokens").Exists() ||
+		usage.Get("cacheCreationInputTokens").Exists() ||
+		usage.Get("cacheReadInputTokens").Exists()
+}
+
+// ampFoldsCacheCreationIntoInput reports whether Amp's
+// cacheCreationInputTokens for a model holds uncached input rather
+// than cache writes. Amp routes every prompt token into one of its
+// three input buckets. Anthropic-family threads use Anthropic's
+// cache-write semantics, while OpenAI-family threads report
+// inputTokens as 0 and put the whole uncached prompt in
+// cacheCreationInputTokens, so that portion is uncached input.
+//
+// Only gpt-prefixed names are folded. An unrecognized or absent model
+// keeps Amp's own bucket labels: without a known provider there is no
+// evidence for reinterpreting them, and a model that cannot be priced
+// contributes no cost either way.
+func ampFoldsCacheCreationIntoInput(model string) bool {
+	return strings.HasPrefix(model, "gpt-")
+}
+
+// applyAmpTokenUsage normalizes an Amp per-inference usage object into
+// the Anthropic-style shape expected by the usage and cost queries.
+//
+// Amp reports the prompt split across three buckets plus their total:
+//
+//	totalInputTokens = inputTokens + cacheCreationInputTokens +
+//	                   cacheReadInputTokens
+//
+// Anthropic-family threads already carry Anthropic semantics and pass
+// through unchanged. OpenAI-family threads fold cache creation into
+// uncached input and emit no cache-creation bucket: Amp's OpenAI
+// cache-creation count is the whole uncached prompt, not a reported
+// cache write.
+//
+//	inputTokens (+ cacheCreationInputTokens for gpt-*) → input_tokens
+//	outputTokens                                       → output_tokens
+//	cacheCreationInputTokens                           → cache_creation_input_tokens
+//	cacheReadInputTokens                               → cache_read_input_tokens
+func applyAmpTokenUsage(msg *ParsedMessage, usage gjson.Result) {
+	if !usage.Exists() {
+		return
+	}
+
+	msg.Model = usage.Get("model").Str
+
+	// Each inference carries its own timestamp on newer threads. Without
+	// it every inference in a long-lived thread falls back to the
+	// session start and lands in one daily bucket.
+	if ts := parseTimestamp(usage.Get("timestamp").Str); !ts.IsZero() {
+		msg.Timestamp = ts
+	}
+
+	input := int(usage.Get("inputTokens").Int())
+	output := int(usage.Get("outputTokens").Int())
+	cacheCreation := int(usage.Get("cacheCreationInputTokens").Int())
+	cacheRead := int(usage.Get("cacheReadInputTokens").Int())
+
+	normalized := map[string]int{
+		"input_tokens":            input,
+		"output_tokens":           output,
+		"cache_read_input_tokens": cacheRead,
+	}
+	if ampFoldsCacheCreationIntoInput(msg.Model) {
+		normalized["input_tokens"] = input + cacheCreation
+	} else {
+		normalized["cache_creation_input_tokens"] = cacheCreation
+	}
+
+	j, err := json.Marshal(normalized, json.Deterministic(true))
+	if err != nil {
+		return
+	}
+	msg.TokenUsage = j
+
+	msg.OutputTokens = output
+	msg.HasOutputTokens = usage.Get("outputTokens").Exists()
+	// Presence comes from the fields themselves: an inference whose
+	// prompt is entirely cached reports inputTokens as 0, which is
+	// real usage rather than missing data.
+	msg.HasContextTokens = usage.Get("inputTokens").Exists() ||
+		usage.Get("cacheCreationInputTokens").Exists() ||
+		usage.Get("cacheReadInputTokens").Exists()
+	msg.ContextTokens = input + cacheCreation + cacheRead
 }
 
 // AmpThreadID extracts the id field from raw Amp thread JSON
@@ -280,9 +380,20 @@ func extractAmpToolResults(content gjson.Result) []ParsedToolResult {
 			continue
 		}
 
-		var text string
+		var text, status string
+		switch block.Get("run.status").Str {
+		case "done":
+			status = "completed"
+		case "error":
+			status = "errored"
+		case "cancelled":
+			status = "cancelled"
+		}
 		hasResult := false
 		result := block.Get("run.result")
+		if result.Get("success").Type == gjson.False {
+			status = "errored"
+		}
 		if result.Exists() && result.Type != gjson.Null {
 			text = serializeAmpResult(result)
 			hasResult = true
@@ -311,6 +422,8 @@ func extractAmpToolResults(content gjson.Result) []ParsedToolResult {
 
 		results = append(results, ParsedToolResult{
 			ToolUseID:     toolUseID,
+			Source:        "tool_result",
+			Status:        status,
 			ContentRaw:    string(quoted),
 			ContentLength: len(text),
 		})

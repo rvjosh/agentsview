@@ -1,12 +1,12 @@
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-} from "vite-plus/test";
+import { reportSyncFailed } from "../utils/telemetry.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import { commitsDisagree, sync } from "./sync.svelte.js";
-import type { SyncStats, UpdateCheck } from "../api/types.js";
+import type {
+  SyncSyncStats as SyncStats,
+  UpdateCheckResponse as UpdateCheck,
+} from "../api/generated/index.js";
+
+vi.mock("../utils/telemetry.js", () => ({ reportSyncFailed: vi.fn() }));
 
 const api = vi.hoisted(() => ({
   triggerSync: vi.fn(),
@@ -35,9 +35,10 @@ vi.mock("../api/client.js", () => ({
   watchSession: api.watchSession,
 }));
 
-vi.mock("../api/runtime.js", () => ({
-  configureGeneratedClient: vi.fn(),
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+vi.mock("../api/runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../api/runtime.js")>()),
+  ApiError: api.ApiError,
+
   isRemoteConnection: api.isRemoteConnection,
 }));
 
@@ -95,6 +96,68 @@ function mockResyncFailure(error: Error): void {
   });
 }
 
+describe("session watch visibility", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    api.watchSession.mockImplementation(() => Object.assign(new EventTarget(), { close: vi.fn() }));
+  });
+
+  afterEach(() => {
+    sync.unwatchSession();
+    vi.restoreAllMocks();
+  });
+
+  it("closes a hidden session stream and refreshes on return and every reconnect", () => {
+    const onUpdate = vi.fn();
+    const onTiming = vi.fn();
+    sync.watchSession("session-a", onUpdate, onTiming);
+    expect(api.watchSession).toHaveBeenLastCalledWith("session-a", onUpdate, onTiming);
+    const first = api.watchSession.mock.results[0]!.value;
+    first.dispatchEvent(new Event("session_ready"));
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+    vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(api.watchSession).toHaveBeenCalledTimes(1);
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+
+    vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(api.watchSession).toHaveBeenCalledTimes(2);
+    expect(api.watchSession).toHaveBeenLastCalledWith("session-a", onUpdate, onTiming);
+    expect(onUpdate).toHaveBeenCalledTimes(2);
+    const reopened = api.watchSession.mock.results[1]!.value;
+    reopened.dispatchEvent(new Event("open"));
+    expect(onUpdate).toHaveBeenCalledTimes(2);
+    reopened.dispatchEvent(new Event("session_ready"));
+    expect(onUpdate).toHaveBeenCalledTimes(3);
+    reopened.dispatchEvent(new Event("error"));
+    reopened.dispatchEvent(new Event("open"));
+    reopened.dispatchEvent(new Event("session_ready"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(api.watchSession).toHaveBeenCalledTimes(2);
+    expect(onUpdate).toHaveBeenCalledTimes(4);
+  });
+
+  it("only starts the latest selected session when a hidden tab returns", () => {
+    vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    const oldUpdate = vi.fn();
+    const newUpdate = vi.fn();
+    sync.watchSession("session-a", oldUpdate);
+    sync.watchSession("session-b", newUpdate);
+    expect(api.watchSession).not.toHaveBeenCalled();
+
+    vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(api.watchSession).toHaveBeenCalledExactlyOnceWith("session-b", newUpdate, undefined);
+    expect(oldUpdate).not.toHaveBeenCalled();
+    expect(newUpdate).toHaveBeenCalledTimes(1);
+    api.watchSession.mock.results[0]!.value.dispatchEvent(new Event("session_ready"));
+    expect(newUpdate).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("commitsDisagree", () => {
   it.each([
     // Unknown / undefined handling
@@ -112,21 +175,48 @@ describe("commitsDisagree", () => {
 
     // Matches
     { expected: false, hash1: "abc1234", hash2: "abc1234", scenario: "identical short hashes" },
-    { expected: false, hash1: "abc1234", hash2: "abc1234def5678", scenario: "short matches full SHA prefix" },
-    { expected: false, hash1: "abc1234aaaaaaaaaaaa", hash2: "abc1234aaaaaaaaaaaa", scenario: "identical full SHAs" },
-    { expected: false, hash1: "abc12", hash2: "abc1234def5678", scenario: "short abbreviation matching prefix" },
+    {
+      expected: false,
+      hash1: "abc1234",
+      hash2: "abc1234def5678",
+      scenario: "short matches full SHA prefix",
+    },
+    {
+      expected: false,
+      hash1: "abc1234aaaaaaaaaaaa",
+      hash2: "abc1234aaaaaaaaaaaa",
+      scenario: "identical full SHAs",
+    },
+    {
+      expected: false,
+      hash1: "abc12",
+      hash2: "abc1234def5678",
+      scenario: "short abbreviation matching prefix",
+    },
 
     // Mismatches
     { expected: true, hash1: "abc1234", hash2: "def5678", scenario: "different hashes" },
-    { expected: true, hash1: "abc1234aaaaaaaaaaaa", hash2: "def5678bbbbbbbbbbb", scenario: "full SHAs differ" },
-    { expected: true, hash1: "abc1234aaaaaaaaaaaa", hash2: "abc1234bbbbbbbbbbb", scenario: "full SHAs share 7-char prefix" },
-    { expected: true, hash1: "xyz99", hash2: "abc1234def5678", scenario: "short abbreviation not matching" },
-  ])(
-    "returns $expected when $scenario",
-    ({ expected, hash1, hash2 }) => {
-      expect(commitsDisagree(hash1, hash2)).toBe(expected);
+    {
+      expected: true,
+      hash1: "abc1234aaaaaaaaaaaa",
+      hash2: "def5678bbbbbbbbbbb",
+      scenario: "full SHAs differ",
     },
-  );
+    {
+      expected: true,
+      hash1: "abc1234aaaaaaaaaaaa",
+      hash2: "abc1234bbbbbbbbbbb",
+      scenario: "full SHAs share 7-char prefix",
+    },
+    {
+      expected: true,
+      hash1: "xyz99",
+      hash2: "abc1234def5678",
+      scenario: "short abbreviation not matching",
+    },
+  ])("returns $expected when $scenario", ({ expected, hash1, hash2 }) => {
+    expect(commitsDisagree(hash1, hash2)).toBe(expected);
+  });
 });
 
 describe("SyncStore.loadStats", () => {
@@ -169,7 +259,7 @@ describe("SyncStore.loadStats", () => {
       );
 
     // Start first request (include one-shot).
-    const p1 = sync.loadStats({ includeOneShot: true });
+    const p1 = sync.loadStats({ include_one_shot: true });
     // Start second request (exclude one-shot) before first resolves.
     const p2 = sync.loadStats({});
 
@@ -208,7 +298,7 @@ describe("SyncStore.loadStats", () => {
         }),
       );
 
-    const p1 = sync.loadStats({ includeOneShot: true });
+    const p1 = sync.loadStats({ include_one_shot: true });
     const p2 = sync.loadStats({});
 
     resolveNewer(newer);
@@ -277,6 +367,86 @@ describe("SyncStore.triggerSync", () => {
   });
 });
 
+describe("SyncStore.triggerSync stale archive", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const s = sync as unknown as Record<string, unknown>;
+    s.syncing = false;
+    s.progress = null;
+    s.serverVersion = null;
+    s.archiveStale = false;
+    s.lastSyncError = null;
+    s.syncCompleteListeners = [];
+  });
+
+  afterEach(() => {
+    const s = sync as unknown as Record<string, unknown>;
+    s.archiveStale = false;
+    s.lastSyncError = null;
+  });
+
+  it("rebuilds the archive instead of syncing when it is stale", async () => {
+    mockResyncSuccess();
+    const s = sync as unknown as Record<string, unknown>;
+    s.archiveStale = true;
+    const onComplete = vi.fn();
+
+    sync.triggerSync(onComplete);
+
+    await vi.waitFor(() => {
+      expect(onComplete).toHaveBeenCalled();
+    });
+    expect(api.triggerSync).not.toHaveBeenCalled();
+    expect(api.triggerResync).toHaveBeenCalledTimes(1);
+  });
+
+  it("rebuilds the archive when the server rejects a sync as needing one", async () => {
+    vi.mocked(api.triggerSync).mockReturnValue({
+      abort: vi.fn(),
+      done: Promise.reject(new api.ApiError(409, "archive data version changed")),
+    });
+    mockResyncSuccess();
+    const onComplete = vi.fn();
+
+    sync.triggerSync(onComplete);
+
+    await vi.waitFor(() => {
+      expect(onComplete).toHaveBeenCalled();
+    });
+    expect(api.triggerSync).toHaveBeenCalledTimes(1);
+    expect(api.triggerResync).toHaveBeenCalledTimes(1);
+    expect(sync.lastSyncStats).toEqual(MOCK_STATS);
+    expect(sync.lastSyncError).toBeNull();
+    expect(reportSyncFailed).not.toHaveBeenCalled();
+  });
+
+  it("keeps a sync failure for the status bar until a sync succeeds", async () => {
+    const error = new Error("the required archive rebuild did not complete");
+    vi.mocked(api.triggerSync).mockReturnValue({ abort: vi.fn(), done: Promise.reject(error) });
+
+    sync.triggerSync();
+
+    await vi.waitFor(() => {
+      expect(sync.lastSyncError).toBe(error.message);
+    });
+    expect(api.triggerResync).not.toHaveBeenCalled();
+    expect(sync.syncing).toBe(false);
+
+    vi.mocked(api.triggerSync).mockReturnValue({
+      abort: vi.fn(),
+      done: Promise.resolve(MOCK_STATS),
+    });
+    mockResyncSuccess();
+    const onComplete = vi.fn();
+    sync.triggerSync(onComplete);
+
+    await vi.waitFor(() => {
+      expect(onComplete).toHaveBeenCalled();
+    });
+    expect(sync.lastSyncError).toBeNull();
+  });
+});
+
 describe("SyncStore.triggerResync", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -307,8 +477,21 @@ describe("SyncStore.triggerResync", () => {
 
     await vi.waitFor(() => {
       expect(onError).toHaveBeenCalledWith(error);
+      expect(reportSyncFailed).toHaveBeenCalledExactlyOnceWith(error);
     });
     expect(sync.syncing).toBe(false);
+  });
+
+  it.each([
+    new DOMException("Cancelled", "AbortError"),
+    Object.assign(new Error("Cancelled"), { name: "AbortError" }),
+  ])("ignores a cancelled resync: %s", async (error) => {
+    mockResyncFailure(error);
+    sync.triggerResync();
+    await expect(api.triggerResync.mock.results[0]!.value.done).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    expect(reportSyncFailed).not.toHaveBeenCalled();
   });
 
   it("resets syncing on non-Error rejection", async () => {
@@ -323,9 +506,7 @@ describe("SyncStore.triggerResync", () => {
     await vi.waitFor(() => {
       expect(onError).toHaveBeenCalled();
     });
-    expect(onError).toHaveBeenCalledWith(
-      expect.objectContaining({ message: "Sync failed" }),
-    );
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: "Sync failed" }));
     expect(sync.syncing).toBe(false);
   });
 
@@ -362,6 +543,30 @@ describe("SyncStore.triggerResync", () => {
     expect(sync.lastSyncStats).toEqual(MOCK_STATS);
   });
 
+  it("does not report a sync failure when onComplete throws after success", async () => {
+    mockResyncSuccess();
+    api.getVersion.mockResolvedValue({
+      build_date: "",
+      commit: "abc123",
+      read_only: false,
+      version: "dev",
+    });
+    const error = new Error("completion callback failed");
+    const onComplete = vi.fn(() => {
+      throw error;
+    });
+    const onError = vi.fn();
+    sync.triggerResync(onComplete, onError);
+
+    await vi.waitFor(() => {
+      expect(onError).toHaveBeenCalledExactlyOnceWith(error);
+    });
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(sync.syncing).toBe(false);
+    expect(sync.lastSyncStats).toEqual(MOCK_STATS);
+    expect(reportSyncFailed).not.toHaveBeenCalled();
+  });
+
   it("rejects full resync for read-only backends", () => {
     const s = sync as unknown as Record<string, unknown>;
     s.serverVersion = {
@@ -378,10 +583,23 @@ describe("SyncStore.triggerResync", () => {
     expect(api.triggerResync).not.toHaveBeenCalled();
     expect(onError).toHaveBeenCalledWith(
       expect.objectContaining({
-        message:
-          "Full resync is unavailable for read-only backends.",
+        message: "Full resync is unavailable for read-only backends.",
       }),
     );
+  });
+
+  it("blocks sync and resync for an archive-only server", async () => {
+    api.getVersion.mockResolvedValue({
+      version: "dev",
+      commit: "unknown",
+      build_date: "",
+      archive_only: true,
+    });
+    await sync.loadVersion();
+    sync.triggerSync();
+    expect(sync.triggerResync()).toBe(false);
+    expect(api.triggerSync).not.toHaveBeenCalled();
+    expect(api.triggerResync).not.toHaveBeenCalled();
   });
 });
 
@@ -421,9 +639,7 @@ describe("SyncStore.checkForUpdate", () => {
       current_version: "v0.9.0",
       latest_version: "v1.0.0",
     };
-    vi.mocked(api.checkForUpdate).mockResolvedValue(
-      mockResult,
-    );
+    vi.mocked(api.checkForUpdate).mockResolvedValue(mockResult);
 
     const s = sync as unknown as Record<string, unknown>;
     const original = s.isDesktop;
@@ -459,9 +675,7 @@ describe("SyncStore.remoteUnreachable", () => {
 
   it("flags unreachable when a remote load fails", async () => {
     vi.mocked(api.isRemoteConnection).mockReturnValue(true);
-    vi.mocked(api.getSyncStatus).mockRejectedValue(
-      new TypeError("Failed to fetch"),
-    );
+    vi.mocked(api.getSyncStatus).mockRejectedValue(new TypeError("Failed to fetch"));
 
     await sync.loadStatus();
 
@@ -638,9 +852,7 @@ describe("SyncStore.remoteUnreachable", () => {
 
   it("does not flag unreachable for local connections", async () => {
     vi.mocked(api.isRemoteConnection).mockReturnValue(false);
-    vi.mocked(api.getSyncStatus).mockRejectedValue(
-      new TypeError("Failed to fetch"),
-    );
+    vi.mocked(api.getSyncStatus).mockRejectedValue(new TypeError("Failed to fetch"));
 
     await sync.loadStatus();
 
@@ -649,9 +861,7 @@ describe("SyncStore.remoteUnreachable", () => {
 
   it("flags backend degraded instead of unreachable on 5xx", async () => {
     vi.mocked(api.isRemoteConnection).mockReturnValue(true);
-    vi.mocked(api.getSyncStatus).mockRejectedValue(
-      new api.ApiError(503, "pg unavailable"),
-    );
+    vi.mocked(api.getSyncStatus).mockRejectedValue(new api.ApiError(503, "pg unavailable"));
 
     await sync.loadStatus();
 
@@ -669,9 +879,7 @@ describe("SyncStore.remoteUnreachable", () => {
       last_sync: "",
       stats: MOCK_STATS,
     });
-    vi.mocked(api.getStats).mockRejectedValue(
-      new api.ApiError(503, "pg unavailable"),
-    );
+    vi.mocked(api.getStats).mockRejectedValue(new api.ApiError(503, "pg unavailable"));
 
     await sync.loadStatus();
 
@@ -759,9 +967,7 @@ describe("SyncStore.remoteUnreachable", () => {
       last_sync: "",
       stats: MOCK_STATS,
     });
-    vi.mocked(api.getVersion).mockRejectedValue(
-      new Error("version still unavailable"),
-    );
+    vi.mocked(api.getVersion).mockRejectedValue(new Error("version still unavailable"));
 
     await sync.loadStatus();
 
@@ -794,9 +1000,7 @@ describe("SyncStore.remoteUnreachable", () => {
     const s = sync as unknown as Record<string, unknown>;
     s.backendDegraded = true;
     s.backendDegradedMessage = "sync not ready";
-    vi.mocked(api.getSyncStatus).mockRejectedValue(
-      new TypeError("Failed to fetch"),
-    );
+    vi.mocked(api.getSyncStatus).mockRejectedValue(new TypeError("Failed to fetch"));
 
     await sync.loadStatus();
 

@@ -25,6 +25,7 @@ func TestOutputFormat_Resolves(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			cmd := &cobra.Command{Use: "x"}
 			registerFormatFlags(cmd.Flags())
 			require.NoError(t, cmd.ParseFlags(tt.args))
@@ -47,15 +48,17 @@ func TestOutputFormat_RejectsInvalid(t *testing.T) {
 // openapi (spec-only) are deliberately excluded.
 var machineOutputCommandPaths = [][]string{
 	{"version"},
-	{"projects"},
-	{"health"},
-	{"usage", "daily"},
-	{"activity", "report"},
-	{"stats"},
+	{"kata", "status"},
+	{"project", "list"},
+	{"session", "health"},
+	{"report", "usage", "daily"},
+	{"report", "usage", "statusline"},
+	{"report", "activity"},
+	{"report", "stats"},
 	{"secrets", "list"},
 	{"secrets", "scan"},
 	{"export", "sessions"},
-	{"parse-diff"},
+	{"archive", "diff"},
 	{"session", "list"},
 	{"session", "get"},
 	{"session", "messages"},

@@ -1,0 +1,233 @@
+package sync
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"time"
+
+	"go.kenn.io/agentsview/internal/parser"
+)
+
+// ChangedPathSyncResult describes bounded, non-destructive processing of a
+// remote changed-path plan. Cache attribution remains process-local.
+type ChangedPathSyncResult struct {
+	Stats                   SyncStats
+	FilesDiscovered         int
+	FilesProcessed          int
+	FallbackSources         int
+	CachedSourceKeys        map[string]struct{}      `json:"-"`
+	CachedFallbackProviders map[parser.AgentType]int `json:"-"`
+}
+
+// ChangedPathSyncOptions controls execution-only behavior for a planned
+// changed-path import. ForceFullParse is the armed journal projection: its
+// exact sources and fallback providers bypass freshness and incremental append.
+// A durable skip entry may still suppress a source attempted after the
+// journal's cache invalidation was consumed.
+type ChangedPathSyncOptions struct {
+	ForceFullParse ChangedPathPruneScope
+}
+
+// SyncChangedPathPlanContext processes exact sources and explicitly selected
+// provider fallbacks without granting deletion authority over missing sources.
+func (e *Engine) SyncChangedPathPlanContext(
+	ctx context.Context,
+	plan ChangedPathPlan,
+	onProgress ProgressFunc,
+) (ChangedPathSyncResult, error) {
+	return e.SyncChangedPathPlanWithOptionsContext(
+		ctx, plan, ChangedPathSyncOptions{}, onProgress,
+	)
+}
+
+// SyncChangedPathPlanWithOptionsContext processes a plan with explicit
+// execution scope. Keeping the armed scope separate from the import plan lets
+// disarmed journal entries remain importable without re-forcing poison paths.
+func (e *Engine) SyncChangedPathPlanWithOptionsContext(
+	ctx context.Context,
+	plan ChangedPathPlan,
+	options ChangedPathSyncOptions,
+	onProgress ProgressFunc,
+) (result ChangedPathSyncResult, retErr error) {
+	if e.sourceSyncErr != nil {
+		return ChangedPathSyncResult{}, e.sourceSyncErr
+	}
+	ctx = e.parsePolicyContext(ctx)
+	result = ChangedPathSyncResult{
+		CachedSourceKeys:        make(map[string]struct{}),
+		CachedFallbackProviders: make(map[parser.AgentType]int),
+	}
+	if e.refuseWriteInForceParse("SyncChangedPathPlan") {
+		return result, nil
+	}
+
+	fallback, err := e.discoverChangedPathFallbackProviders(
+		ctx, plan.FallbackProviders,
+	)
+	if err != nil {
+		return result, err
+	}
+	fallbackFiles := fallback.files
+	forceSourceKeys := make(map[string]struct{}, len(options.ForceFullParse.Files))
+	for _, file := range options.ForceFullParse.Files {
+		forceSourceKeys[changedPathSourceKey(file)] = struct{}{}
+	}
+	forceProviders := make(map[parser.AgentType]struct{},
+		len(options.ForceFullParse.FallbackProviders))
+	for _, agent := range options.ForceFullParse.FallbackProviders {
+		forceProviders[agent] = struct{}{}
+	}
+	planFiles := append([]parser.DiscoveredFile(nil), plan.Files...)
+	for i := range planFiles {
+		if _, force := forceSourceKeys[changedPathSourceKey(planFiles[i])]; force {
+			// The journal scope supersedes plan-time ForceParse. Its cache was
+			// already invalidated durably, so a surviving entry is proof of a
+			// later attempt and must be allowed to suppress replay.
+			planFiles[i].ForceParse = false
+			planFiles[i].ForceFullParse = true
+		}
+	}
+	for i := range fallbackFiles {
+		if _, force := forceProviders[fallbackFiles[i].Agent]; force {
+			fallbackFiles[i].ForceFullParse = true
+		}
+	}
+	for _, count := range fallback.counts {
+		result.FallbackSources += count
+	}
+	exactKeys := make(map[string]struct{}, len(plan.Files))
+	for _, file := range plan.Files {
+		exactKeys[changedPathSourceKey(file)] = struct{}{}
+	}
+	fallbackKeys := make(map[string]parser.AgentType, len(fallbackFiles))
+	for _, file := range fallbackFiles {
+		key := changedPathSourceKey(file)
+		if _, exact := exactKeys[key]; !exact {
+			fallbackKeys[key] = file.Agent
+		}
+	}
+	files := sortAndDedupeChangedPathFiles(append(
+		planFiles, fallbackFiles...,
+	))
+	result.FilesDiscovered = len(files)
+	changedPaths := make([]string, 0, len(plan.attribution))
+	for path := range plan.attribution {
+		changedPaths = append(changedPaths, path)
+	}
+	if len(files) == 0 {
+		// A title store change alone plans no session files.
+		e.syncMu.Lock()
+		e.invalidateNativeTitleCache(changedPaths)
+		e.reconcileNativeTitlesLocked(ctx, &result.Stats)
+		e.recordNativeTitleUpdates(result.Stats)
+		e.syncMu.Unlock()
+		fallback.applyFailures(&result.Stats)
+		if result.Stats.TitlesUpdated > 0 {
+			e.emit("sessions")
+		}
+		return result, errors.Join(ctx.Err(), errors.Join(fallback.incomplete...))
+	}
+
+	e.syncMu.Lock()
+	e.invalidateNativeTitleCache(changedPaths)
+	var stats SyncStats
+	defer func() {
+		if stats.hasSessionChanges() {
+			e.emit("sessions")
+		}
+	}()
+	defer e.syncMu.Unlock()
+	defer e.clearCurrentProgress()
+	e.resetS3CodexIndexCache()
+	e.anomalies.reset()
+	processErr := errors.Join(fallback.incomplete...)
+
+	physicalPaths := make([]string, 0, len(files))
+	for _, file := range files {
+		physicalPaths = append(physicalPaths, parser.ResolveSourceFilePath(file.Path))
+	}
+	ctx, closeProviderCache, err := e.withProviderFingerprintCache(ctx, physicalPaths)
+	if err != nil {
+		result.Stats = SyncStats{Aborted: true}
+		return result, err
+	}
+	defer func() { retErr = errors.Join(retErr, closeProviderCache()) }()
+	preContainerStates := e.captureSQLiteContainerStates(physicalPaths)
+	if err := e.prepareSQLiteContainerVerification(ctx, preContainerStates); err != nil {
+		result.Stats = SyncStats{Aborted: true}
+		return result, err
+	}
+	e.beginSQLiteContainerPass(files, preContainerStates)
+	processingCtx := context.WithValue(ctx, deferGlobalLinkContextKey{}, true)
+	processingCtx = parser.WithProjectRootMemo(processingCtx)
+	processingCtx = parser.WithCodexParentInventoryBatch(processingCtx)
+	results := e.startWorkers(processingCtx, files)
+	affectedSessionIDs := make(changedSessionLinks)
+	stats = e.collectAndBatchWithOptions(
+		processingCtx, results, len(files), len(files), func(progress Progress) {
+			progress.FallbackProviders = len(plan.FallbackProviders)
+			progress.FallbackSources = result.FallbackSources
+			if onProgress != nil {
+				onProgress(progress)
+			}
+		}, syncWriteDefault, collectAndBatchOptions{
+			observeResult: func(job syncJob) {
+				result.FilesProcessed++
+				affectedSessionIDs.observe(job, e.idPrefix)
+				if !job.cachedSkip {
+					return
+				}
+				key := changedPathSourceKey(parser.DiscoveredFile{
+					Agent: job.agent, Path: job.path,
+				})
+				if _, exact := exactKeys[key]; exact {
+					result.CachedSourceKeys[key] = struct{}{}
+					return
+				}
+				if agent, fallback := fallbackKeys[key]; fallback {
+					result.CachedFallbackProviders[agent]++
+				}
+			},
+		},
+	)
+	fallback.applyFailures(&stats)
+	processErr = errors.Join(processErr, e.finishCodexParentInventoryBatch(processingCtx, &stats))
+	if err := affectedSessionIDs.link(ctx, e, &stats); err != nil {
+		stats.RecordFailed()
+		processErr = errors.Join(processErr, err)
+	}
+	e.anomalies.applyTo(&stats)
+	// Pass-level failures cannot be attributed to one container, so they
+	// poison the whole capture; a clean plan subset keeps its verification
+	// age and, being partial, never promotes.
+	if ctx.Err() != nil || processErr != nil || !stats.ProcessingComplete() {
+		e.poisonSQLiteContainerPass()
+	}
+	e.finishSQLiteContainerPass(ctx, true, false)
+	if !e.ephemeral {
+		e.persistSkipCache(ctx)
+	}
+	processingComplete := stats.ProcessingComplete()
+	e.reconcileNativeTitlesLocked(ctx, &stats)
+	e.mu.Lock()
+	e.lastSync = time.Now()
+	e.lastSyncStats = stats
+	e.mu.Unlock()
+	result.Stats = stats
+
+	if stats.Synced > 0 || stats.CwdUpdated > 0 {
+		log.Printf("sync: %d file(s) updated", stats.Synced)
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if !processingComplete {
+		return result, errors.Join(processErr, fmt.Errorf(
+			"changed-path plan sync incomplete: %d source or archive failures",
+			stats.Failed,
+		))
+	}
+	return result, processErr
+}

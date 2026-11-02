@@ -1,7 +1,8 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,31 +32,38 @@ type kiroMeta struct {
 // discoverLegacyJSONL finds all .jsonl session files under a Kiro
 // CLI sessions directory. Layout:
 // <sessionsDir>/<uuid>.jsonl  (with companion <uuid>.json)
-func (s kiroSourceSet) discoverLegacyJSONL(sessionsDir string) []DiscoveredFile {
-	entries, err := os.ReadDir(sessionsDir)
-	if err != nil {
-		return nil
-	}
-
+func (s kiroSourceSet) discoverLegacyJSONL(sessionsDir string) ([]DiscoveredFile, error) {
 	var files []DiscoveredFile
-	for _, e := range entries {
-		if e.IsDir() {
+	for _, dir := range []string{sessionsDir, filepath.Join(sessionsDir, "cli")} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("read Kiro legacy directory %s: %w", dir, err)
+			}
 			continue
 		}
-		name := e.Name()
-		if !strings.HasSuffix(name, ".jsonl") {
-			continue
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			if _, err := loadKiroMetaStrict(path); err != nil {
+				return nil, err
+			}
+			regular, err := kiroRegularFileUnderRootChecked(sessionsDir, path)
+			if err != nil {
+				return nil, fmt.Errorf("probe Kiro legacy transcript %s: %w", path, err)
+			}
+			if regular {
+				files = append(files, DiscoveredFile{Path: path, Agent: AgentKiro})
+			}
 		}
-		files = append(files, DiscoveredFile{
-			Path:  filepath.Join(sessionsDir, name),
-			Agent: AgentKiro,
-		})
 	}
 
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].Path < files[j].Path
 	})
-	return files
+	return files, nil
 }
 
 // legacySourceFile locates a legacy Kiro JSONL session file by its raw
@@ -64,14 +72,13 @@ func (s kiroSourceSet) legacySourceFile(sessionsDir, rawID string) string {
 	if sessionsDir == "" || !IsValidSessionID(rawID) {
 		return ""
 	}
-	candidate := filepath.Join(sessionsDir, rawID+".jsonl")
-	if abs, err := filepath.Abs(candidate); err != nil || !strings.HasPrefix(abs, filepath.Clean(sessionsDir)) {
-		return ""
+	for _, dir := range []string{sessionsDir, filepath.Join(sessionsDir, "cli")} {
+		candidate := filepath.Join(dir, rawID+".jsonl")
+		if _, err := os.Stat(candidate); err == nil && kiroRegularFileUnderRoot(sessionsDir, candidate) {
+			return candidate
+		}
 	}
-	if _, err := os.Stat(candidate); err != nil {
-		return ""
-	}
-	return candidate
+	return ""
 }
 
 // KiroSessionIDFromPath returns the logical raw session ID for a
@@ -88,23 +95,31 @@ func KiroSessionIDFromPath(jsonlPath string) string {
 // loadKiroMeta reads the companion .json metadata file for a
 // session JSONL file.
 func loadKiroMeta(jsonlPath string) *kiroMeta {
+	meta, _ := loadKiroMetaStrict(jsonlPath)
+	return meta
+}
+
+func loadKiroMetaStrict(jsonlPath string) (*kiroMeta, error) {
 	jsonPath := strings.TrimSuffix(jsonlPath, ".jsonl") + ".json"
 	data, err := os.ReadFile(jsonPath)
 	if err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read Kiro legacy metadata %s: %w", jsonPath, err)
 	}
 	var m kiroMeta
 	if err := json.Unmarshal(data, &m); err != nil {
-		return nil
+		return nil, fmt.Errorf("decode Kiro legacy metadata %s: %w", jsonPath, err)
 	}
-	return &m
+	return &m, nil
 }
 
-// parseLegacySession parses a Kiro CLI session from its JSONL file.
+// parseLegacySessionContext parses a Kiro CLI session from its JSONL file.
 // Returns (nil, nil, nil) if the file doesn't exist or contains
 // no user/assistant messages.
-func (p *kiroProvider) parseLegacySession(
-	path, machine string,
+func (p *kiroProvider) parseLegacySessionContext(
+	ctx context.Context, path, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -211,13 +226,16 @@ func (p *kiroProvider) parseLegacySession(
 	}
 
 	// Extract metadata from companion .json file.
-	meta := loadKiroMeta(path)
+	meta, err := loadKiroMetaStrict(path)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	sessionID := strings.TrimSuffix(
 		filepath.Base(path), ".jsonl",
 	)
 
-	var project, cwd string
+	var project, cwd, sessionName string
 	var startedAt, endedAt time.Time
 
 	if meta != nil {
@@ -226,10 +244,11 @@ func (p *kiroProvider) parseLegacySession(
 		}
 		cwd = meta.Cwd
 		if cwd != "" {
-			project = ExtractProjectFromCwd(cwd)
+			project = ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
 		}
-		if meta.Title != "" && firstMessage == "" {
-			firstMessage = meta.Title
+		sessionName = strings.TrimSpace(meta.Title)
+		if firstMessage == "" {
+			firstMessage = sessionName
 		}
 		startedAt = parseTimestamp(meta.CreatedAt)
 		endedAt = parseTimestamp(meta.UpdatedAt)
@@ -255,6 +274,7 @@ func (p *kiroProvider) parseLegacySession(
 		Agent:            AgentKiro,
 		Cwd:              cwd,
 		FirstMessage:     firstMessage,
+		SessionName:      sessionName,
 		StartedAt:        startedAt,
 		EndedAt:          endedAt,
 		MessageCount:     len(messages),
@@ -267,6 +287,249 @@ func (p *kiroProvider) parseLegacySession(
 	}
 
 	return sess, messages, nil
+}
+
+type kiroCurrentMeta struct {
+	Title          string   `json:"title"`
+	CreatedAt      string   `json:"createdAt"`
+	LastModifiedAt string   `json:"lastModifiedAt"`
+	WorkspacePaths []string `json:"workspacePaths"`
+}
+
+func (m kiroCurrentMeta) cwd() string {
+	if len(m.WorkspacePaths) > 0 {
+		return m.WorkspacePaths[0]
+	}
+	return ""
+}
+
+// readKiroCurrentMeta reads the session.json beside a session transcript. A
+// session without one has empty metadata.
+func readKiroCurrentMeta(roots []string, transcript string) (kiroCurrentMeta, error) {
+	meta := kiroCurrentMeta{}
+	sidecar, ok := kiroCurrentSidecarPath(roots, transcript)
+	if !ok {
+		return meta, nil
+	}
+	data, err := os.ReadFile(sidecar)
+	if err != nil {
+		return meta, fmt.Errorf("read Kiro current metadata %s: %w", sidecar, err)
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return meta, fmt.Errorf("decode Kiro current metadata %s: %w", sidecar, err)
+	}
+	return meta, nil
+}
+
+// kiroSubagentToolName is the Task tool name recorded for a kiro-cli
+// subagent spawn. kiro-cli writes the spawn as sub_agent_start and
+// sub_agent_complete records instead of a tool_call/tool_result pair.
+const kiroSubagentToolName = "invoke_subagent"
+
+// kiroSubagentInput is the Task tool input recorded for a subagent spawn,
+// using the field names the session viewer reads for Task calls.
+type kiroSubagentInput struct {
+	SubagentType string `json:"subagent_type,omitempty"`
+	Description  string `json:"description,omitempty"`
+	Prompt       string `json:"prompt,omitempty"`
+}
+
+// isKiroSubagentID reports whether id can name a subagent session. A
+// subagent is stored as kiro:<id> beside top-level sessions, so an ID shaped
+// like a session directory (sess_<id>) is rejected: it would collide with
+// that session.
+func isKiroSubagentID(id string) bool {
+	return IsValidSessionID(id) && !isKiroCurrentSessionDir(id)
+}
+
+// parseCurrentSessionContext parses a session's messages.jsonl or one of its
+// subagent transcripts. A subagent takes its project and working directory
+// from its session's session.json and is linked to that session; the
+// subagent linker re-parents a nested subagent onto the subagent whose Task
+// call spawned it.
+func (p *kiroProvider) parseCurrentSessionContext(
+	ctx context.Context, src kiroSource, machine string,
+) (*ParsedSession, []ParsedMessage, error) {
+	path, sessionID := src.Path, src.SessionID
+	sessionTranscript, parentSessionID := path, ""
+	if src.Kind == kiroSourceSubagentJSONL {
+		transcript, sessionDir, ok := kiroSubagentPathUnderRoot(src.Root, path)
+		if !ok {
+			return nil, nil, fmt.Errorf("kiro subagent transcript outside a session: %s", path)
+		}
+		sessionTranscript, parentSessionID = transcript, "kiro:"+sessionDir
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	lr := newLineReader(f, maxLineSize)
+	defer releaseLineReader(lr)
+	var messages []ParsedMessage
+	firstMessage := ""
+	ordinal := 0
+	var earliestMessage, latestMessage time.Time
+	for {
+		line, ok := lr.next()
+		if !ok {
+			break
+		}
+		if !gjson.Valid(line) {
+			continue
+		}
+		payload := gjson.Get(line, "payload")
+		timestamp := kiroCurrentMessageTimestamp(gjson.Get(line, "timestamp"))
+		typ := payload.Get("type").Str
+		content := strings.TrimSpace(payload.Get("content").Str)
+		accepted := false
+		switch typ {
+		case "user", "assistant":
+			if content == "" {
+				continue
+			}
+			role := RoleUser
+			if typ == "assistant" {
+				role = RoleAssistant
+			}
+			if role == RoleUser && firstMessage == "" {
+				firstMessage = truncate(strings.ReplaceAll(content, "\n", " "), 300)
+			}
+			messages = append(messages, ParsedMessage{Ordinal: ordinal, Role: role, Content: content, Timestamp: timestamp, ContentLength: len(content), Model: payload.Get("reasoningModelId").Str})
+			accepted = true
+			ordinal++
+		case "tool_call":
+			name, id := payload.Get("toolName").Str, payload.Get("toolCallId").Str
+			if name == "" || id == "" {
+				continue
+			}
+			call := ParsedToolCall{ToolUseID: id, ToolName: name, Category: NormalizeToolCategory(name), InputJSON: payload.Get("args").Raw}
+			display := kiroFormatToolCalls([]ParsedToolCall{call})
+			messages = append(messages, ParsedMessage{Ordinal: ordinal, Role: RoleAssistant, Content: display, Timestamp: timestamp, ContentLength: len(display), HasToolUse: true, ToolCalls: []ParsedToolCall{call}})
+			accepted = true
+			ordinal++
+		case "tool_result":
+			id := payload.Get("toolCallId").Str
+			if id == "" {
+				continue
+			}
+			raw := payload.Get("content").Raw
+			messages = append(messages, ParsedMessage{Ordinal: ordinal, Role: RoleUser, Timestamp: timestamp, ToolResults: []ParsedToolResult{{ToolUseID: id, ContentRaw: raw, ContentLength: len(raw)}}})
+			accepted = true
+			ordinal++
+		case "sub_agent_start":
+			// Record ids repeat in real kiro-cli output, so the subagent's
+			// session ID is the only reliable key pairing start, complete,
+			// and the subagent's own transcript.
+			subID := payload.Get("subSessionId").Str
+			if !isKiroSubagentID(subID) {
+				continue
+			}
+			input, err := json.Marshal(kiroSubagentInput{SubagentType: payload.Get("subAgentName").Str, Description: payload.Get("explanation").Str, Prompt: payload.Get("prompt").Str})
+			if err != nil {
+				return nil, nil, fmt.Errorf("encode Kiro subagent input in %s: %w", path, err)
+			}
+			call := ParsedToolCall{ToolUseID: subID, ToolName: kiroSubagentToolName, Category: NormalizeToolCategory(kiroSubagentToolName), InputJSON: string(input), SubagentSessionID: "kiro:" + subID}
+			display := kiroFormatToolCalls([]ParsedToolCall{call})
+			messages = append(messages, ParsedMessage{Ordinal: ordinal, Role: RoleAssistant, Content: display, Timestamp: timestamp, ContentLength: len(display), HasToolUse: true, ToolCalls: []ParsedToolCall{call}})
+			accepted = true
+			ordinal++
+		case "sub_agent_complete":
+			subID := payload.Get("subSessionId").Str
+			if !isKiroSubagentID(subID) {
+				continue
+			}
+			// A failed spawn reports an errorMessage and may leave response
+			// empty; any non-empty response is kept as the result.
+			response := payload.Get("response")
+			raw := response.Raw
+			if !response.Exists() || response.Type == gjson.Null || (response.Type == gjson.String && response.Str == "") {
+				if errRaw := payload.Get("errorMessage").Raw; errRaw != "" {
+					raw = errRaw
+				}
+			}
+			status := ""
+			switch payload.Get("status").Str {
+			case "success":
+				status = "completed"
+			case "error":
+				status = "errored"
+			}
+			messages = append(messages, ParsedMessage{Ordinal: ordinal, Role: RoleUser, Timestamp: timestamp, ToolResults: []ParsedToolResult{{ToolUseID: subID, Source: "tool_result", Status: status, ContentRaw: raw, ContentLength: len(raw)}}})
+			accepted = true
+			ordinal++
+		}
+		if accepted && !timestamp.IsZero() {
+			if earliestMessage.IsZero() || timestamp.Before(earliestMessage) {
+				earliestMessage = timestamp
+			}
+			if latestMessage.IsZero() || timestamp.After(latestMessage) {
+				latestMessage = timestamp
+			}
+		}
+	}
+	if err := lr.Err(); err != nil {
+		return nil, nil, fmt.Errorf("reading kiro %s: %w", path, err)
+	}
+	if len(messages) == 0 {
+		return nil, nil, nil
+	}
+	meta, err := readKiroCurrentMeta(p.sources.roots, sessionTranscript)
+	if err != nil {
+		return nil, nil, err
+	}
+	cwd := meta.cwd()
+	project := ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
+	if project == "" {
+		project = "unknown"
+	}
+	var startedAt, endedAt time.Time
+	sessionName, relationship := meta.Title, RelationshipType("")
+	if parentSessionID == "" {
+		startedAt, endedAt = parseTimestamp(meta.CreatedAt), parseTimestamp(meta.LastModifiedAt)
+	} else {
+		// session.json describes the spawning session, not the subagent.
+		sessionName, relationship = "", RelSubagent
+	}
+	if startedAt.IsZero() {
+		startedAt = earliestMessage
+		if startedAt.IsZero() {
+			startedAt = info.ModTime()
+		}
+	}
+	if endedAt.IsZero() {
+		endedAt = latestMessage
+		if endedAt.IsZero() {
+			endedAt = info.ModTime()
+		}
+	}
+	userCount := 0
+	for _, msg := range messages {
+		if msg.Role == RoleUser && msg.Content != "" {
+			userCount++
+		}
+	}
+	return &ParsedSession{ID: "kiro:" + sessionID, Project: project, Machine: machine, Agent: AgentKiro, Cwd: cwd, FirstMessage: firstMessage, StartedAt: startedAt, EndedAt: endedAt, MessageCount: len(messages), UserMessageCount: userCount, SessionName: sessionName, ParentSessionID: parentSessionID, RelationshipType: relationship, File: FileInfo{Path: path, Size: info.Size(), Mtime: info.ModTime().UnixNano()}}, messages, nil
+}
+
+func kiroCurrentMessageTimestamp(value gjson.Result) time.Time {
+	if ts := parseTimestamp(value.Str); !ts.IsZero() {
+		return ts
+	}
+	if value.Type == gjson.Number {
+		millis := value.Int()
+		if millis != 0 {
+			return time.UnixMilli(millis).UTC()
+		}
+	}
+	return time.Time{}
 }
 
 // kiroExtractText extracts concatenated text from a Kiro message's

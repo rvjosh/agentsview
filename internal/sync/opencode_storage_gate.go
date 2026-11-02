@@ -47,7 +47,7 @@ func (e *Engine) openCodeStorageSessionPath(file parser.DiscoveredFile) string {
 	if isOpenCodeFormatSQLiteVirtualPath(file.Agent, file.Path) {
 		return ""
 	}
-	for _, dir := range e.agentDirs[file.Agent] {
+	for _, dir := range e.sources().agentDirs[file.Agent] {
 		if dir == "" {
 			continue
 		}
@@ -103,7 +103,7 @@ func (e *Engine) storageTrustSnapshotFor(path string) storageTrustSnapshot {
 func (e *Engine) openCodeStorageSessionGateState(
 	file parser.DiscoveredFile,
 ) (string, storageTrustSnapshot, bool) {
-	if e.forceParse || file.ForceParse {
+	if e.forceParseRequested(file) {
 		return "", storageTrustSnapshot{}, false
 	}
 	sessionPath := e.openCodeStorageSessionPath(file)

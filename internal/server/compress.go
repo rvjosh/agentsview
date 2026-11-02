@@ -58,6 +58,10 @@ type gzipResponseWriter struct {
 	plain       bool
 }
 
+func (w *gzipResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func (w *gzipResponseWriter) Header() http.Header {
 	return w.ResponseWriter.Header()
 }
@@ -204,6 +208,7 @@ func isEventStreamContentType(value string) bool {
 func isStreamingPath(path string) bool {
 	switch {
 	case path == "/api/v1/events",
+		path == "/api/v1/remote-sync/archive",
 		path == "/api/v1/sync",
 		path == "/api/v1/resync",
 		path == "/api/v1/secrets/scan",

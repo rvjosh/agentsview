@@ -52,12 +52,12 @@ func newClassifierRebuildCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.LoadPFlags(cmd.Flags())
+			cfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 			if err != nil {
 				return fmt.Errorf("loading config: %w", err)
 			}
 			applyClassifierConfig(cfg)
-			tr, err := detectTransport(cfg.DataDir, cfg.AuthToken, 0)
+			tr, err := detectClientTransportContext(cmd.Context(), &cfg, 0)
 			if err != nil {
 				return err
 			}
@@ -84,7 +84,7 @@ func guardClassifierRebuild(tr transport) error {
 		return errors.New(
 			"local daemon is serving on " + tr.URL +
 				"; stop 'agentsview serve' or the read-only mirror serve " +
-				"before running 'classifier rebuild'",
+				"before running 'index classifier rebuild'",
 		)
 	}
 	if tr.Mode == transportDirect && tr.DirectReadOnly {
@@ -126,7 +126,7 @@ func runClassifierRebuild(
 	}
 	defer func() { _ = writeLock.Close() }()
 
-	if err := clearSQLiteClassifierHash(cfg.DBPath); err != nil {
+	if err := clearSQLiteClassifierHash(ctx, cfg.DBPath); err != nil {
 		return fmt.Errorf("clearing SQLite hash: %w", err)
 	}
 
@@ -144,8 +144,8 @@ func runClassifierRebuild(
 			return fmt.Errorf(
 				"clearing PG hash: %w (SQLite was cleared "+
 					"successfully; once PG is reachable, retry "+
-					"'agentsview classifier rebuild', or run "+
-					"'agentsview pg push --full' to repopulate "+
+					"'agentsview index classifier rebuild --pg', or run "+
+					"'agentsview replica pg push --full' to repopulate "+
 					"PG from the corrected SQLite side)",
 				err,
 			)
@@ -161,7 +161,7 @@ func runClassifierRebuild(
 	return nil
 }
 
-func clearSQLiteClassifierHash(dbPath string) error {
+func clearSQLiteClassifierHash(ctx context.Context, dbPath string) error {
 	if _, err := os.Stat(dbPath); errors.Is(err, os.ErrNotExist) {
 		// Nothing to clear; first open will write the hash.
 		return nil
@@ -171,7 +171,7 @@ func clearSQLiteClassifierHash(dbPath string) error {
 		return err
 	}
 	defer conn.Close()
-	_, err = conn.Exec(
+	_, err = conn.ExecContext(ctx,
 		`DELETE FROM stats WHERE key = ?`,
 		db.ClassifierHashKey,
 	)

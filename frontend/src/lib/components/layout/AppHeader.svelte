@@ -45,8 +45,10 @@
     getMarkdownExportUrl,
   } from "../../api/client.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
+  import { reportTelemetry } from "../../utils/telemetry.js";
   import ProjectTypeahead from "./ProjectTypeahead.svelte";
   import ImportModal from "../import/ImportModal.svelte";
+  import { claudeAISync } from "../../stores/claudeAISync.svelte.js";
 
   const isMac = navigator.platform.toUpperCase().includes("MAC");
   const modKey = isMac ? "⌘" : "Ctrl";
@@ -86,21 +88,29 @@
     "usage",
     "activity",
     "trends",
+    "recall",
     "pinned",
-    "insights",
+    "quality",
+    "friction",
     "trash",
     "recent-edits",
+    "data",
   ] as const;
+
+  const frictionNavVisible = $derived(sync.serverVersion?.friction_readable === true);
 
   const tabs: TopBarTab[] = $derived([
     { id: "sessions", label: m.nav_sessions() },
     { id: "usage", label: m.nav_usage() },
     { id: "activity", label: m.nav_activity() },
     { id: "trends", label: m.nav_trends() },
+    { id: "recall", label: m.nav_recall() },
     { id: "pinned", label: m.nav_pinned() },
-    { id: "insights", label: m.nav_insights() },
+    { id: "quality", label: m.nav_quality() },
+    ...(frictionNavVisible ? [{ id: "friction", label: m.nav_friction() }] : []),
     { id: "trash", label: m.nav_trash() },
     { id: "recent-edits", label: m.nav_recent_edits() },
+    { id: "data", label: m.nav_data() },
   ]);
 
   const activeTab = $derived(
@@ -115,6 +125,7 @@
     thinking: m.header_transcript_blocks_thinking,
     tool: m.header_transcript_blocks_tool,
     code: m.header_transcript_blocks_code,
+    system: m.header_transcript_blocks_system,
   };
 
   const BLOCK_COLORS: Record<BlockType, string> = {
@@ -123,6 +134,7 @@
     thinking: "var(--accent-purple)",
     tool: "var(--accent-amber)",
     code: "var(--text-muted)",
+    system: "var(--text-muted)",
   };
 
   async function handleExport() {
@@ -143,6 +155,7 @@
     ).toString();
     const ok = await copyToClipboard(url);
     if (!ok) return;
+    reportTelemetry("export_run", { format: "markdown_link" });
     copiedMarkdownLink = true;
     clearTimeout(copiedMarkdownLinkTimer);
     copiedMarkdownLinkTimer = setTimeout(() => {
@@ -311,21 +324,26 @@
   ariaLabel={m.nav_primary()}
 >
   {#snippet left()}
-    <button
-      class="hamburger"
-      onclick={() => {
-        if (ui.isMobileViewport && router.route !== "sessions") {
-          router.navigate("sessions");
-          ui.sidebarOpen = true;
-        } else {
-          ui.toggleSidebar();
-        }
-      }}
-      title={m.nav_toggle_sidebar_shortcut()}
-      aria-label={m.nav_toggle_sidebar()}
-    >
-      <MenuIcon size="16" strokeWidth="2" aria-hidden="true" />
-    </button>
+    {#if ui.isMobileViewport}
+      <button
+        class="hamburger"
+        onclick={() => {
+          if (router.route !== "sessions") {
+            router.navigate("sessions");
+            ui.sidebarOpen = true;
+          } else {
+            ui.toggleSidebar();
+          }
+        }}
+        title={m.nav_toggle_sidebar_shortcut()}
+        aria-label={m.nav_toggle_sidebar()}
+        aria-expanded={ui.sidebarOpen}
+        aria-controls="session-sidebar"
+        data-sidebar-focus-target="mobile"
+      >
+        <MenuIcon size="16" strokeWidth="2" aria-hidden="true" />
+      </button>
+    {/if}
     <button
       class="header-home"
       onclick={() => router.navigate("sessions")}
@@ -631,6 +649,7 @@
       </div>
     {/if}
 
+    {#if !sync.archiveOnly}
     <button
       class="header-btn sync-btn"
       class:syncing={sync.syncing}
@@ -646,19 +665,28 @@
       {/if}
       <span class="sync-label" class:collapsed={navCollapsed}>{sync.readOnly ? m.header_actions_refresh() : m.header_actions_sync()}</span>
     </button>
+    {/if}
 
     <button
       class="import-btn"
       onclick={() => {
-        if (!sync.readOnly) showImportModal = true;
+        if (!sync.readOnly && !sync.archiveOnly) showImportModal = true;
       }}
-      disabled={sync.readOnly}
-      title={sync.readOnly
+      disabled={sync.readOnly || sync.archiveOnly}
+      title={sync.archiveOnly
+        ? m.header_actions_import_archive_only()
+        : sync.readOnly
         ? m.header_actions_import_unavailable()
+        : claudeAISync.running
+        ? m.header_actions_import_claude_syncing()
         : m.header_actions_import_conversations()}
-      aria-label={m.header_actions_import_conversations()}
+      aria-label={claudeAISync.running ? m.header_actions_import_claude_syncing() : m.header_actions_import_conversations()}
     >
-      <DownloadIcon size="12" strokeWidth="2" aria-hidden="true" />
+      {#if claudeAISync.running}
+        <span class="sync-spinner" aria-hidden="true"><Spinner size={12} /></span>
+      {:else}
+        <DownloadIcon size="12" strokeWidth="2" aria-hidden="true" />
+      {/if}
       <span class="import-label" class:collapsed={navCollapsed}>{m.header_actions_import()}</span>
     </button>
 
@@ -988,7 +1016,7 @@
   }
 
   .header-btn:disabled {
-    opacity: 0.55;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 
@@ -1042,7 +1070,7 @@
   }
 
   .import-btn:disabled {
-    opacity: 0.55;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 

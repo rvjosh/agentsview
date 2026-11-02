@@ -1,54 +1,12 @@
 package sync
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestSyncStats_RecordSkip(t *testing.T) {
-	tests := []struct {
-		name  string
-		skips int
-		want  int
-	}{
-		{"zero skips", 0, 0},
-		{"multiple skips", 2, 2},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var s SyncStats
-			for i := 0; i < tt.skips; i++ {
-				s.RecordSkip()
-			}
-			assert.Equal(t, tt.want, s.Skipped)
-			assert.Equal(t, 0, s.Synced)
-		})
-	}
-}
-
-func TestSyncStats_RecordSynced(t *testing.T) {
-	tests := []struct {
-		name   string
-		synced []int
-		want   int
-	}{
-		{"zero synced", []int{}, 0},
-		{"multiple synced", []int{5, 3}, 8},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var s SyncStats
-			for _, v := range tt.synced {
-				s.RecordSynced(v)
-			}
-			assert.Equal(t, 0, s.Skipped)
-			assert.Equal(t, tt.want, s.Synced)
-		})
-	}
-}
 
 func TestAnomalyStats_RecordMalformedLines(t *testing.T) {
 	tests := []struct {
@@ -449,4 +407,37 @@ func TestSyncStatsJSONOmitsZeroAnomalies(t *testing.T) {
 		"malformed counts must still serialize")
 	assert.NotContains(t, got, "sanitize",
 		"malformed-only run must not emit an empty sanitize object")
+}
+
+func TestSyncStatsCwdUpdatedSurvivesWorkerJSONRoundTrip(t *testing.T) {
+	stats := SyncStats{}
+	stats.RecordCwdUpdated(2)
+	require.True(t, stats.hasSessionChanges())
+	require.True(t, stats.shouldEmitSync())
+
+	payload, err := json.Marshal(stats)
+	require.NoError(t, err)
+	var restored SyncStats
+	require.NoError(t, json.Unmarshal(payload, &restored))
+
+	assert.Equal(t, 2, restored.CwdUpdated,
+		"worker-process passes marshal SyncStats; cwd-only updates must survive")
+	assert.True(t, restored.hasSessionChanges())
+	assert.True(t, restored.shouldEmitSync())
+}
+
+func TestMergeSyncStatsCarriesMetadataChanges(t *testing.T) {
+	for name, merge := range map[string]func(*SyncStats, SyncStats){
+		"reconciliation": mergeReconciliationSyncStats,
+		"rebuild":        mergeSyncStats,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dst := SyncStats{CwdUpdated: 1, LinksUpdated: 2}
+			merge(&dst, SyncStats{CwdUpdated: 3, LinksUpdated: 4})
+			assert.Equal(t, 4, dst.CwdUpdated)
+			assert.Equal(t, 6, dst.LinksUpdated)
+			assert.True(t, dst.hasSessionChanges(),
+				"metadata-only changes must still notify session consumers")
+		})
+	}
 }

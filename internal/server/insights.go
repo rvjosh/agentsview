@@ -2,7 +2,8 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,32 +14,51 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/insight"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/timeutil"
 )
 
-var validInsightTypes = map[string]bool{
-	"daily_activity":   true,
-	"agent_analysis":   true,
-	insight.CannedType: true,
-}
-
 type generateInsightRequest struct {
-	Type           string                        `json:"type"`
-	DateFrom       string                        `json:"date_from"`
-	DateTo         string                        `json:"date_to"`
-	Project        string                        `json:"project,omitempty"`
-	Prompt         string                        `json:"prompt,omitempty"`
-	SessionID      string                        `json:"session_id,omitempty"`
-	Agent          string                        `json:"agent,omitempty"`
-	Kind           string                        `json:"kind,omitempty"`
-	LLMOptIn       bool                          `json:"llm_opt_in,omitempty"`
-	ForceRefresh   bool                          `json:"force_refresh,omitempty"`
-	AutomatedScope string                        `json:"automated_scope,omitempty"`
-	Filters        *insight.CannedSessionFilters `json:"filters,omitempty"`
+	Type           string                     `json:"type"`
+	DateFrom       string                     `json:"date_from"`
+	DateTo         string                     `json:"date_to"`
+	Project        string                     `json:"project,omitempty"`
+	Prompt         string                     `json:"prompt,omitempty"`
+	SessionID      string                     `json:"session_id,omitempty"`
+	Agent          string                     `json:"agent,omitempty"`
+	Kind           string                     `json:"kind,omitempty"`
+	LLMOptIn       bool                       `json:"llm_opt_in,omitempty"`
+	ForceRefresh   bool                       `json:"force_refresh,omitempty"`
+	AutomatedScope string                     `json:"automated_scope,omitempty"`
+	Filters        *cannedSessionFiltersInput `json:"filters,omitempty"`
 	// Timezone is the IANA zone the caller's date range is expressed in, so
 	// the attached activity summary covers the same local-day window as the
 	// activity dashboard the dates were derived from. Empty means UTC.
 	Timezone string `json:"timezone,omitempty"`
+}
+
+type cannedSessionFiltersInput struct {
+	Timezone        string `json:"timezone,omitempty"`
+	Machine         string `json:"machine,omitempty" doc:"Exact machine ID or alias, comma-separated IDs or aliases, or a unique whole display label (case-sensitive). Unknown or ambiguous values return HTTP 400 before streaming."`
+	Agent           string `json:"agent,omitempty"`
+	Termination     string `json:"termination,omitempty"`
+	MinUserMessages int    `json:"min_user_messages,omitempty"`
+	IncludeOneShot  bool   `json:"include_one_shot,omitempty"`
+	AutomatedScope  string `json:"automated_scope,omitempty"`
+	ActiveSince     string `json:"active_since,omitempty"`
+}
+
+func (f cannedSessionFiltersInput) toDomain() insight.CannedSessionFilters {
+	return insight.CannedSessionFilters{
+		Timezone:        f.Timezone,
+		Machine:         f.Machine,
+		Agent:           f.Agent,
+		Termination:     f.Termination,
+		MinUserMessages: f.MinUserMessages,
+		IncludeOneShot:  f.IncludeOneShot,
+		AutomatedScope:  f.AutomatedScope,
+		ActiveSince:     f.ActiveSince,
+	}
 }
 
 func normalizeInsightAutomatedScope(scope string) (string, bool) {
@@ -61,7 +81,7 @@ func normalizeCannedSessionFilters(
 		AutomatedScope: req.AutomatedScope,
 	}
 	if req.Filters != nil {
-		filters = *req.Filters
+		filters = req.Filters.toDomain()
 	}
 	filters.Timezone = strings.TrimSpace(filters.Timezone)
 	if filters.Timezone == "" {
@@ -105,7 +125,7 @@ func insightGenerateClientMessage(
 	agent string, err error,
 ) string {
 	if err == nil {
-		return fmt.Sprintf("%s generation failed", agent)
+		return agent + " generation failed"
 	}
 	msg := err.Error()
 	// Strip stderr dump after newline for the short client message; full details
@@ -120,6 +140,7 @@ func insightGenerateClientMessage(
 }
 
 func (s *Server) humaGenerateCannedInsight(
+	ctx context.Context,
 	req generateInsightRequest,
 ) (*huma.StreamResponse, error) {
 	req.Prompt = strings.TrimSpace(req.Prompt)
@@ -152,8 +173,13 @@ func (s *Server) humaGenerateCannedInsight(
 		return nil, apiError(http.StatusBadRequest,
 			"date_to must be >= date_from")
 	}
+	if kind == insight.CannedFrictionReview {
+		if err := s.validateFrictionReviewRequest(ctx, req); err != nil {
+			return nil, err
+		}
+	}
 	if req.Agent == "" {
-		req.Agent = "claude"
+		req.Agent = s.insightDefaultAgent()
 	}
 	if !insight.ValidAgents[req.Agent] {
 		return nil, apiError(http.StatusBadRequest,
@@ -164,17 +190,19 @@ func (s *Server) humaGenerateCannedInsight(
 	if !ok {
 		return nil, apiError(http.StatusBadRequest, message)
 	}
-	req.Filters = &filters
-	req.AutomatedScope = filters.AutomatedScope
-
+	var err error
+	filters.Machine, err = db.ResolveMachineFilter(ctx, s.db, filters.Machine)
+	if err != nil {
+		return nil, serverError(err)
+	}
 	return &huma.StreamResponse{Body: func(hctx huma.Context) {
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
 			writeHumaJSON(hctx, http.StatusInternalServerError,
-				apiErrorResponse{Message: "streaming not supported"})
+				apiResponseError{Message: "streaming not supported"})
 			return
 		}
-		s.generateCannedInsight(hctx.Context(), stream, kind, req)
+		s.generateCannedInsight(hctx.Context(), stream, kind, req, filters)
 	}}, nil
 }
 
@@ -183,6 +211,7 @@ func (s *Server) generateCannedInsight(
 	stream *SSEStream,
 	kind insight.CannedKind,
 	req generateInsightRequest,
+	filters insight.CannedSessionFilters,
 ) {
 	sendJSON := func(event string, v any) bool {
 		return stream.SendJSON(event, v)
@@ -196,14 +225,21 @@ func (s *Server) generateCannedInsight(
 	if !status("building_payload") {
 		return
 	}
-	payload, aggregateHash, cacheKey, err := s.buildCannedPayload(
-		ctx, kind, req,
+	generationOptions := s.currentInsightGenerateOptions(ctx)
+	build := s.buildCannedPayload
+	if kind == insight.CannedFrictionReview {
+		build = s.buildFrictionReviewPayload
+	}
+	payload, aggregateHash, cacheKey, err := build(
+		ctx, kind, req, filters, generationOptions,
 	)
 	if err != nil {
 		log.Printf("canned insight payload error: %v", err)
-		sendJSON("error", map[string]string{
-			"message": "failed to build canned insight payload",
-		})
+		message := "failed to build canned insight payload"
+		if errors.Is(err, errFrictionDigestNotFound) {
+			message = errFrictionDigestNotFound.Error()
+		}
+		sendJSON("error", map[string]string{"message": message})
 		return
 	}
 
@@ -242,6 +278,9 @@ func (s *Server) generateCannedInsight(
 		ctx, 3*time.Minute,
 	)
 	defer cancel()
+	genCtx = context.WithValue(
+		genCtx, insightGenerationOptionsContextKey{}, generationOptions,
+	)
 	result, err := s.generateStreamFunc(
 		genCtx, req.Agent, prompt, nil,
 	)
@@ -322,9 +361,9 @@ func (s *Server) generateCannedInsight(
 	}
 
 	var id int64
-	err = s.serializeArchiveWrite(func() error {
+	err = s.SerializeArchiveWrite(ctx, func() error {
 		var insertErr error
-		id, insertErr = s.db.InsertInsight(db.Insight{
+		id, insertErr = s.db.InsertInsight(ctx, db.Insight{
 			Type:            insight.CannedType,
 			DateFrom:        req.DateFrom,
 			DateTo:          req.DateTo,
@@ -348,7 +387,7 @@ func (s *Server) generateCannedInsight(
 	if err != nil {
 		log.Printf("canned insight insert error: %v", err)
 		sendJSON("error", map[string]string{
-			"message": insightSaveErrorMessage(err),
+			"message": s.insightSaveErrorMessage(err),
 		})
 		return
 	}
@@ -392,14 +431,9 @@ func (s *Server) buildCannedPayload(
 	ctx context.Context,
 	kind insight.CannedKind,
 	req generateInsightRequest,
+	filters insight.CannedSessionFilters,
+	generationOptions insight.GenerateOptions,
 ) (insight.CannedAggregatePayload, string, string, error) {
-	filters := insight.CannedSessionFilters{
-		Timezone:       "UTC",
-		AutomatedScope: req.AutomatedScope,
-	}
-	if req.Filters != nil {
-		filters = *req.Filters
-	}
 	analyticsFilter := db.AnalyticsFilter{
 		From:            req.DateFrom,
 		To:              req.DateTo,
@@ -440,6 +474,10 @@ func (s *Server) buildCannedPayload(
 	if err != nil {
 		return insight.CannedAggregatePayload{}, "", "", err
 	}
+	modelBreakdowns, err := foldCannedModelBreakdowns(usageResult.Daily)
+	if err != nil {
+		return insight.CannedAggregatePayload{}, "", "", err
+	}
 	usageSummary := &insight.CannedUsageSummary{
 		InputTokens:         usageResult.Totals.InputTokens,
 		OutputTokens:        usageResult.Totals.OutputTokens,
@@ -447,10 +485,10 @@ func (s *Server) buildCannedPayload(
 		CacheReadTokens:     usageResult.Totals.CacheReadTokens,
 		TotalCost:           usageResult.Totals.TotalCost,
 		CacheSavings:        usageResult.Totals.CacheSavings,
-		ModelBreakdowns:     foldCannedModelBreakdowns(usageResult.Daily),
+		ModelBreakdowns:     modelBreakdowns,
 		TopSessionsByCost:   topSessions,
 	}
-	coachSessions, err := s.listCannedCoachSessions(ctx, req)
+	coachSessions, err := s.listCannedCoachSessions(ctx, req, filters)
 	if err != nil {
 		return insight.CannedAggregatePayload{}, "", "", err
 	}
@@ -481,6 +519,7 @@ func (s *Server) buildCannedPayload(
 		req.Agent, req.Prompt, aggregateHash,
 		filters.AutomatedScope,
 		filters,
+		generationOptions,
 	)
 	if err != nil {
 		return insight.CannedAggregatePayload{}, "", "", err
@@ -490,13 +529,13 @@ func (s *Server) buildCannedPayload(
 
 func foldCannedModelBreakdowns(
 	daily []db.DailyUsageEntry,
-) []insight.CannedModelBreakdown {
+) ([]insight.CannedModelBreakdown, error) {
 	type modelAccum struct {
 		inputTok  int
 		outputTok int
 		cacheCr   int
 		cacheRd   int
-		cost      float64
+		cost      money.Money
 	}
 	byModel := make(map[string]*modelAccum)
 	for _, day := range daily {
@@ -510,7 +549,11 @@ func foldCannedModelBreakdowns(
 			acc.outputTok += model.OutputTokens
 			acc.cacheCr += model.CacheCreationTokens
 			acc.cacheRd += model.CacheReadTokens
-			acc.cost += model.Cost
+			var err error
+			acc.cost, err = money.Add(acc.cost, model.Cost)
+			if err != nil {
+				return nil, fmt.Errorf("summing canned insight model cost: %w", err)
+			}
 		}
 	}
 	out := make([]insight.CannedModelBreakdown, 0, len(byModel))
@@ -525,25 +568,19 @@ func foldCannedModelBreakdowns(
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Cost != out[j].Cost {
-			return out[i].Cost > out[j].Cost
+		if out[i].Cost.Microdollars != out[j].Cost.Microdollars {
+			return out[i].Cost.Microdollars > out[j].Cost.Microdollars
 		}
 		return out[i].ModelName < out[j].ModelName
 	})
-	return out
+	return out, nil
 }
 
 func (s *Server) listCannedCoachSessions(
 	ctx context.Context,
 	req generateInsightRequest,
+	filters insight.CannedSessionFilters,
 ) ([]db.Session, error) {
-	filters := insight.CannedSessionFilters{
-		Timezone:       "UTC",
-		AutomatedScope: req.AutomatedScope,
-	}
-	if req.Filters != nil {
-		filters = *req.Filters
-	}
 	loc := cannedCoachLocation(filters.Timezone)
 	dateFrom, dateTo := cannedCoachUTCDateBounds(
 		req.DateFrom, req.DateTo, loc,

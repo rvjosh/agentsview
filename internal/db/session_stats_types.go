@@ -1,7 +1,9 @@
 package db
 
-// SessionStats is the top-level v1 output of GetSessionStats.
-// schema_version is locked at 1. Additive fields (new keys that
+import "go.kenn.io/agentsview/internal/money"
+
+// SessionStats is the top-level v2 output of GetSessionStats.
+// schema_version is locked at 2. Additive fields (new keys that
 // old consumers can ignore) and semantic tightening (e.g., routing
 // an existing field through a stricter definition) are allowed
 // within v1 without a bump as long as the field *shape* stays
@@ -151,8 +153,8 @@ type StatsAgentPortfolio struct {
 type StatsCacheEconomics struct {
 	ClaudeOnly             bool                      `json:"claude_only"`
 	CacheHitRatio          CacheHitRatioDistribution `json:"cache_hit_ratio"`
-	DollarsSavedVsUncached float64                   `json:"dollars_saved_vs_uncached"`
-	DollarsSpent           float64                   `json:"dollars_spent"`
+	DollarsSavedVsUncached money.Money               `json:"saved_vs_uncached"`
+	DollarsSpent           money.Money               `json:"spent"`
 }
 
 type CacheHitRatioDistribution struct {
@@ -177,8 +179,24 @@ type StatsOutcomeStats struct {
 	LOCAdded     int  `json:"loc_added"`
 	LOCRemoved   int  `json:"loc_removed"`
 	FilesChanged int  `json:"files_changed"`
-	PRsOpened    *int `json:"prs_opened,omitempty"` // nil when gh not configured
+	PRsOpened    *int `json:"prs_opened,omitempty"` // nil when no PR lookup succeeded
 	PRsMerged    *int `json:"prs_merged,omitempty"`
+	// Skipped lists repository operations whose results are missing from the
+	// totals. Successful operations still contribute to their respective totals.
+	Skipped []StatsOutcomeSkippedRepo `json:"skipped,omitempty"`
+}
+
+// StatsOutcomeSkippedRepo records a repository operation that could not
+// contribute to the outcome totals, and why. A "pr" entry affects only PR
+// counts; that repository's commit, line, file and active-repo counts remain.
+type StatsOutcomeSkippedRepo struct {
+	// Repo is the local repository toplevel the lookup ran in.
+	Repo string `json:"repo"`
+	// Op is the lookup that failed: "author" for the author email,
+	// "log" for commit and line aggregation, "pr" for pull-request counts.
+	Op string `json:"op"`
+	// Reason explains why the lookup could not contribute to the totals.
+	Reason string `json:"reason"`
 }
 
 type StatsOutcomes struct {

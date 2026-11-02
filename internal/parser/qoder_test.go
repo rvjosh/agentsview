@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,32 +10,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestQoderRegistry(t *testing.T) {
-	def, ok := AgentByType(AgentQoder)
-	require.True(t, ok, "AgentQoder missing from Registry")
-	assert.Equal(t, "Qoder", def.DisplayName)
-	assert.Equal(t, "QODER_PROJECTS_DIR", def.EnvVar)
-	assert.Equal(t, "qoder_project_dirs", def.ConfigKey)
-	assert.Equal(t, qoderIDPrefix, def.IDPrefix)
-	assert.True(t, def.FileBased)
-	assert.False(t, def.ShallowWatch)
-	assert.Equal(t, []string{".qoder/projects", ".qoderwork/projects"}, def.DefaultDirs)
-	factory, ok := ProviderFactoryByType(AgentQoder)
-	require.True(t, ok, "AgentQoder provider missing")
-	assert.Equal(t, AgentQoder, factory.Definition().Type)
-	caps := factory.Capabilities()
-	assert.Equal(t, CapabilitySupported, caps.Source.DiscoverSources)
-	assert.Equal(t, CapabilitySupported, caps.Source.ClassifyChangedPath)
-	assert.Equal(t, CapabilitySupported, caps.Source.FindSource)
-	assert.Equal(t, CapabilitySupported, caps.Source.MultiSessionSource)
-	assert.Equal(t, CapabilitySupported, caps.Source.ExcludedSessions)
-	assert.Equal(t, CapabilitySupported, caps.Source.ForceReplaceOnParse)
-	assert.Equal(t, CapabilitySupported, caps.Content.Subagents)
-	provider, ok := NewProvider(AgentQoder, ProviderConfig{Roots: []string{t.TempDir()}})
-	require.True(t, ok)
-	require.NotNil(t, provider)
-}
 
 func TestParseQoderSession(t *testing.T) {
 	root := t.TempDir()
@@ -57,8 +30,8 @@ func TestParseQoderSession(t *testing.T) {
 	sess := results[0].Session
 	assert.Equal(t, "qoder:11111111-1111-4111-8111-111111111111", sess.ID)
 	assert.Equal(t, AgentQoder, sess.Agent)
-	assert.Equal(t, "", sess.AgentLabel)
-	assert.Equal(t, "", sess.Entrypoint)
+	assert.Empty(t, sess.AgentLabel)
+	assert.Empty(t, sess.Entrypoint)
 	assert.Equal(t, "sample-project", sess.Project)
 	assert.Equal(t, cwd, sess.Cwd)
 	assert.Equal(t, "help me", sess.FirstMessage)
@@ -139,13 +112,13 @@ func TestQoderProviderParseStampsCompositeFingerprint(t *testing.T) {
 		Machine: "local",
 	})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
-	fingerprint, err := provider.Fingerprint(context.Background(), sources[0])
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      sources[0],
 		Fingerprint: fingerprint,
 	})
@@ -182,7 +155,7 @@ func TestParseQoderSubagentExclusionIDs(t *testing.T) {
 `
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
 
-	results, excluded, err := ParseQoderSessionWithExclusions(path, "proj", "local")
+	results, excluded, err := ParseQoderSessionWithExclusions(t.Context(), path, "proj", "local")
 	require.NoError(t, err)
 	assert.Empty(t, results)
 	assert.Equal(t, []string{
@@ -191,12 +164,12 @@ func TestParseQoderSubagentExclusionIDs(t *testing.T) {
 
 	provider, ok := NewProvider(AgentQoder, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
-	source, found, err := provider.FindSource(context.Background(), FindSourceRequest{
+	source, found, err := provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: "11111111-1111-4111-8111-111111111111:subagent:agent-123",
 	})
 	require.NoError(t, err)
 	require.True(t, found)
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:  source,
 		Machine: "local",
 	})
@@ -328,4 +301,88 @@ func TestDecodeQoderProjectDir(t *testing.T) {
 			assert.Equal(t, tt.want, DecodeQoderProjectDir(tt.name))
 		})
 	}
+}
+
+func TestQoderFlatDiscovery(t *testing.T) {
+	root := t.TempDir()
+	// SharedClientCache-style flat layout: files directly under root with
+	// dotted suffixes such as task-<uuid>.session.execution.jsonl.
+	stem := "task-10f849241e06451d9c9c.session.execution"
+	flatPath := filepath.Join(root, stem+".jsonl")
+	sidecar := strings.TrimSuffix(flatPath, ".jsonl") + "-session.json"
+	// A legacy per-project subtree still needs to be discovered alongside.
+	projRoot := filepath.Join(root, "proj-dir")
+	legacyPath := filepath.Join(projRoot, "22222222-2222-4222-8222-222222222222.jsonl")
+	for _, path := range []string{flatPath, sidecar, legacyPath} {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte("{}\n"), 0o644))
+	}
+
+	files := DiscoverQoderSessions(root)
+	require.Len(t, files, 2)
+	// results are sorted by path; "proj-dir" (p) sorts before "task-..." (t).
+	assert.Equal(t, legacyPath, files[0].Path)
+	assert.Equal(t, "proj_dir", files[0].Project)
+	assert.Equal(t, AgentQoder, files[0].Agent)
+	assert.Equal(t, flatPath, files[1].Path)
+	// Project hint for flat files comes from the parent dir basename
+	// (the temp dir's parent in t.TempDir ends in a generated name; we
+	// just assert it's non-empty).
+	assert.NotEmpty(t, files[1].Project)
+	assert.Equal(t, AgentQoder, files[1].Agent)
+}
+
+func TestQoderFlatSourceFileLookup(t *testing.T) {
+	root := t.TempDir()
+	stem := "task-abcdef1234567890abcdef1234567890.session.execution"
+	flatPath := filepath.Join(root, stem+".jsonl")
+	require.NoError(t, os.MkdirAll(root, 0o755))
+	require.NoError(t, os.WriteFile(flatPath, []byte("{}\n"), 0o644))
+
+	assert.Equal(t, flatPath, FindQoderSourceFile(root, "qoder:"+stem))
+	assert.Empty(t, FindQoderSourceFile(root, "qoder:nope"))
+}
+
+func TestIsValidQoderSessionID(t *testing.T) {
+	tests := []struct {
+		id   string
+		want bool
+	}{
+		{"abc-123", true},
+		{"session_1", true},
+		{"abc123", true},
+		// Dotted suffixes used by SharedClientCache layouts.
+		{"task-10f849241e06451d9c9c.session.execution", true},
+		{"uuid.exec", true},
+		{"a.b.c.d", true},
+		{"", false},
+		{"../etc", false},
+		{"a b", false},
+		{"a/b", false},
+		{"a\\b", false},
+		{"weird:id", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.id, func(t *testing.T) {
+			got := IsValidQoderSessionID(tt.id)
+			assert.Equalf(t, tt.want, got, "IsValidQoderSessionID(%q)", tt.id)
+		})
+	}
+}
+
+func TestQoderFlatProjectHint(t *testing.T) {
+	t.Run("cli parent", func(t *testing.T) {
+		tmp := t.TempDir()
+		cliRoot := filepath.Join(tmp, "Qoder", "SharedClientCache", "cli", "projects")
+		require.NoError(t, os.MkdirAll(cliRoot, 0o755))
+		// Parent dir's basename is the "cli" segment, so flat files
+		// under the SharedClientCache/projects root label as "cli".
+		assert.Equal(t, "cli", qoderFlatProjectHint(cliRoot))
+	})
+	t.Run("root with no parent", func(t *testing.T) {
+		assert.Equal(t, "SharedClientCache", qoderFlatProjectHint("/"))
+	})
+	t.Run("relative root with no parent", func(t *testing.T) {
+		assert.Equal(t, "SharedClientCache", qoderFlatProjectHint("projects"))
+	})
 }

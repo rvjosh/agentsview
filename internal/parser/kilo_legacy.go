@@ -20,8 +20,11 @@
 package parser
 
 import (
+	"context"
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/hex"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,6 +32,10 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/ccoveille/go-safecast/v2"
+	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // kiloLegacyDefaultDirs returns the platform-specific default
@@ -277,7 +284,7 @@ func parseKiloLegacySession(
 		totalOutputTok   int
 		totalInputTok    int
 		peakContextTok   int
-		totalCost        float64
+		totalCost        money.Money
 		hasCost          bool
 		totalRequests    int
 		requestsWithCost int
@@ -325,8 +332,7 @@ func parseKiloLegacySession(
 		parsedMessages, totalOutputTok, totalInputTok, peakContextTok,
 			totalCost, hasCost, totalRequests, requestsWithCost,
 			provider, minTS, maxTS,
-			totalCacheReads, totalCacheWrites, parseErr =
-			parseKiloLegacyMessages(msgsBytes, apiModels)
+			totalCacheReads, totalCacheWrites, parseErr = parseKiloLegacyMessages(msgsBytes, apiModels)
 		if parseErr != nil {
 			return nil, nil, fmt.Errorf(
 				"parsing ui_messages.json: %w", parseErr,
@@ -382,7 +388,7 @@ func parseKiloLegacySession(
 	}
 	sessionName := firstMsg
 	if len(sessionName) > 80 {
-		sessionName = sessionName[:77] + "..."
+		sessionName = stringutil.SafeTruncate(sessionName, 77) + "..."
 	}
 	if sessionName == "" {
 		sessionName = projectHint
@@ -488,12 +494,11 @@ func parseKiloLegacySession(
 		if totalOutputTok > 0 {
 			event.OutputTokens = totalOutputTok
 		}
-		// Only set CostUSD when every API request reports cost data.
-		// If any request lacks cost data, the aggregate CostUSD is not
+		// Only set Cost when every API request reports cost data.
+		// If any request lacks cost data, the aggregate Cost is not
 		// set to prevent partial sums from being treated as authoritative.
 		if totalRequests > 0 && requestsWithCost == totalRequests {
-			cost := totalCost
-			event.CostUSD = &cost
+			event.Cost = &totalCost
 		}
 		if totalCacheReads > 0 {
 			event.CacheReadInputTokens = totalCacheReads
@@ -535,7 +540,7 @@ func parseKiloLegacyMessages(
 	totalOutput int,
 	totalInput int,
 	peakContext int,
-	totalCost float64,
+	totalCost money.Money,
 	hasCost bool,
 	totalRequests int,
 	requestsWithCost int,
@@ -545,16 +550,16 @@ func parseKiloLegacyMessages(
 	totalCacheWrites int,
 	err error,
 ) {
-	var rawMessages []json.RawMessage
+	var rawMessages []jsontext.Value
 	if unmarshalErr := json.Unmarshal(data, &rawMessages); unmarshalErr != nil {
 		// Tolerate a single-object file (defensive).
 		var single kiloLegacyMessage
 		if singleErr := json.Unmarshal(data, &single); singleErr != nil {
-			return nil, 0, 0, 0, 0, false, 0, 0, "",
+			return nil, 0, 0, 0, money.Money{}, false, 0, 0, "",
 				time.Time{}, time.Time{}, 0, 0,
 				fmt.Errorf("parsing ui_messages.json: %w", unmarshalErr)
 		}
-		rawMessages = []json.RawMessage{data}
+		rawMessages = []jsontext.Value{data}
 	}
 
 	messages = make([]ParsedMessage, 0, len(rawMessages))
@@ -590,8 +595,7 @@ func parseKiloLegacyMessages(
 		// accounting for peak context and aggregate totals.
 		if kiloIsMetadataSay(msg.Say) {
 			if msg.Say == "api_req_started" && msg.Text != "" {
-				ctx, in, out, cost, costPresent, prov, cr, cw, valid :=
-					kiloExtractAPIRequestStats(msg.Text)
+				ctx, in, out, cost, costPresent, prov, cr, cw, valid := kiloExtractAPIRequestStats(msg.Text)
 				if ctx > peakContext {
 					peakContext = ctx
 				}
@@ -613,7 +617,13 @@ func parseKiloLegacyMessages(
 				if costPresent {
 					hasCost = true
 					requestsWithCost++
-					totalCost += cost
+					var costErr error
+					totalCost, costErr = money.Add(totalCost, cost)
+					if costErr != nil {
+						return nil, 0, 0, 0, money.Money{}, false, 0, 0, "",
+							time.Time{}, time.Time{}, 0, 0,
+							fmt.Errorf("summing Kilo reported cost: %w", costErr)
+					}
 				}
 				if cr > 0 {
 					totalCacheReads += cr
@@ -716,6 +726,7 @@ func parseKiloLegacyMessages(
 					Role:          RoleUser,
 					Content:       output,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(output),
 					ToolResults:   toolResults,
@@ -754,6 +765,7 @@ func parseKiloLegacyMessages(
 					Role:          RoleSystem,
 					Content:       content,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(content),
 				})
@@ -793,6 +805,7 @@ func parseKiloLegacyMessages(
 					Role:          RoleSystem,
 					Content:       content,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(content),
 				})
@@ -834,6 +847,7 @@ func parseKiloLegacyMessages(
 					Role:          RoleSystem,
 					Content:       content,
 					IsSystem:      true,
+					SourceSubtype: SourceSubtypeToolResult,
 					Timestamp:     ts,
 					ContentLength: len(content),
 				})
@@ -1090,7 +1104,7 @@ func distinctModels(s []string) int {
 // mixed-provider sessions where attributing all usage to one provider
 // would be incorrect.
 func parseKiloLegacyMessagesDistinctProviders(data []byte) int {
-	var rawMessages []json.RawMessage
+	var rawMessages []jsontext.Value
 	if err := json.Unmarshal(data, &rawMessages); err != nil {
 		return 0
 	}
@@ -1192,7 +1206,7 @@ func classifyKiloLegacyMessage(
 			cmdName = "executeCommand"
 		}
 		inputMap := map[string]string{"command": cmdText}
-		inputJSON, err := json.Marshal(inputMap)
+		inputJSON, err := json.Marshal(inputMap, json.Deterministic(true))
 		if err != nil {
 			return RoleAssistant, nil, nil
 		}
@@ -1314,8 +1328,8 @@ func kiloUnwrapJSONEnvelope(text string) string {
 		return ""
 	}
 	var envelope struct {
-		Question string          `json:"question"`
-		Suggest  json.RawMessage `json:"suggest"`
+		Question string         `json:"question"`
+		Suggest  jsontext.Value `json:"suggest"`
 	}
 	if err := json.Unmarshal([]byte(text), &envelope); err != nil {
 		return ""
@@ -1502,22 +1516,29 @@ func kiloExtractAPIRequestStats(text string) (
 	contextWindow int,
 	inputTokens int,
 	outputTokens int,
-	cost float64,
+	cost money.Money,
 	costPresent bool,
 	provider string,
 	cacheReads int,
 	cacheWrites int,
 	validPayload bool,
 ) {
-	var data map[string]any
+	var data struct {
+		TokensIn          any            `json:"tokensIn"`
+		TokensOut         any            `json:"tokensOut"`
+		Cost              jsontext.Value `json:"cost"`
+		InferenceProvider string         `json:"inferenceProvider"`
+		CacheReads        any            `json:"cacheReads"`
+		CacheWrites       any            `json:"cacheWrites"`
+	}
 	if err := json.Unmarshal([]byte(text), &data); err != nil {
-		return 0, 0, 0, 0, false, "", 0, 0, false
+		return 0, 0, 0, money.Money{}, false, "", 0, 0, false
 	}
 	validPayload = true
-	tokensIn := JSONFloatInt(data["tokensIn"])
-	tokensOut := JSONFloatInt(data["tokensOut"])
-	cacheReads = JSONFloatInt(data["cacheReads"])
-	cacheWrites = JSONFloatInt(data["cacheWrites"])
+	tokensIn := JSONFloatInt(data.TokensIn)
+	tokensOut := JSONFloatInt(data.TokensOut)
+	cacheReads = JSONFloatInt(data.CacheReads)
+	cacheWrites = JSONFloatInt(data.CacheWrites)
 	contextWindow = tokensIn + cacheReads + cacheWrites
 	inputTokens = tokensIn
 
@@ -1527,19 +1548,21 @@ func kiloExtractAPIRequestStats(text string) (
 	// An explicit cost value — including 0 — is authoritative:
 	// usageMissing only indicates that the request did not return
 	// usage data, but a recorded cost field stays reported.
-	if raw, ok := data["cost"]; ok {
-		if f, ok := raw.(float64); ok {
-			cost = f
+	if data.Cost != nil {
+		parsed, err := money.ParseDollars(string(data.Cost))
+		// Invalid reported cost makes this request unpriced; it must not
+		// discard the independently valid token accounting.
+		if err == nil && parsed.Microdollars >= 0 {
+			cost = parsed
 			costPresent = true
 		}
 	}
 	// Kilo records only the inference provider name on each
 	// request (e.g. "Z.AI", "Moonshot AI"); it is the closest
 	// thing to a model label the format exposes.
-	if p, ok := data["inferenceProvider"].(string); ok {
-		provider = p
-	}
-	return contextWindow, inputTokens, tokensOut, cost, costPresent, provider, cacheReads, cacheWrites, validPayload
+	provider = data.InferenceProvider
+	return contextWindow, inputTokens, tokensOut, cost, costPresent, provider,
+		cacheReads, cacheWrites, validPayload
 }
 
 // JSONFloatInt extracts a JSON-decoded numeric value as an int,
@@ -1547,7 +1570,10 @@ func kiloExtractAPIRequestStats(text string) (
 // across parsers (RooCode, Kilo (legacy)).
 func JSONFloatInt(v any) int {
 	if f, ok := v.(float64); ok {
-		return int(f)
+		converted, err := safecast.Convert[int](f)
+		if err == nil {
+			return converted
+		}
 	}
 	return 0
 }
@@ -1659,7 +1685,7 @@ func parseKiloLegacyToolCall(text string, ordinal int) *ParsedToolCall {
 	for _, field := range kiloResultBearingReadTools[strings.ToLower(toolName)] {
 		delete(toolData, field)
 	}
-	inputJSON, err := json.Marshal(toolData)
+	inputJSON, err := json.Marshal(toolData, json.Deterministic(true))
 	if err != nil {
 		return nil
 	}
@@ -1676,7 +1702,7 @@ func parseKiloLegacyToolCall(text string, ordinal int) *ParsedToolCall {
 			tc.SkillName, _ = toolData["name"].(string)
 		}
 	} else {
-		tc.SkillName = inferToolSkillName(toolName, tc.InputJSON)
+		tc.SkillName = inferToolSkillName(context.Background(), toolName, tc.InputJSON)
 	}
 	// FilePath is exposed from the payload when present so the
 	// frontend can route Edits / Writes to the right file even
@@ -1712,7 +1738,7 @@ func parseKiloLegacyMCPToolCall(
 		Category:  "MCP",
 		InputJSON: inputJSON,
 	}
-	tc.SkillName = inferToolSkillName(qualified, inputJSON)
+	tc.SkillName = inferToolSkillName(context.Background(), qualified, inputJSON)
 	return tc
 }
 
@@ -1731,7 +1757,7 @@ func buildKiloLegacyMCPInputJSON(toolData map[string]any) string {
 				}
 			}
 		case map[string]any, []any:
-			if b, err := json.Marshal(v); err == nil {
+			if b, err := json.Marshal(v, json.Deterministic(true)); err == nil {
 				return string(b)
 			}
 		}
@@ -1743,7 +1769,7 @@ func buildKiloLegacyMCPInputJSON(toolData map[string]any) string {
 		}
 		env[k] = val
 	}
-	if b, err := json.Marshal(env); err == nil {
+	if b, err := json.Marshal(env, json.Deterministic(true)); err == nil {
 		return string(b)
 	}
 	return "{}"
@@ -1812,6 +1838,6 @@ func kiloLegacyFingerprintSource(path string) (SourceFingerprint, error) {
 			return SourceFingerprint{}, err
 		}
 	}
-	fp.Hash = fmt.Sprintf("%x", h.Sum(nil))
+	fp.Hash = hex.EncodeToString(h.Sum(nil))
 	return fp, nil
 }

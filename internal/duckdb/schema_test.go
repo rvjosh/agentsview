@@ -5,7 +5,6 @@ package duckdb
 import (
 	"context"
 	"database/sql"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,28 +13,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestOpenCreatesLocalDuckDBFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "agentsview.duckdb")
-
-	db, err := Open(path)
-	require.NoError(t, err, "Open")
-	t.Cleanup(func() {
-		require.NoError(t, db.Close(), "close DuckDB")
-	})
-
-	require.NoError(t, db.PingContext(context.Background()))
-	assert.FileExists(t, path)
-}
-
 func TestOpenRejectsEmptyPath(t *testing.T) {
-	db, err := Open("")
+	db, err := Open(t.Context(), "")
 	require.Error(t, err)
 	assert.Nil(t, db)
 	assert.Contains(t, err.Error(), "duckdb path is required")
 }
 
 func TestEnsureSchemaCreatesRequiredMirrorTables(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 
 	require.NoError(t, createSchema(ctx, db), "createSchema")
@@ -47,6 +33,8 @@ func TestEnsureSchemaCreatesRequiredMirrorTables(t *testing.T) {
 		"usage_events",
 		"cursor_usage_events",
 		"model_pricing",
+		"model_pricing_bands",
+		"genai_pricing",
 		"tool_calls",
 		"tool_result_events",
 		"secret_findings",
@@ -66,7 +54,7 @@ func TestEnsureSchemaCreatesRequiredMirrorTables(t *testing.T) {
 }
 
 func TestUsageEventsDedupIndexAllowsRepeatedKeys(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	require.NoError(t, createSchema(ctx, db), "createSchema")
 
@@ -86,7 +74,7 @@ func TestUsageEventsDedupIndexAllowsRepeatedKeys(t *testing.T) {
 }
 
 func TestEnsureSchemaIsIdempotent(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 
 	require.NoError(t, createSchema(ctx, db), "first createSchema")
@@ -97,7 +85,7 @@ func TestEnsureSchemaIsIdempotent(t *testing.T) {
 }
 
 func TestCheckSchemaCompatReportsMissingTablesAndColumns(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 
 	err := CheckSchemaCompat(ctx, db)
@@ -121,7 +109,7 @@ func TestCheckSchemaCompatReportsMissingTablesAndColumns(t *testing.T) {
 }
 
 func TestCheckSchemaCompatPassesAfterCreateSchema(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 
 	require.NoError(t, createSchema(ctx, db), "createSchema")
@@ -129,7 +117,7 @@ func TestCheckSchemaCompatPassesAfterCreateSchema(t *testing.T) {
 }
 
 func TestCheckSchemaCompatViaQuackRejectsPreReportedCostMirror(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	require.NoError(t, createSchema(ctx, db), "createSchema")
 	_, err := db.ExecContext(ctx,
@@ -145,13 +133,13 @@ func TestCheckSchemaCompatViaQuackRejectsPreReportedCostMirror(t *testing.T) {
 
 	err = CheckSchemaCompatViaQuack(ctx, db)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "rebuild with 'agentsview duckdb push --full'")
+	assert.Contains(t, err.Error(), "rebuild with 'agentsview replica duckdb push --full'")
 }
 
 func TestCheckSchemaCompatViaQuackReportsServerBehindOnMissingColumns(
 	t *testing.T,
 ) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	_, err := db.ExecContext(ctx,
 		`CREATE TABLE sessions (
@@ -171,14 +159,14 @@ func TestCheckSchemaCompatViaQuackReportsServerBehindOnMissingColumns(
 	assert.Contains(t, err.Error(), "upgrade and restart the DuckDB server",
 		"remote incompat must tell the operator the fix")
 	assert.NotContains(t, err.Error(),
-		"rebuild with 'agentsview duckdb push --full'",
+		"rebuild with 'agentsview replica duckdb push --full'",
 		"push cannot migrate a remote server schema")
 }
 
 func TestCheckSchemaCompatKeepsLocalRebuildHintOnMissingColumns(
 	t *testing.T,
 ) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	_, err := db.ExecContext(ctx,
 		`CREATE TABLE sessions (
@@ -193,27 +181,28 @@ func TestCheckSchemaCompatKeepsLocalRebuildHintOnMissingColumns(
 	err = CheckSchemaCompat(ctx, db)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "sessions.entrypoint")
-	assert.Contains(t, err.Error(), "rebuild with 'agentsview duckdb push --full'",
+	assert.Contains(t, err.Error(), "rebuild with 'agentsview replica duckdb push --full'",
 		"local mirrors are rebuilt, not migrated in place")
 	assert.NotContains(t, err.Error(), "older AgentsView build")
 }
 
 // TestCheckSchemaCompatRejectsSchemaVersionMismatchInBothDirections verifies
-// that mirror schema v4's create-only version check rejects a mismatch in
+// that the mirror's create-only version check rejects a mismatch in
 // either direction (an older or a newer schema_version row than this
 // build's SchemaVersion), for both the local mirror file and a remote Quack
 // server, with the same rebuild hint.
 func TestCheckSchemaCompatRejectsSchemaVersionMismatchInBothDirections(
 	t *testing.T,
 ) {
-	ctx := context.Background()
+	ctx := t.Context()
 	checks := map[string]func(context.Context, *sql.DB) error{
 		"local":  CheckSchemaCompat,
 		"remote": CheckSchemaCompatViaQuack,
 	}
 	versions := map[string]string{
-		"older": "1",
-		"newer": strconv.Itoa(SchemaVersion + 1),
+		"pre_usage_accounting": strconv.Itoa(SchemaVersion - 1),
+		"older":                "1",
+		"newer":                strconv.Itoa(SchemaVersion + 1),
 	}
 	for versionName, version := range versions {
 		for locationName, check := range checks {
@@ -230,7 +219,7 @@ func TestCheckSchemaCompatRejectsSchemaVersionMismatchInBothDirections(
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), "does not match this build's")
 				assert.Contains(t, err.Error(),
-					"rebuild with 'agentsview duckdb push --full'")
+					"rebuild with 'agentsview replica duckdb push --full'")
 			})
 		}
 	}
@@ -239,7 +228,7 @@ func TestCheckSchemaCompatRejectsSchemaVersionMismatchInBothDirections(
 func TestCheckSchemaCompatViaQuackReportsServerBehindOnMissingVersionRow(
 	t *testing.T,
 ) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	require.NoError(t, createSchema(ctx, db), "createSchema")
 	_, err := db.ExecContext(ctx,
@@ -260,7 +249,7 @@ func TestCheckSchemaCompatViaQuackReportsServerBehindOnMissingVersionRow(
 // Recent Edits index. DuckDB has no partial indexes, so it omits the
 // WHERE file_path IS NOT NULL clause but indexes the same column.
 func TestEnsureSchemaCreatesToolCallsFilePathIndex(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openTestDuckDB(t)
 	require.NoError(t, createSchema(ctx, db), "createSchema")
 
@@ -280,7 +269,7 @@ func openTestDuckDB(t *testing.T) *sql.DB {
 	require.NoError(t, err, "open in-memory DuckDB")
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	require.NoError(t, configureDuckDBThreads(db))
+	require.NoError(t, configureDuckDBThreads(t.Context(), db))
 	t.Cleanup(func() {
 		require.NoError(t, db.Close(), "close DuckDB")
 	})
@@ -290,7 +279,7 @@ func openTestDuckDB(t *testing.T) *sql.DB {
 func tableExists(t *testing.T, db *sql.DB, table string) bool {
 	t.Helper()
 	var exists bool
-	require.NoError(t, db.QueryRow(
+	require.NoError(t, db.QueryRowContext(t.Context(),
 		`SELECT count(*) > 0
 		 FROM information_schema.tables
 		 WHERE table_schema = current_schema()
@@ -303,7 +292,7 @@ func tableExists(t *testing.T, db *sql.DB, table string) bool {
 func columnExists(t *testing.T, db *sql.DB, table, column string) bool {
 	t.Helper()
 	var exists bool
-	require.NoError(t, db.QueryRow(
+	require.NoError(t, db.QueryRowContext(t.Context(),
 		`SELECT count(*) > 0
 		 FROM information_schema.columns
 		 WHERE table_schema = current_schema()

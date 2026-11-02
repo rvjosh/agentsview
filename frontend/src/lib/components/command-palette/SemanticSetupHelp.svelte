@@ -28,7 +28,7 @@
   import { Button, CopyButton, Spinner } from "@kenn-io/kit-ui";
   import { getLocale, m } from "../../i18n/index.js";
   import { EmbeddingsService } from "../../api/generated/index.js";
-  import { ApiError, callGenerated, isAbortError } from "../../api/runtime.js";
+  import { ApiError, isAbortError } from "../../api/runtime.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
 
   interface Props {
@@ -36,7 +36,7 @@
     // the search that failed.
     onResolved: () => void;
     // The search's own 501 message. Most carry the generic "enable [vector]
-    // ... run 'agentsview embeddings build'" remediation the panel replaces,
+    // ... run 'agentsview index embeddings build'" remediation the panel replaces,
     // but some name a specific recoverable state (stale index after an
     // embedding-config change, vectors.db schema mismatch) that the status
     // probe cannot distinguish — those are shown verbatim so their
@@ -50,7 +50,7 @@
   // more specific cause differ from it.
   const GENERIC_SEARCH_UNAVAILABLE =
     "semantic search not available: enable [vector] in config.toml and run " +
-    "'agentsview embeddings build'";
+    "'agentsview index embeddings build'";
 
   const specificSearchDetail = $derived(
     searchDetail !== null && searchDetail !== GENERIC_SEARCH_UNAVAILABLE
@@ -66,16 +66,9 @@
   const GENERIC_UNAVAILABLE = "embeddings manager not available";
 
   const CONFIG_SNIPPET = `[vector]
-enabled = true
+enabled = true`;
 
-[vector.embeddings]
-model = "nomic-embed-text"
-dimension = 768
-
-[vector.embeddings.servers.local]
-endpoint = "http://localhost:11434/v1"`;
-
-  const BUILD_COMMAND = "agentsview embeddings build";
+  const BUILD_COMMAND = "agentsview index embeddings build";
   const BUILD_POLL_MS = 2000;
 
   type Phase =
@@ -123,9 +116,7 @@ endpoint = "http://localhost:11434/v1"`;
 
   async function probe(): Promise<void> {
     try {
-      const status = await callGenerated(() =>
-        EmbeddingsService.getApiV1EmbeddingsStatus(),
-      );
+      const status = await EmbeddingsService.getApiV1EmbeddingsStatus({});
       if (disposed) return;
       if (status.running) {
         applyProgress(status.phase, status.done, status.total);
@@ -174,9 +165,7 @@ endpoint = "http://localhost:11434/v1"`;
     buildDone = 0;
     buildTotal = 0;
     try {
-      await callGenerated(() =>
-        EmbeddingsService.postApiV1EmbeddingsBuild({ requestBody: {} }),
-      );
+      await EmbeddingsService.postApiV1EmbeddingsBuild({});
     } catch (e) {
       if (disposed || isAbortError(e)) return;
       // 409 means a build is already running (started by the CLI or the
@@ -199,9 +188,7 @@ endpoint = "http://localhost:11434/v1"`;
 
   async function poll(): Promise<void> {
     try {
-      const status = await callGenerated(() =>
-        EmbeddingsService.getApiV1EmbeddingsStatus(),
-      );
+      const status = await EmbeddingsService.getApiV1EmbeddingsStatus({});
       if (disposed) return;
       if (status.running) {
         applyProgress(status.phase, status.done, status.total);
@@ -280,6 +267,10 @@ endpoint = "http://localhost:11434/v1"`;
       />
       <pre>{BUILD_COMMAND}</pre>
     </div>
+    <span class="setup-text">
+      {m.command_palette_semantic_setup_local()}
+      <a href="https://agentsview.io/docs/semantic-search/#named-embeddings-servers" target="_blank" rel="noreferrer">{m.command_palette_semantic_setup_local_link()}</a>
+    </span>
   {:else if phase === "disabled"}
     <strong>{m.command_palette_semantic_disabled_title()}</strong>
     <span class="setup-text">{detail}</span>

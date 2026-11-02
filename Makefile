@@ -4,25 +4,38 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-LDFLAGS := -X main.version=$(VERSION) \
-           -X main.commit=$(COMMIT) \
-           -X main.buildDate=$(BUILD_DATE)
+# Public PostHog ingest key. Builds without it send no telemetry.
+POSTHOG_PROJECT_KEY ?= phc_AzHd9YvuHR7M5poKzC6eW654d3SgKyBdoQPuwkWhimUf
 
-LDFLAGS_RELEASE := $(LDFLAGS) -s -w
+# Who ships the binary: a package manager such as "homebrew", or "kenn" for
+# official direct downloads. Package-manager builds refuse to self-update and
+# point users at the package manager. Telemetry reports the value too.
+DISTRIBUTION ?=
+BINDIR ?= .
+
+# Recursive (=) so target-specific DISTRIBUTION values reach the linker.
+LDFLAGS = -X main.version=$(VERSION) \
+          -X main.commit=$(COMMIT) \
+          -X main.buildDate=$(BUILD_DATE) \
+          -X main.distribution=$(DISTRIBUTION) \
+          -X go.kenn.io/kit/telemetry/posthog.distribution=$(DISTRIBUTION) \
+          -X go.kenn.io/kit/telemetry/posthog.projectKey=$(POSTHOG_PROJECT_KEY)
+
+LDFLAGS_RELEASE = $(LDFLAGS) -s -w
 DESKTOP_DIST_DIR := dist/desktop
-GOLANGCI_LINT_VERSION ?= v2.11.4
+GOLANGCI_LINT_VERSION ?= v2.14.0
 # Isolate each checkout from stale sibling-worktree fixes and issue positions.
 GOLANGCI_LINT_CACHE ?= $(CURDIR)/.golangci-cache
 export GOLANGCI_LINT_CACHE
 CUSTOM_GCL := ./custom-gcl
+GOEXE := $(shell go env GOEXE)
 PRICING_SNAPSHOT_FILE := internal/pricing/snapshot/litellm_snapshot.json.gz
 
 # sqlite-vec's cgo bindings #include "sqlite3.h". Without an override the
 # compiler falls back to the system header (the macOS SDK one marks
 # sqlite3_auto_extension deprecated, warning on every build) which can also
 # drift from the amalgamation mattn/go-sqlite3 statically links. Compile
-# against the bundled amalgamation's own header instead, mirroring the
-# Linux release workflow in .github/workflows/release.yml.
+# against the bundled amalgamation's own header instead.
 # Setting CGO_CFLAGS replaces Go's built-in default of "-O2 -g", so restate
 # it explicitly or the SQLite amalgamation compiles unoptimized (2-3x slower
 # queries, caught by the bench gate). Caller-provided flags stay last so
@@ -36,7 +49,20 @@ AIR_BIN := $(shell if command -v air >/dev/null 2>&1; then command -v air; \
 	elif [ -x "$(GOPATH_FIRST)/bin/air" ]; then printf "%s" "$(GOPATH_FIRST)/bin/air"; \
 	fi)
 
-.PHONY: build build-release install frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short test-evalingest bench-backends bench-gate bench-gate-config test-postgres test-postgres-ci test-s3 postgres-up postgres-down test-ssh test-ssh-ci ssh-up ssh-down e2e e2e-duckdb vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot sqlite-vec-header dev-snapshot help
+# Compile without absolute source paths so every checkout and worktree shares
+# one Go build cache instead of each compiling its own copy of every package.
+# Read `go env` first so flags saved with `go env -w GOFLAGS=...` survive the
+# export. GOFLAGS=-trimpath=false opts out. Debuggers need a source mapping:
+# README.md#shared-go-build-cache.
+ifeq ($(origin GOFLAGS),undefined)
+GOFLAGS := $(shell go env GOFLAGS)
+endif
+ifeq ($(filter -trimpath -trimpath=%,$(GOFLAGS)),)
+override GOFLAGS += -trimpath
+endif
+export GOFLAGS
+
+.PHONY: build build-release homebrew install install-cjk-fts simple-fts frontend frontend-dev dev check-air air-install desktop-dev desktop-build desktop-macos-app desktop-macos-dmg desktop-windows-installer desktop-linux-appimage desktop-app docs-install docs-build docs-serve docs-check docs-screenshots docs-assets-branch docs-generated-assets-branch docs-deploy-staging docs-deploy test test-short test-evalingest bench-backends bench-gate bench-gate-config bench-pg-usage test-postgres test-postgres-ci test-postgres-raw-sync-ci test-postgres-core-ci test-postgres-core-fast-ci test-postgres-core-heavy-ci test-s3 postgres-up postgres-down test-clickhouse test-clickhouse-ci clickhouse-up clickhouse-down e2e e2e-duckdb memory-e2e vet lint lint-ci lint-golangci lint-golangci-ci nilaway nilaway-golangci-build lint-tools tidy clean release release-darwin-arm64 release-darwin-amd64 release-linux-amd64 install-hooks ensure-embed-dir pricing-snapshot sqlite-vec-header dev-snapshot help
 
 # Ensure go:embed has at least one file (no-op if frontend is built)
 ensure-embed-dir:
@@ -50,7 +76,7 @@ ensure-embed-dir:
 # Chained from pricing-snapshot so every Go-compiling target stages it
 # without lengthening each prerequisite list.
 sqlite-vec-header:
-	@go mod download github.com/mattn/go-sqlite3
+	@$(DOWNLOAD_RETRY) go mod download github.com/mattn/go-sqlite3
 	@mkdir -p $(SQLITE_INCLUDE_DIR)
 	@install -m 0644 \
 		"$$(go list -m -f '{{.Dir}}' github.com/mattn/go-sqlite3)/sqlite3-binding.h" \
@@ -59,7 +85,7 @@ sqlite-vec-header:
 # Restore the generated LiteLLM fallback snapshot from its artifact branch.
 # Pinned ref, SHA256, and branch are compiled into the snapshot tool.
 pricing-snapshot: sqlite-vec-header
-	go run ./internal/pricing/cmd/litellm-snapshot -restore
+	$(DOWNLOAD_RETRY) go run ./internal/pricing/cmd/litellm-snapshot -restore
 
 # Build the binary (debug, with embedded pricing snapshot and frontend)
 build: pricing-snapshot frontend
@@ -70,6 +96,12 @@ build: pricing-snapshot frontend
 build-release: pricing-snapshot frontend
 	CGO_ENABLED=1 go build -tags fts5 -ldflags="$(LDFLAGS_RELEASE)" -trimpath -o agentsview ./cmd/agentsview
 	@chmod +x agentsview
+
+# Homebrew build profile: the release build with cgo and
+# DISTRIBUTION=homebrew, written to $(BINDIR)/agentsview.
+homebrew: DISTRIBUTION := homebrew
+homebrew: pricing-snapshot frontend
+	CGO_ENABLED=1 go build -tags fts5 -ldflags="$(LDFLAGS_RELEASE)" -trimpath -buildvcs=false -o "$(BINDIR)/agentsview" ./cmd/agentsview
 
 # Install to ~/.local/bin, $GOBIN, or $GOPATH/bin.
 # Copy to a temp file in the destination directory, then rename into place.
@@ -97,9 +129,42 @@ install: build-release
 	cleanup; \
 	exit $$status
 
+# Build the optional simple/cppjieba SQLite tokenizer sidecar from pinned
+# upstream commits. It remains separate from the Go binary so SQLite can load
+# the native extension on every supported platform.
+simple-fts:
+	bash scripts/build-simple-fts.sh dist/agentsview-simple
+
+# Install the binary and its CJK-search sidecar in sibling bin/lib trees.
+install-cjk-fts: install simple-fts
+	@if [ -d "$(HOME)/.local/bin" ]; then \
+		INSTALL_DIR="$(HOME)/.local/bin"; \
+	else \
+		INSTALL_DIR="$${GOBIN:-$$(go env GOBIN)}"; \
+		if [ -z "$$INSTALL_DIR" ]; then \
+			GOPATH_FIRST="$$(go env GOPATH | cut -d: -f1)"; \
+			INSTALL_DIR="$$GOPATH_FIRST/bin"; \
+		fi; \
+	fi; \
+	SIMPLE_DIR="$$(cd "$$INSTALL_DIR/.." && pwd)/lib/agentsview/simple"; \
+	mkdir -p "$$SIMPLE_DIR/dict" "$$SIMPLE_DIR/licenses"; \
+	for name in libsimple.so libsimple.dylib simple.dll; do \
+		if [ -f "dist/agentsview-simple/$$name" ]; then \
+			install -m 0755 "dist/agentsview-simple/$$name" "$$SIMPLE_DIR/$$name"; \
+		fi; \
+	done; \
+	install -m 0644 dist/agentsview-simple/VERSIONS "$$SIMPLE_DIR/VERSIONS"; \
+	for name in hmm_model.utf8 idf.utf8 jieba.dict.utf8 stop_words.utf8 user.dict.utf8; do \
+		install -m 0644 "dist/agentsview-simple/dict/$$name" "$$SIMPLE_DIR/dict/$$name"; \
+	done; \
+	for name in simple-LICENSE cppjieba-LICENSE; do \
+		install -m 0644 "dist/agentsview-simple/licenses/$$name" "$$SIMPLE_DIR/licenses/$$name"; \
+	done; \
+	echo "Installed CJK FTS sidecar to $$SIMPLE_DIR"
+
 # Build frontend SPA and copy into embed directory
 frontend:
-	cd frontend && npm ci && npm run build
+	cd frontend && $(DOWNLOAD_RETRY) npm ci && npm run build
 	rm -rf internal/web/dist
 	cp -r frontend/dist internal/web/dist
 	printf '%s\n' \
@@ -274,18 +339,34 @@ desktop-linux-appimage:
 # Backward-compatible alias (macOS .app)
 desktop-app: desktop-macos-app
 
-# Run tests
+# Keep local package/test-process fan-out bounded. A plain `go test ./...`
+# otherwise defaults to GOMAXPROCS, which can launch a large number of fresh
+# test binaries at once on a developer machine. Override with `GO_TEST_P=`
+# when an operator intentionally wants the Go default.
+GO_TEST_P ?= 4
+GO_TEST_P_FLAG := $(if $(GO_TEST_P),-p $(GO_TEST_P),)
+
+# Run the cacheable unit/integration suite. The external-service lanes below
+# intentionally retain `-count=1` because they require fresh state.
 test: pricing-snapshot ensure-embed-dir
-	go test -tags "fts5" ./... -v -count=1
+	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -v
+
+# Reproducible synthetic ingest, steady-state sync, and analytics measurements.
+.PHONY: perf-sim
+PERF_SIM_FLAGS ?=
+perf-sim: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go run -buildvcs=true -tags fts5 ./cmd/perfsim $(PERF_SIM_FLAGS)
 
 # Run fast tests only
 test-short: pricing-snapshot ensure-embed-dir
-	go test -tags "fts5" ./... -short -count=1
+	go test $(GO_TEST_P_FLAG) -tags "fts5" ./... -short
 
 # Run the quarantined eval-ingest endpoint tests under their build tag.
+# Only internal/server contains evalingest-gated code; every other package is
+# identical under the tag and already covered by the untagged run.
 test-evalingest: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5,evalingest" \
-		./internal/db ./internal/server -v -count=1
+		./internal/server -v -count=1
 
 # Compare db.Store read-query performance across SQLite, DuckDB, and PostgreSQL.
 # Requires Docker because the PostgreSQL backend is started with testcontainers.
@@ -297,38 +378,60 @@ bench-backends: pricing-snapshot ensure-embed-dir
 		AGENTSVIEW_BENCH_MESSAGES_PER_SESSION=$(BENCH_BACKENDS_MESSAGES_PER_SESSION) \
 		CGO_ENABLED=1 go test -tags "fts5,benchdb" ./internal/backendbench $(BENCH_BACKENDS_FLAGS)
 
-# Hot-path benchmark gate. Runs every benchmark in the gated packages
+# Local hot-path benchmark comparison. Runs every benchmark in these packages
 # (sync engine warm/cold/append, message write paths, usage
-# aggregation, secret scanning). This target is the single source of
-# truth for the gate configuration: CI's bench.yml runs it on both
-# the PR head and the merge base, then compares the outputs with
-# `go run ./cmd/benchgate -old old.txt -new new.txt`. Run it before
-# and after touching a sync or DB hot path.
-BENCH_GATE_PACKAGES ?= ./internal/sync ./internal/db ./internal/secrets
+# aggregation, secret scanning, signal analysis). For a local comparison,
+# run this target before and after a change, then compare the outputs with
+# `go run ./cmd/benchgate -old old.txt -new new.txt`.
+BENCH_GATE_PACKAGES ?= ./internal/sync ./internal/db ./internal/secrets \
+	./internal/signals
 # Count must stay >= 5: benchgate's time gate needs at least 5
-# candidate samples for its significance test.
-BENCH_GATE_COUNT ?= 6
+# candidate samples for its significance test. Every -count run
+# rebuilds each benchmark's fixture, so this is also the multiplier
+# on the 100k-row seeds below.
+BENCH_GATE_COUNT ?= 5
 # Fixed iterations, not a duration: some gated benchmarks grow their
 # fixture as they iterate, so baseline and candidate must run the
 # same iteration count to measure identical workloads.
 BENCH_GATE_TIME ?= 20x
+# Benchmarks whose single iteration costs hundreds of milliseconds to
+# seconds (100k-row usage and activity-report fixtures, cold-archive
+# ingest) run in a second pass with fewer iterations. Their per-op
+# ratios are stable at that scale, and at BENCH_GATE_TIME these few
+# benchmarks were most of the gate's wall clock. The regex is matched
+# against top-level benchmark names, so sub-benchmarks follow their
+# parent; the cheap benchmarks keep the full iteration count because
+# their millisecond-scale samples are what needs the averaging.
+BENCH_GATE_HEAVY ?= GetDailyUsage|UsageRollup|SQLiteActivityReport|SyncAllColdArchive|ResyncBulk|CopyMixedLegacyPageOrphans|CopySessionMetadataPins
+BENCH_GATE_HEAVY_TIME ?= 5x
 bench-gate: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5" -run '^$$' \
-		-bench . -benchmem \
+		-bench . -skip '$(BENCH_GATE_HEAVY)' -benchmem \
 		-count $(BENCH_GATE_COUNT) -benchtime $(BENCH_GATE_TIME) \
 		-timeout 25m $(BENCH_GATE_PACKAGES)
+	CGO_ENABLED=1 go test -tags "fts5" -run '^$$' \
+		-bench '$(BENCH_GATE_HEAVY)' -benchmem \
+		-count $(BENCH_GATE_COUNT) -benchtime $(BENCH_GATE_HEAVY_TIME) \
+		-timeout 25m $(BENCH_GATE_PACKAGES)
 
-# Prints the gate's sample/iteration configuration in shell-evalable
-# form. CI evaluates this on the PR head and passes the values into
-# the merge-base `make bench-gate` invocation, so both sides measure
-# identical workloads even when a PR changes the defaults above (the
-# package list intentionally stays per-side).
+# Prints the sample/iteration configuration in shell-evalable form.
+# Pass these values to the baseline `make bench-gate` invocation so both
+# sides measure identical workloads even when a change updates the defaults
+# above (the package list intentionally stays per-side).
 bench-gate-config:
 	@echo "BENCH_GATE_COUNT=$(BENCH_GATE_COUNT) BENCH_GATE_TIME=$(BENCH_GATE_TIME)"
+	@echo "BENCH_GATE_HEAVY='$(BENCH_GATE_HEAVY)' BENCH_GATE_HEAVY_TIME=$(BENCH_GATE_HEAVY_TIME)"
 
 # Start test PostgreSQL container
 postgres-up:
 	docker compose -f docker-compose.test.yml up -d --wait
+
+# Run opt-in PostgreSQL usage benchmarks against the pinned PG16 service.
+bench-pg-usage: pricing-snapshot
+	docker compose -f docker-compose.test.yml up -d --wait postgres
+	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" ./internal/postgres \
+		-run '^$$' -bench 'BenchmarkPGUsage(Read|Refresh)' -benchmem -count=5
 
 # Stop test PostgreSQL container
 postgres-down:
@@ -339,11 +442,56 @@ test-postgres: pricing-snapshot ensure-embed-dir postgres-up
 	@echo "Waiting for postgres to be ready..."
 	@sleep 2
 	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
-		CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./cmd/agentsview \
+		-run 'TestRawSync.*CleanUploads|TestPGServeKataHubConnection|TestRawSyncBackfill|TestRawProjectionDialogueRolloutRequeuesCompletedProductionVersion|TestHostedRuntimeHealthRequiresStatusToken|TestReplicaRecipeQueryWithoutConfig|TestReplicaServeWatchPublication' -count=1
+	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
+	CGO_ENABLED=1 go test -p 1 -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1 -timeout=20m
+	TEST_PG_URL="postgres://agentsview_test:agentsview_test_password@localhost:5433/agentsview_test?sslmode=disable" \
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/service -run '^TestPlanUsageCountsParity$$' -count=1
 
 # PostgreSQL integration tests for CI (postgres already running as service)
-test-postgres-ci: pricing-snapshot ensure-embed-dir
-	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -count=1
+POSTGRES_CORE_HEAVY_TEST := TestRawProjectionProofLookupsStayBounded
+test-postgres-ci:
+	$(MAKE) -j1 test-postgres-raw-sync-ci test-postgres-core-ci
+
+test-postgres-raw-sync-ci: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./cmd/agentsview \
+		-run 'TestRawSync.*CleanUploads|TestPGServeKataHubConnection|TestRawSyncBackfill|TestRawProjectionDialogueRolloutRequeuesCompletedProductionVersion|TestHostedRuntimeHealthRequiresStatusToken|TestReplicaRecipeQueryWithoutConfig|TestReplicaServeWatchPublication' -count=1
+
+test-postgres-core-ci:
+	$(MAKE) -j1 test-postgres-core-fast-ci test-postgres-core-heavy-ci
+
+# These packages drop schemas that can own database-wide extensions, so their
+# cleanup must finish before another package starts using the same database.
+test-postgres-core-fast-ci: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -p 1 -tags "fts5,pgtest" -v ./internal/postgres/... ./internal/activity/... -skip '^$(POSTGRES_CORE_HEAVY_TEST)$$' -count=1 -timeout=20m
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/service -run '^TestPlanUsageCountsParity$$' -count=1
+
+test-postgres-core-heavy-ci: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" ./internal/postgres/... -list '^$(POSTGRES_CORE_HEAVY_TEST)$$' | grep -Fx '$(POSTGRES_CORE_HEAVY_TEST)'
+	CGO_ENABLED=1 go test -tags "fts5,pgtest" -v ./internal/postgres/... -run '^$(POSTGRES_CORE_HEAVY_TEST)$$' -count=1 -timeout=20m
+
+# Start test ClickHouse container (native 19000, HTTP 18123)
+clickhouse-up:
+	docker compose -f docker-compose.test.yml up -d --wait clickhouse
+
+# Stop test ClickHouse container
+clickhouse-down:
+	docker compose -f docker-compose.test.yml down clickhouse
+
+# Run ClickHouse integration tests (starts clickhouse automatically)
+test-clickhouse: pricing-snapshot ensure-embed-dir clickhouse-up
+	@echo "Waiting for clickhouse to be ready..."
+	@sleep 2
+	TEST_CLICKHOUSE_URL="clickhouse://localhost:19000/default" \
+		CGO_ENABLED=1 go test -tags "fts5,chtest" -v ./internal/clickhouse/... ./internal/activity/... -count=1 -timeout=20m
+	TEST_CLICKHOUSE_URL="clickhouse://localhost:19000/default" \
+		CGO_ENABLED=1 go test -tags "fts5,chtest" -v ./internal/service -run '^TestPlanUsageCountsParity$$' -count=1
+
+# ClickHouse integration tests for CI (clickhouse already running as service)
+test-clickhouse-ci: pricing-snapshot ensure-embed-dir
+	CGO_ENABLED=1 go test -tags "fts5,chtest" -v ./internal/clickhouse/... ./internal/activity/... -count=1 -timeout=20m
+	CGO_ENABLED=1 go test -tags "fts5,chtest" -v ./internal/service -run '^TestPlanUsageCountsParity$$' -count=1
 
 # S3 discovery integration tests. testcontainers starts and tears down a
 # rustfs (S3-compatible) container automatically, so only a working Docker
@@ -351,62 +499,65 @@ test-postgres-ci: pricing-snapshot ensure-embed-dir
 test-s3: pricing-snapshot ensure-embed-dir
 	CGO_ENABLED=1 go test -tags "fts5,s3test" -v ./internal/sync/... -run TestS3 -count=1
 
-# Start test SSH container
-ssh-up:
-	docker compose -f docker-compose.test.yml up -d --build --wait sshd
-	docker cp "$$(docker compose -f docker-compose.test.yml ps -q sshd)":/tmp/test_ssh_key testdata/ssh/test_key
-	chmod 600 testdata/ssh/test_key
-
-# Stop test SSH container
-ssh-down:
-	docker compose -f docker-compose.test.yml down sshd
-
-# Run SSH integration tests (starts sshd automatically)
-test-ssh: pricing-snapshot ensure-embed-dir ssh-up
-	TEST_SSH_HOST=localhost TEST_SSH_PORT=2222 TEST_SSH_USER=testuser \
-		TEST_SSH_KEY=$(CURDIR)/testdata/ssh/test_key \
-		CGO_ENABLED=1 go test -tags "fts5,sshtest" -v ./internal/ssh/... -count=1
-
-# SSH integration tests for CI (sshd already running)
-test-ssh-ci: pricing-snapshot ensure-embed-dir
-	CGO_ENABLED=1 go test -tags "fts5,sshtest" -v ./internal/ssh/... -count=1
+# Local E2E builds enable the mapping workspace. Prebuilt servers must opt in
+# because their embedded frontend may not include the workspace yet.
+PROJECT_MAPPING_WORKSPACE_E2E_ENABLED ?= $(if $(E2E_PREBUILT_SERVER),,true)
 
 # Run Playwright E2E tests
 e2e:
-	cd frontend && npx playwright test
+	cd frontend && \
+		PROJECT_MAPPING_WORKSPACE_E2E_ENABLED="$(PROJECT_MAPPING_WORKSPACE_E2E_ENABLED)" \
+		npx playwright test
 
 # Run focused Playwright smoke tests against duckdb serve.
 e2e-duckdb:
-	cd frontend && AGENTSVIEW_E2E_BACKEND=duckdb npx playwright test \
-		e2e/duckdb-backend.spec.ts e2e/session-list.spec.ts --project=chromium
+	cd frontend && AGENTSVIEW_E2E_BACKEND=duckdb \
+		PROJECT_MAPPING_WORKSPACE_E2E_ENABLED="$(PROJECT_MAPPING_WORKSPACE_E2E_ENABLED)" \
+		npx playwright test \
+		e2e/duckdb-backend.spec.ts e2e/data-mode.spec.ts \
+		e2e/session-list.spec.ts --project=chromium
+
+# Run the opt-in native-client conversation-memory release gate. This uses the
+# caller's authenticated Claude Code and Codex installations and writes traces
+# only under an ignored .test-data-memory-e2e-* directory.
+MEMORY_E2E_ARGS ?=
+memory-e2e: pricing-snapshot ensure-embed-dir
+	go run ./scripts/memory-e2e --live $(MEMORY_E2E_ARGS)
 
 # Vet
 vet: pricing-snapshot ensure-embed-dir
 	go vet -tags fts5 ./...
 
 # Lint Go code and auto-fix where possible (local development)
-lint: lint-golangci nilaway
+lint: lint-config-check lint-sql lint-golangci nilaway
 
 # Run golangci-lint with auto-fixes for local development.
-lint-golangci: pricing-snapshot ensure-embed-dir
+lint-golangci: pricing-snapshot ensure-embed-dir nilaway-golangci-build
 	@if ! command -v golangci-lint >/dev/null 2>&1; then \
 		echo "golangci-lint not found. Install with: make lint-tools" >&2; \
 		exit 1; \
 	fi
-	golangci-lint run --fix ./...
+	$(CUSTOM_GCL) run --fix ./...
 
 # Lint Go code without fixing (for CI)
-lint-ci: lint-golangci-ci nilaway
+lint-ci: lint-config-check lint-sql lint-golangci-ci nilaway
 
 # Run golangci-lint without auto-fixes for CI.
-lint-golangci-ci: pricing-snapshot ensure-embed-dir
+lint-golangci-ci: pricing-snapshot ensure-embed-dir nilaway-golangci-build
 	@if ! command -v golangci-lint >/dev/null 2>&1; then \
 		echo "golangci-lint not found. Install with: make lint-tools" >&2; \
 		exit 1; \
 	fi
-	golangci-lint run ./...
+	$(CUSTOM_GCL) run ./...
 
-# Build a custom golangci-lint binary with the NilAway module plugin.
+.PHONY: lint-config-check lint-sql
+lint-sql:
+	go run go.kenn.io/kit/cmd/kennlint@v0.34.1 sql internal/db/schema.sql
+
+lint-config-check:
+	go run go.kenn.io/kit/cmd/kennlint@v0.47.2 config -check
+
+# Build a custom golangci-lint binary with the kit and NilAway module plugins.
 # Strip every repo-local Git env var (GIT_DIR, GIT_INDEX_FILE,
 # GIT_CONFIG_PARAMETERS, etc.) and disable VCS stamping so the inner
 # `git clone` and `go build` don't inherit the parent repo's state.
@@ -414,31 +565,83 @@ lint-golangci-ci: pricing-snapshot ensure-embed-dir
 # vars pointing at the parent repo, which makes the clone and the
 # VCS-stamped build fail with exit 128. The list comes from
 # `git rev-parse --local-env-vars` so it tracks whatever Git considers
-# repo-local at runtime.
+# repo-local at runtime. An existing binary is reused while it is newer than
+# .custom-gcl.yml, which pins its plugins, and reports GOLANGCI_LINT_VERSION.
 nilaway-golangci-build:
-	@if ! command -v golangci-lint >/dev/null 2>&1; then \
+	@if [ -x "$(CUSTOM_GCL)$(GOEXE)" ] && [ "$(CUSTOM_GCL)$(GOEXE)" -nt .custom-gcl.yml ]; then case "$$($(CUSTOM_GCL) version --short 2>/dev/null)" in "$(GOLANGCI_LINT_VERSION)"-custom-gcl-*) exit 0;; esac; fi; \
+	if ! command -v golangci-lint >/dev/null 2>&1; then \
 		echo "golangci-lint not found. Install with: make lint-tools" >&2; \
 		exit 1; \
-	fi
-	@unset_args=$$(git rev-parse --local-env-vars 2>/dev/null | sed 's/^/-u /' | tr '\n' ' '); \
+	fi; \
+	unset_args=$$(git rev-parse --local-env-vars 2>/dev/null | sed 's/^/-u /' | tr '\n' ' '); \
 	env $$unset_args GOFLAGS=-buildvcs=false \
 		golangci-lint custom --version "$(GOLANGCI_LINT_VERSION)" --name custom-gcl
 
 # Run NilAway through the custom golangci-lint module plugin.
+#
+# NilAway is run once per package instead of once over ./... because a single
+# whole-module run blows up memory. Each invocation therefore keeps its own
+# tight caps (GOMAXPROCS=1, GOGC=10, GOMEMLIMIT=512MiB). Those caps are
+# per-process, so the ~45 invocations can safely overlap: NILAWAY_JOBS of them
+# run at a time, bounding peak usage at roughly NILAWAY_JOBS x GOMEMLIMIT.
+# Concurrent invocations share one GOLANGCI_LINT_CACHE, so they need
+# --allow-parallel-runners; without it golangci-lint's start-up file lock makes
+# every overlapping run fail with "parallel golangci-lint is running".
+#
+# Each invocation writes its output to its own scratch file, which the parent
+# prints in package order once the run finishes. Writing straight to stdout
+# would interleave one package's findings with another's as soon as a report
+# exceeded the pipe's atomic-write size. NILAWAY_JOBS must be a positive
+# integer: `xargs -P 0` means "unlimited" and would remove the memory bound
+# this whole arrangement depends on.
+NILAWAY_JOBS ?= 4
+
+# Compile exports once before the workers apply their CPU and memory limits.
 nilaway: pricing-snapshot ensure-embed-dir nilaway-golangci-build
 	@set -e; \
+	case "$(NILAWAY_JOBS)" in \
+		''|*[!0-9]*) \
+			echo "nilaway: NILAWAY_JOBS must be a positive integer (got '$(NILAWAY_JOBS)')" >&2; \
+			exit 1;; \
+	esac; \
+	njobs=$$(( $(NILAWAY_JOBS) + 0 )); \
+	if [ "$$njobs" -lt 1 ]; then \
+		echo "nilaway: NILAWAY_JOBS must be at least 1 (got '$(NILAWAY_JOBS)')" >&2; \
+		exit 1; \
+	fi; \
 	root=$$(pwd); \
-	dirs=$$(go list -f '{{.Dir}}' ./...); \
-	for dir in $$dirs; do \
+	dirs=$$(go list -export -f '{{.Dir}}' ./...); \
+	pkgs=$$(for dir in $$dirs; do \
 		if [ "$$dir" = "$$root" ]; then \
-			pkg="."; \
+			printf '%s\n' "."; \
 		else \
-			pkg="./$${dir#$$root/}"; \
+			printf '%s\n' "./$${dir#$$root/}"; \
 		fi; \
-		echo "$(CUSTOM_GCL) run --config .golangci.nilaway.yml $$pkg"; \
-		GOMAXPROCS=$${GOMAXPROCS:-1} GOGC=$${GOGC:-10} GOMEMLIMIT=$${GOMEMLIMIT:-512MiB} \
-			$(CUSTOM_GCL) run --config .golangci.nilaway.yml "$$pkg"; \
-	done
+	done); \
+	if [ -z "$$pkgs" ]; then echo "nilaway: no packages to lint" >&2; exit 1; fi; \
+	NILAWAY_OUT_DIR=$$(mktemp -d); \
+	export NILAWAY_OUT_DIR; \
+	trap 'rm -f "$$NILAWAY_OUT_DIR"/*; rmdir "$$NILAWAY_OUT_DIR"' EXIT HUP INT TERM; \
+	set +e; \
+	printf '%s\n' "$$pkgs" | awk '{ printf "%d:%s\n", NR, $$0 }' | tr '\n' '\0' \
+		| xargs -0 -n 1 -P "$$njobs" sh -c ' \
+		n=$${1%%:*}; \
+		pkg=$${1#*:}; \
+		cmd="$(CUSTOM_GCL) run --allow-parallel-runners --config .golangci.nilaway.yml $$pkg"; \
+		out=$$(GOMAXPROCS=$${GOMAXPROCS:-1} GOGC=$${GOGC:-10} GOMEMLIMIT=$${GOMEMLIMIT:-512MiB} \
+			$(CUSTOM_GCL) run --allow-parallel-runners \
+				--config .golangci.nilaway.yml "$$pkg" 2>&1); \
+		status=$$?; \
+		{ printf "%s\n" "$$cmd"; \
+		  if [ -n "$$out" ]; then printf "%s\n" "$$out"; fi; \
+		} > "$$NILAWAY_OUT_DIR/$$n"; \
+		exit $$status' sh; \
+	rc=$$?; \
+	set -e; \
+	ls "$$NILAWAY_OUT_DIR" | sort -n | while IFS= read -r n; do \
+		cat "$$NILAWAY_OUT_DIR/$$n"; \
+	done; \
+	exit $$rc
 
 # Install pinned local lint tools.
 lint-tools:
@@ -467,6 +670,9 @@ docs-build:
 docs-serve:
 	cd docs && bash assets/hydrate-assets.sh && uv run bash ./zensical-docs.sh serve
 
+docs-preview:
+	python3 -m http.server 8000 --directory docs/site
+
 docs-check:
 	bash scripts/check-docs.sh
 
@@ -477,7 +683,7 @@ docs-assets-branch:
 	bash docs/assets/update-static-assets-branch.sh
 
 docs-generated-assets-branch:
-	bash docs/screenshots/update-generated-assets-branch.sh
+	bash docs/screenshots/update-generated-assets-branch.sh --source "$(CAPTURE_ASSETS)"
 
 docs-deploy-staging:
 	vercel deploy docs
@@ -525,8 +731,11 @@ help:
 	@echo ""
 	@echo "  build          - Build with embedded frontend"
 	@echo "  build-release  - Release build (optimized, stripped)"
+	@echo "  homebrew       - Release build for Homebrew (BINDIR=dir, DISTRIBUTION=homebrew)"
 	@echo "  pricing-snapshot - Restore LiteLLM snapshot from artifact branch"
 	@echo "  install        - Build and install to ~/.local/bin or GOPATH"
+	@echo "  install-cjk-fts - Install agentsview with the optional CJK FTS sidecar"
+	@echo "  simple-fts     - Build the pinned simple/cppjieba SQLite extension"
 	@echo ""
 	@echo "  dev            - Run Go server with live reload via air (use with frontend-dev)"
 	@echo "  dev-snapshot   - Run agentsview against a fresh snapshot of prod sessions.db"
@@ -544,16 +753,18 @@ help:
 	@echo "  test           - Run all tests"
 	@echo "  test-short     - Run fast tests only"
 	@echo "  bench-backends - Benchmark SQLite, DuckDB, and PostgreSQL stores"
-	@echo "  bench-gate     - Run the hot-path benchmarks CI gates PRs on"
+	@echo "  bench-pg-usage - Run opt-in PostgreSQL usage benchmarks against PG16"
+	@echo "  bench-gate     - Run hot-path benchmarks for local comparison"
 	@echo "  test-postgres  - Run PostgreSQL integration tests"
+	@echo "  test-clickhouse - Run ClickHouse integration tests"
 	@echo "  test-s3        - Run S3 discovery integration tests (Docker)"
 	@echo "  postgres-up    - Start test PostgreSQL container"
 	@echo "  postgres-down  - Stop test PostgreSQL container"
-	@echo "  test-ssh       - Run SSH integration tests"
-	@echo "  ssh-up         - Start test SSH container"
-	@echo "  ssh-down       - Stop test SSH container"
+	@echo "  clickhouse-up  - Start test ClickHouse container"
+	@echo "  clickhouse-down - Stop test ClickHouse container"
 	@echo "  e2e            - Run Playwright E2E tests"
 	@echo "  e2e-duckdb     - Run DuckDB-backed Playwright smoke tests"
+	@echo "  memory-e2e     - Run opt-in Claude Code and Codex memory recall gate"
 	@echo "  vet            - Run go vet"
 	@echo "  lint           - Run golangci-lint and NilAway (auto-fix golangci issues)"
 	@echo "  lint-ci        - Run golangci-lint and NilAway (no fix, for CI)"
@@ -565,3 +776,36 @@ help:
 	@echo "  release        - Release build for current platform"
 	@echo "  clean          - Remove build artifacts"
 	@echo "  install-hooks  - Install pre-commit and pre-push git hooks"
+
+# Workflow actions run at the commits in .github/workflows/actions.lock,
+# including actions that other actions call. The organization requires
+# SHA-pinned actions, and the lockfile is what satisfies that for nested refs.
+# The version comes from constraints.ghActionsLock in renovate.json.
+# Renovate uses the same version when it regenerates the lockfile after
+# bumping an action.
+GH_ACTIONS_LOCK_VERSION ?= $(shell sed -nE "s/^[[:space:]]*\"?ghActionsLock\"?:[[:space:]]*[\"']([^\"']*)[\"'].*/\1/p" renovate.json)
+
+.PHONY: gh-actions-lock-install actions-lock actions-lock-check-local actions-lock-check
+
+gh-actions-lock-install:
+	@test -n "$(GH_ACTIONS_LOCK_VERSION)" || { echo "constraints.ghActionsLock is missing from renovate.json" >&2; exit 1; }
+	@if [ "$$(gh actions-lock --version 2>/dev/null)" != "actions-lock version $(GH_ACTIONS_LOCK_VERSION)" ]; then \
+		gh extension remove actions-lock >/dev/null 2>&1 || true; \
+		gh extension install github/gh-actions-lock --pin $(GH_ACTIONS_LOCK_VERSION); \
+	fi
+
+# Lock every workflow action after adding or bumping a `uses:` line
+actions-lock: gh-actions-lock-install
+	gh actions-lock --no-interactive
+
+# Offline check that every workflow action has a lockfile entry
+actions-lock-check-local: gh-actions-lock-install
+	gh actions-lock --verify-local
+
+# Network check that the lockfile is complete and every locked commit is still valid
+actions-lock-check: gh-actions-lock-install
+	gh actions-lock --verify
+
+.PHONY: lint-workflow-retries
+lint-workflow-retries:
+	GOOS= GOARCH= go run go.kenn.io/kit/cmd/kennlint@v0.47.3 workflow-retries

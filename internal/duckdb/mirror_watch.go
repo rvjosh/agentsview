@@ -108,7 +108,7 @@ func (s *Store) checkMirrorReplacement(ctx context.Context, onEvent func(err err
 	}
 	defer s.retiring.Done()
 
-	conn, alias, err := openMirrorAlias(s.path)
+	conn, alias, err := openMirrorAlias(ctx, s.path)
 	if err != nil {
 		reportMirrorReplacementEvent(
 			onEvent, fmt.Errorf("opening replaced duckdb mirror: %w", err),
@@ -133,7 +133,7 @@ func (s *Store) checkMirrorReplacement(ctx context.Context, onEvent func(err err
 // duckdb-go driver: the driver caches instances per literal DSN, so opening
 // path again with the same read-only DSN while the Store's original
 // connection is still open silently returns the *already open, stale*
-// database instance instead of re-reading the file rebuildMirror just
+// database instance instead of re-reading the file buildMirror just
 // renamed into place (and a differing DSN errors with "Can't open a
 // connection to same database file with a different configuration than
 // existing connections"). A hardlink gives the identical bytes a distinct
@@ -148,7 +148,7 @@ func (s *Store) checkMirrorReplacement(ctx context.Context, onEvent func(err err
 // same-filesystem mirror always works. The caller must Close the returned
 // *sql.DB and then call removeMirrorAlias(alias) once it is done with the
 // connection.
-func openMirrorAlias(path string) (conn *sql.DB, alias string, err error) {
+func openMirrorAlias(ctx context.Context, path string) (conn *sql.DB, alias string, err error) {
 	workDir, err := ensureMirrorWorkDir(path)
 	if err != nil {
 		return nil, "", err
@@ -159,7 +159,7 @@ func openMirrorAlias(path string) (conn *sql.DB, alias string, err error) {
 	if err := os.Link(path, alias); err != nil {
 		return nil, "", fmt.Errorf("hardlinking duckdb mirror for reopen: %w", err)
 	}
-	conn, err = OpenReadOnly(alias)
+	conn, err = OpenReadOnly(ctx, alias)
 	if err != nil {
 		_ = os.Remove(alias)
 		return nil, "", err

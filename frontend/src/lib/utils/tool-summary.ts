@@ -1,6 +1,7 @@
 // ABOUTME: Builds a structured one-line summary for a tool call header.
 // ABOUTME: Pure; reads input_json + result_content, conservative on counts.
-import type { ToolCall } from "../api/types.js";
+import type { DbToolCall as ToolCall } from "../api/generated/index.js";
+import { isAbsolutePath, pathDisplayValue } from "./tool-params.js";
 
 const MAX = 100;
 
@@ -11,14 +12,41 @@ function countLines(s: string): number {
   return body === "" ? 0 : body.split("\n").length;
 }
 
-/** Count non-empty lines, or null when empty/blank (used for result lists). */
-function countResultLines(s: string | undefined): number | null {
+/** Replies Claude Code and OpenCode give when a search finds nothing. */
+const EMPTY_SEARCH_REPLIES = new Set(["No files found", "No matches found"]);
+
+/** Total that Claude Code's files_with_matches mode and OpenCode put above a
+ *  result list: "Found 1 file", "Found 10 files limit: 10, offset: 0", or
+ *  "Found 2 matches". */
+const SEARCH_TOTAL_RE = /^Found (\d+) (file|match)(?:es|s)?\b/;
+
+/** Note Claude Code appends to Grep output when head_limit or offset is set. */
+const PAGINATION_NOTE = "[Showing results with pagination = ";
+
+interface SearchCount {
+  count: number;
+  /** What the reply's own total counts, when it states one. */
+  unit?: "files" | "matches";
+}
+
+/** Count the results a search reply lists, or null when it lists none. A
+ *  leading total wins; otherwise count non-empty lines, leaving out the
+ *  pagination note and the reply for an empty search. */
+function countSearchResults(s: string | undefined): SearchCount | null {
   if (!s) return null;
-  let n = 0;
-  for (const line of s.split("\n")) {
-    if (line.trim() !== "") n += 1;
+  const lines = s
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.startsWith(PAGINATION_NOTE));
+  const [first = ""] = lines;
+  const total = SEARCH_TOTAL_RE.exec(first);
+  if (total) {
+    const count = Number(total[1]);
+    if (count === 0) return null;
+    return { count, unit: total[2] === "file" ? "files" : "matches" };
   }
-  return n > 0 ? n : null;
+  if (lines.length === 1 && EMPTY_SEARCH_REPLIES.has(first)) return null;
+  return lines.length > 0 ? { count: lines.length } : null;
 }
 
 function firstLine(s: string): string {
@@ -42,20 +70,42 @@ function parseParams(toolCall: ToolCall): Params | null {
 }
 
 function fileArg(p: Params): string | null {
+  return asString(p.file_path) ?? asString(p.path) ?? asString(p.filePath) ?? asString(p.file);
+}
+
+function isSpecialSummaryTool(name: string, category: string | undefined): boolean {
   return (
-    asString(p.file_path) ??
-    asString(p.path) ??
-    asString(p.filePath) ??
-    asString(p.file)
+    isTaskCall(name, category) ||
+    ["TodoWrite", "TaskCreate", "TaskUpdate", "Skill", "skill", "ToolSearch"].includes(name)
   );
+}
+
+export function summarizeToolCallPath(toolCall: ToolCall): string | null {
+  const p = parseParams(toolCall);
+  if (!p) return null;
+
+  const key = toolCall.category || toolCall.tool_name;
+  const hasPathSummary =
+    key === "Read" ||
+    key === "Edit" ||
+    key === "Write" ||
+    (!isSpecialSummaryTool(toolCall.tool_name, toolCall.category) &&
+      !["Bash", "Grep", "Glob"].includes(key) &&
+      !asString(p.command) &&
+      !asString(p.cmd) &&
+      !asString(p.pattern) &&
+      !asString(p.query));
+  if (!hasPathSummary) return null;
+
+  const path = fileArg(p);
+  return path && isAbsolutePath(path) && pathDisplayValue(path) !== path ? path : null;
 }
 
 function todoSummary(p: Params): string | null {
   const todos = p.todos;
   if (!Array.isArray(todos) || todos.length === 0) return null;
   const items = todos as Array<{ content?: unknown; status?: unknown }>;
-  const target =
-    items.find((t) => t?.status === "in_progress") ?? items[items.length - 1];
+  const target = items.find((t) => t?.status === "in_progress") ?? items[items.length - 1];
   const text = asString(target?.content);
   return text ? `→ ${text}`.slice(0, MAX) : null;
 }
@@ -68,7 +118,8 @@ function specialSummary(name: string, p: Params): string | null {
   }
   if (name === "TaskUpdate") {
     const parts: string[] = [];
-    if (p.taskId != null) parts.push(`#${String(p.taskId)}`);
+    const taskId = typeof p.taskId === "number" ? String(p.taskId) : asString(p.taskId);
+    if (taskId) parts.push(`#${taskId}`);
     const status = asString(p.status);
     if (status) parts.push(status);
     const subject = asString(p.subject);
@@ -87,12 +138,7 @@ function specialSummary(name: string, p: Params): string | null {
 }
 
 function isTaskCall(name: string, cat: string | undefined): boolean {
-  return (
-    name === "Task" ||
-    name === "Agent" ||
-    cat === "Task" ||
-    name.includes("subagent")
-  );
+  return name === "Task" || name === "Agent" || cat === "Task" || name.includes("subagent");
 }
 
 /**
@@ -124,11 +170,9 @@ export function summarizeToolCall(toolCall: ToolCall): string | null {
   if (key === "Read") {
     const file = fileArg(p);
     if (!file) return null;
-    const lines = toolCall.result_content
-      ? countLines(toolCall.result_content)
-      : 0;
+    const lines = toolCall.result_content ? countLines(toolCall.result_content) : 0;
     const suffix = lines > 0 ? ` (${lines} lines)` : "";
-    return `${file.slice(0, MAX)}${suffix}`;
+    return `${pathDisplayValue(file)}${suffix}`;
   }
   if (key === "Edit") {
     const file = fileArg(p);
@@ -141,40 +185,90 @@ export function summarizeToolCall(toolCall: ToolCall): string | null {
       const removed = countLines(oldS);
       if (added > 0 || removed > 0) suffix = ` (+${added} -${removed})`;
     }
-    return `${file.slice(0, MAX)}${suffix}`;
+    return `${pathDisplayValue(file)}${suffix}`;
   }
   if (key === "Write") {
     const file = fileArg(p);
     if (!file) return null;
     const added = typeof p.content === "string" ? countLines(p.content) : 0;
     const suffix = added > 0 ? ` (+${added})` : "";
-    return `${file.slice(0, MAX)}${suffix}`;
+    return `${pathDisplayValue(file)}${suffix}`;
   }
   if (key === "Grep") {
     const pattern = asString(p.pattern) ?? asString(p.query);
     if (!pattern) return null;
     let suffix = "";
     if (p.output_mode !== "count") {
-      const n = countResultLines(toolCall.result_content);
-      if (n != null) suffix = ` (${n} matches)`;
+      const results = countSearchResults(toolCall.result_content);
+      if (results) suffix = ` (${results.count} ${results.unit ?? "matches"})`;
     }
     return `${pattern.slice(0, MAX)}${suffix}`;
   }
   if (key === "Glob") {
     const pattern = asString(p.pattern);
     if (!pattern) return null;
-    const n = countResultLines(toolCall.result_content);
-    const suffix = n != null ? ` (${n} files)` : "";
+    const results = countSearchResults(toolCall.result_content);
+    const suffix = results ? ` (${results.count} files)` : "";
     return `${pattern.slice(0, MAX)}${suffix}`;
   }
 
   // Generic structured fallback: any tool exposing a known key arg.
   const file = fileArg(p);
-  if (file) return file.slice(0, MAX);
+  if (file) return pathDisplayValue(file);
   const cmd = asString(p.command) ?? asString(p.cmd);
   if (cmd) return `$ ${firstLine(cmd)}`;
   const pattern = asString(p.pattern);
   if (pattern) return pattern.slice(0, MAX);
 
   return null;
+}
+
+const PREVIEW_KEYS = [
+  "command",
+  "cmd",
+  "pattern",
+  "query",
+  "file_path",
+  "filePath",
+  "path",
+  "file",
+  "url",
+  "description",
+  "prompt",
+];
+const PATH_KEYS = new Set(["file_path", "filePath", "path", "file"]);
+
+function previewValue(key: string, value: string): string {
+  return PATH_KEYS.has(key) ? pathDisplayValue(value) : firstLine(value);
+}
+
+/**
+ * One-line label for a tool call's input preview, which may be JSON cut
+ * mid-value. Prefers the command, path, or pattern argument.
+ */
+export function summarizeToolInputPreview(preview: string): string {
+  let params: Params | null = null;
+  try {
+    const parsed: unknown = JSON.parse(preview);
+    params = parsed && typeof parsed === "object" ? (parsed as Params) : null;
+  } catch {
+    params = null;
+  }
+  for (const key of PREVIEW_KEYS) {
+    if (params) {
+      const value = asString(params[key]);
+      if (value) return previewValue(key, value);
+      continue;
+    }
+    const match = new RegExp(String.raw`"${key}"\s*:\s*"((?:[^"\\]|\\.)*)`).exec(preview);
+    if (!match?.[1]) continue;
+    let value = match[1];
+    try {
+      value = JSON.parse(`"${value}"`) as string;
+    } catch {
+      // A value cut mid-escape keeps its raw text.
+    }
+    return previewValue(key, value);
+  }
+  return preview.replace(/\s+/g, " ").trim().slice(0, MAX);
 }

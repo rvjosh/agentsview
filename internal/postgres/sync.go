@@ -5,16 +5,99 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
-	"strings"
+	"strconv"
 	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
-type syncStateStore = SyncStateStore
+type syncStateStore = storage.SyncStateStore
+
+// handoffSyncState writes push state to the local archive and rides out a
+// worker handoff. The daemon closes its archive writer while a sync worker
+// runs, and a daemon push runs outside the sync lock, so a handoff can start
+// during a push. A write that hits a closed writer waits for it to reopen and
+// tries again.
+type handoffSyncState struct{ local *db.DB }
+
+func (h handoffSyncState) GetSyncState(ctx context.Context, key string) (string, error) {
+	return h.local.GetSyncState(ctx, key)
+}
+
+func (h handoffSyncState) SetSyncState(ctx context.Context, key, value string) error {
+	_, err := retryAcrossHandoff(ctx, h.local, func() (struct{}, error) {
+		return struct{}{}, h.local.SetSyncState(ctx, key, value)
+	})
+	return err
+}
+
+func (h handoffSyncState) GetOrCreateSyncState(
+	ctx context.Context, key, defaultValue string,
+) (string, error) {
+	return retryAcrossHandoff(ctx, h.local, func() (string, error) {
+		return h.local.GetOrCreateSyncState(ctx, key, defaultValue)
+	})
+}
+
+// databaseSyncStateWriter writes several sync-state values in one archive
+// transaction, and only while the archive's database ID is still databaseID.
+type databaseSyncStateWriter interface {
+	SetSyncStatesForDatabase(ctx context.Context, databaseID string, values map[string]string) error
+}
+
+func (h handoffSyncState) SetSyncStatesForDatabase(
+	ctx context.Context, databaseID string, values map[string]string,
+) error {
+	_, err := retryAcrossHandoff(ctx, h.local, func() (struct{}, error) {
+		return struct{}{}, h.local.SetSyncStatesForDatabase(ctx, databaseID, values)
+	})
+	return err
+}
+
+// syncStateBatch collects sync-state writes so a caller can commit them
+// together. It is write-only.
+type syncStateBatch struct{ values map[string]string }
+
+func newSyncStateBatch() *syncStateBatch {
+	return &syncStateBatch{values: make(map[string]string)}
+}
+
+var errSyncStateBatchWriteOnly = errors.New("sync state batch is write-only")
+
+func (b *syncStateBatch) GetSyncState(context.Context, string) (string, error) {
+	return "", errSyncStateBatchWriteOnly
+}
+
+func (b *syncStateBatch) SetSyncState(_ context.Context, key, value string) error {
+	b.values[key] = value
+	return nil
+}
+
+func (b *syncStateBatch) GetOrCreateSyncState(context.Context, string, string) (string, error) {
+	return "", errSyncStateBatchWriteOnly
+}
+
+func retryAcrossHandoff[T any](
+	ctx context.Context, local *db.DB, write func() (T, error),
+) (T, error) {
+	for {
+		value, err := write()
+		if !errors.Is(err, db.ErrWriterClosed) {
+			return value, err
+		}
+		if err := local.WaitForWriter(ctx); err != nil {
+			return value, err
+		}
+	}
+}
 
 type scopedSyncStateStore struct {
 	base          syncStateStore
@@ -43,7 +126,7 @@ func (s *scopedSyncStateStore) scopedKey(key string) string {
 	return key + ":" + s.scope
 }
 
-func (s *scopedSyncStateStore) ensureMigration() error {
+func (s *scopedSyncStateStore) ensureMigration(ctx context.Context) error {
 	if s.scope == "" || !s.migrateLegacy {
 		return nil
 	}
@@ -54,7 +137,7 @@ func (s *scopedSyncStateStore) ensureMigration() error {
 			lastPushTargetFingerprintKey,
 		} {
 			scopedKey := s.scopedKey(key)
-			scopedValue, err := s.base.GetSyncState(scopedKey)
+			scopedValue, err := s.base.GetSyncState(ctx, scopedKey)
 			if err != nil {
 				s.migrateErr = fmt.Errorf(
 					"reading %s during PG sync-state migration: %w",
@@ -62,7 +145,7 @@ func (s *scopedSyncStateStore) ensureMigration() error {
 				)
 				return
 			}
-			legacyValue, err := s.base.GetSyncState(key)
+			legacyValue, err := s.base.GetSyncState(ctx, key)
 			if err != nil {
 				s.migrateErr = fmt.Errorf(
 					"reading legacy %s during PG sync-state migration: %w",
@@ -74,7 +157,7 @@ func (s *scopedSyncStateStore) ensureMigration() error {
 				continue
 			}
 			if scopedValue == "" {
-				if err := s.base.SetSyncState(
+				if err := s.base.SetSyncState(ctx,
 					scopedKey, legacyValue,
 				); err != nil {
 					s.migrateErr = fmt.Errorf(
@@ -84,7 +167,7 @@ func (s *scopedSyncStateStore) ensureMigration() error {
 					return
 				}
 			}
-			if err := s.base.SetSyncState(key, ""); err != nil {
+			if err := s.base.SetSyncState(ctx, key, ""); err != nil {
 				s.migrateErr = fmt.Errorf(
 					"clearing legacy %s during PG sync-state migration: %w",
 					key, err,
@@ -96,29 +179,46 @@ func (s *scopedSyncStateStore) ensureMigration() error {
 	return s.migrateErr
 }
 
-func (s *scopedSyncStateStore) GetSyncState(key string) (string, error) {
-	if err := s.ensureMigration(); err != nil {
+func (s *scopedSyncStateStore) GetSyncState(ctx context.Context, key string) (string, error) {
+	if err := s.ensureMigration(ctx); err != nil {
 		return "", err
 	}
-	return s.base.GetSyncState(s.scopedKey(key))
+	return s.base.GetSyncState(ctx, s.scopedKey(key))
 }
 
-func (s *scopedSyncStateStore) SetSyncState(
+func (s *scopedSyncStateStore) SetSyncState(ctx context.Context,
 	key, value string,
 ) error {
-	if err := s.ensureMigration(); err != nil {
+	if err := s.ensureMigration(ctx); err != nil {
 		return err
 	}
-	return s.base.SetSyncState(s.scopedKey(key), value)
+	return s.base.SetSyncState(ctx, s.scopedKey(key), value)
 }
 
-func (s *scopedSyncStateStore) GetOrCreateSyncState(
+func (s *scopedSyncStateStore) SetSyncStatesForDatabase(
+	ctx context.Context, databaseID string, values map[string]string,
+) error {
+	if err := s.ensureMigration(ctx); err != nil {
+		return err
+	}
+	writer, ok := s.base.(databaseSyncStateWriter)
+	if !ok {
+		return fmt.Errorf("sync state store %T cannot write in one transaction", s.base)
+	}
+	scoped := make(map[string]string, len(values))
+	for key, value := range values {
+		scoped[s.scopedKey(key)] = value
+	}
+	return writer.SetSyncStatesForDatabase(ctx, databaseID, scoped)
+}
+
+func (s *scopedSyncStateStore) GetOrCreateSyncState(ctx context.Context,
 	key, defaultValue string,
 ) (string, error) {
-	if err := s.ensureMigration(); err != nil {
+	if err := s.ensureMigration(ctx); err != nil {
 		return "", err
 	}
-	return s.base.GetOrCreateSyncState(
+	return s.base.GetOrCreateSyncState(ctx,
 		s.scopedKey(key), defaultValue,
 	)
 }
@@ -128,29 +228,23 @@ func (s *scopedSyncStateStore) GetOrCreateSyncState(
 // only the SQLSTATE code to avoid false positives from other
 // "does not exist" errors (missing columns, functions, etc.).
 func isUndefinedTable(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "42P01")
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	return ok && pgErr.Code == "42P01"
 }
 
 // isUndefinedColumn returns true when a query references a column
 // that does not exist (PG SQLSTATE 42703).
 func isUndefinedColumn(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "42703")
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	return ok && pgErr.Code == "42703"
 }
 
 // isInsufficientPrivilege returns true when the role lacks a required
 // privilege (PG SQLSTATE 42501) — e.g. a restricted push role that cannot
 // create vector tables in a schema provisioned by a privileged role.
 func isInsufficientPrivilege(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "42501")
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	return ok && pgErr.Code == "42501"
 }
 
 // Sync manages push-only sync from local SQLite to a remote
@@ -166,13 +260,27 @@ type Sync struct {
 	syncStateTarget        string
 	migrateLegacySyncState bool
 
+	// archiveID caches this local archive's stable identifier, populated at
+	// the top of Push and stamped onto every pushed session's
+	// source_archive_id column.
+	archiveID string
+	// databaseGeneration identifies the exact local database generation that
+	// produced each pushed session and its identity snapshot.
+	databaseGeneration string
+	// fullVectorSessions holds PushOptions.FullVectorSessions for the push
+	// in progress.
+	fullVectorSessions map[string]struct{}
+
 	// Project filtering for push scope.
 	projects        []string
 	excludeProjects []string
 
 	// vectorSource, when set, supplies the local vectors.db active generation
 	// pushed as a phase at the end of Push. Nil disables the phase.
-	vectorSource VectorPushSource
+	vectorSource storage.VectorPushSource
+	// recipePrivilegeLogged limits the notice that this writer cannot
+	// publish embedding recipes to once per Sync.
+	recipePrivilegeLogged bool
 	// afterVectorApply is a full/scoped post-apply test hook.
 	afterVectorApply func()
 	// beforeVectorWitnessRecord is a generation-wide pre-witness test hook.
@@ -181,6 +289,21 @@ type Sync struct {
 	afterVectorGenerationLookup func()
 	// afterScopedVectorApply is a scoped-retry test hook.
 	afterScopedVectorApply func()
+
+	// fullRun tracks the running full push's progress; nil outside one.
+	fullRun *fullPushRunTracker
+	// fullRunCheckpointInterval, when positive, replaces
+	// fullPushRunCheckpointInterval.
+	fullRunCheckpointInterval time.Duration
+	// fullRunSaveTimeout, when positive, replaces
+	// defaultFullRunSaveTimeout.
+	fullRunSaveTimeout time.Duration
+	// pushBatchSize, when positive, replaces the session batch size.
+	pushBatchSize int
+	// afterPushBatch is a test hook called after each session batch.
+	afterPushBatch func()
+	// afterMessagePage is a test hook called after each copied message page.
+	afterMessagePage func()
 
 	closeOnce sync.Once
 	closeErr  error
@@ -193,7 +316,7 @@ func (s *Sync) effectiveSyncState() syncStateStore {
 	if s.syncState != nil {
 		return s.syncState
 	}
-	return s.local
+	return handoffSyncState{s.local}
 }
 
 func (s *Sync) aliasBackfillSyncStateOrDefault() syncStateStore {
@@ -201,24 +324,6 @@ func (s *Sync) aliasBackfillSyncStateOrDefault() syncStateStore {
 		return s.aliasBackfillState
 	}
 	return s.effectiveSyncState()
-}
-
-// SyncOptions holds optional configuration for a Sync instance.
-type SyncOptions struct {
-	// Projects limits push scope to these project names.
-	// Mutually exclusive with ExcludeProjects.
-	Projects []string
-	// ExcludeProjects excludes these project names from push.
-	// Mutually exclusive with Projects.
-	ExcludeProjects []string
-	// SyncStateTarget scopes per-target push watermarks and fingerprints.
-	SyncStateTarget string
-	// MigrateLegacySyncState moves unsuffixed legacy sync-state keys into the
-	// named default target the first time that target runs.
-	MigrateLegacySyncState bool
-	// VectorSource, when non-nil, enables the vector push phase, replicating
-	// the local vectors.db active generation into PG. Nil skips the phase.
-	VectorSource VectorPushSource
 }
 
 // New creates a Sync instance and verifies the PG connection.
@@ -229,15 +334,13 @@ type SyncOptions struct {
 func New(
 	pgURL, schema string, local *db.DB,
 	machine string, allowInsecure bool,
-	opts SyncOptions,
+	opts storage.PusherOptions,
 ) (*Sync, error) {
 	if pgURL == "" {
-		return nil, fmt.Errorf("postgres URL is required")
+		return nil, errors.New("postgres URL is required")
 	}
 	if machine == "" {
-		return nil, fmt.Errorf(
-			"machine name must not be empty",
-		)
+		return nil, errors.New("machine name must not be empty")
 	}
 	if machine == "local" {
 		return nil, fmt.Errorf(
@@ -247,9 +350,9 @@ func New(
 		)
 	}
 	if local == nil {
-		return nil, fmt.Errorf("local db is required")
+		return nil, errors.New("local db is required")
 	}
-	if err := ValidateProjectFilters(
+	if err := storage.ValidateProjectFilters(
 		opts.Projects,
 		opts.ExcludeProjects,
 	); err != nil {
@@ -258,6 +361,10 @@ func New(
 
 	pg, err := Open(pgURL, schema, allowInsecure)
 	if err != nil {
+		return nil, err
+	}
+	if err = RejectHostedPush(context.Background(), pg); err != nil {
+		pg.Close()
 		return nil, err
 	}
 	targetFingerprint, err := pgTargetFingerprint(pgURL, schema)
@@ -280,12 +387,12 @@ func New(
 		pg:    pg,
 		local: local,
 		syncState: newScopedSyncStateStore(
-			local,
+			handoffSyncState{local},
 			syncStateScope,
 			migrateLegacySyncState,
 		),
 		aliasBackfillState: newScopedSyncStateStore(
-			local,
+			handoffSyncState{local},
 			aliasBackfillStateScope,
 			false,
 		),
@@ -304,16 +411,6 @@ func hasProjectFilter(projects, excludeProjects []string) bool {
 	return len(projects) > 0 || len(excludeProjects) > 0
 }
 
-// ValidateProjectFilters rejects ambiguous include/exclude project filters.
-func ValidateProjectFilters(projects, excludeProjects []string) error {
-	if len(projects) > 0 && len(excludeProjects) > 0 {
-		return fmt.Errorf(
-			"projects and exclude_projects are mutually exclusive",
-		)
-	}
-	return nil
-}
-
 func pushSyncStateScope(
 	target string,
 	projects, excludeProjects []string,
@@ -329,12 +426,12 @@ func pushSyncStateScope(
 	writeSyncScopeField(sum, "target")
 	writeSyncScopeField(sum, target)
 	writeSyncScopeField(sum, "include")
-	writeSyncScopeField(sum, fmt.Sprintf("%d", len(includeValues)))
+	writeSyncScopeField(sum, strconv.Itoa(len(includeValues)))
 	for _, value := range includeValues {
 		writeSyncScopeField(sum, value)
 	}
 	writeSyncScopeField(sum, "exclude")
-	writeSyncScopeField(sum, fmt.Sprintf("%d", len(excludeValues)))
+	writeSyncScopeField(sum, strconv.Itoa(len(excludeValues)))
 	for _, value := range excludeValues {
 		writeSyncScopeField(sum, value)
 	}
@@ -425,6 +522,16 @@ func (s *Sync) ensureSchemaLocked(ctx context.Context) error {
 		if _, err := ensureVectorBaseSchemaPG(ctx, s.pg); err != nil {
 			log.Printf("pg schema: vector schema setup failed: %v", err)
 		}
+		// A restricted push role may lack CREATE on a schema that a
+		// privileged role provisioned. Raw custody is server-side only,
+		// so skip it here rather than failing every push; the full
+		// EnsureSchema bootstrap path still requires it.
+		if err := ensureRawIngestSchemaPG(ctx, s.pg); err != nil {
+			if !isInsufficientPrivilege(err) {
+				return err
+			}
+			log.Printf("pg schema: raw custody schema skipped, insufficient privilege: %v", err)
+		}
 		s.schemaDone = true
 		return nil
 	}
@@ -443,7 +550,7 @@ func (s *Sync) ensureSchemaLocked(ctx context.Context) error {
 func (s *Sync) Status(
 	ctx context.Context,
 ) (SyncStatus, error) {
-	lastPush, err := ReadLastPushAt(
+	lastPush, err := ReadLastPushAt(ctx,
 		s.local, s.syncStateTarget, nil, nil,
 		s.migrateLegacySyncState,
 	)
@@ -466,9 +573,7 @@ func ReadStatus(
 	lastPush string,
 ) (SyncStatus, error) {
 	if machine == "" {
-		return SyncStatus{}, fmt.Errorf(
-			"machine name must not be empty",
-		)
+		return SyncStatus{}, errors.New("machine name must not be empty")
 	}
 	if machine == "local" {
 		return SyncStatus{}, fmt.Errorf(
@@ -532,25 +637,25 @@ func readStatus(
 	}, nil
 }
 
-func ReadLastPushAt(
-	local SyncStateStore,
+func ReadLastPushAt(ctx context.Context,
+	local storage.SyncStateStore,
 	target string,
 	projects, excludeProjects []string,
 	migrateLegacy bool,
 ) (string, error) {
 	if local == nil {
-		return "", fmt.Errorf("local sync state is required")
+		return "", errors.New("local sync state is required")
 	}
 	scope := pushSyncStateScope(target, projects, excludeProjects)
 	if scope == "" {
-		return local.GetSyncState("last_push_at")
+		return local.GetSyncState(ctx, "last_push_at")
 	}
 	store := newScopedSyncStateStore(
 		local,
 		scope,
 		false,
 	)
-	lastPush, err := store.GetSyncState("last_push_at")
+	lastPush, err := store.GetSyncState(ctx, "last_push_at")
 	if err != nil {
 		return "", err
 	}
@@ -559,7 +664,7 @@ func ReadLastPushAt(
 		hasProjectFilter(projects, excludeProjects) {
 		return lastPush, nil
 	}
-	return local.GetSyncState("last_push_at")
+	return local.GetSyncState(ctx, "last_push_at")
 }
 
 // SyncStatus holds summary information about the sync state.

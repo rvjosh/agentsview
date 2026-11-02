@@ -1,31 +1,173 @@
-import { cleanup, fireEvent, render } from "@testing-library/svelte";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/svelte";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import AppearanceSettings from "./AppearanceSettings.svelte";
+import { SettingsService } from "../../api/generated/index";
+import { messageColors } from "../../stores/messageColors.svelte.js";
+import { settings } from "../../stores/settings.svelte.js";
+import { sync } from "../../stores/sync.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 
+vi.mock("../../api/generated/index", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("../../api/generated/index")>();
+  return {
+    ...orig,
+    SettingsService: {
+      putApiV1Settings: vi.fn(),
+    },
+  };
+});
+
+const settingsService = SettingsService as unknown as {
+  putApiV1Settings: ReturnType<typeof vi.fn>;
+};
+const originalIsDesktop = sync.isDesktop;
+
 describe("AppearanceSettings", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    settingsService.putApiV1Settings.mockResolvedValue({
+      agent_dirs: {},
+      chart_palette: "agentsview",
+      github_configured: false,
+      host: "127.0.0.1",
+      port: 8080,
+      read_only: false,
+      require_auth: false,
+      terminal: { mode: "auto" },
+    });
+    settings.chartPalette = "agentsview";
+    settings.readOnly = false;
+    settings.loaded = true;
+    settings.saving = false;
+    Object.defineProperty(sync, "isDesktop", {
+      value: false,
+      writable: true,
+      configurable: true,
+    });
+  });
+
   afterEach(() => {
-    ui.setFontScale(100);
+    messageColors.applyPreset("default");
+    ui.setZoomLevel(100);
+    ui.renderUnknownXmlBlocksAsPreformatted = false;
     if (ui.highContrast) ui.toggleHighContrast();
+    settings.chartPalette = "agentsview";
+    settings.readOnly = false;
+    settings.loaded = false;
+    Object.defineProperty(sync, "isDesktop", {
+      value: originalIsDesktop,
+      writable: true,
+      configurable: true,
+    });
     cleanup();
   });
 
-  it("renders five text-size options and marks the active scale", () => {
-    ui.setFontScale(110);
-    const { getByRole } = render(AppearanceSettings);
-    for (const pct of [90, 100, 110, 120, 130]) {
-      expect(getByRole("radio", { name: `${pct}%` })).toBeTruthy();
-    }
-    expect(
-      getByRole("radio", { name: "110%" }).getAttribute("aria-checked"),
-    ).toBe("true");
+  it.each([false, true])("shares one Zoom selector with desktop=%s", async (isDesktop) => {
+    Object.defineProperty(sync, "isDesktop", {
+      value: isDesktop,
+      writable: true,
+      configurable: true,
+    });
+    ui.setZoomLevel(120);
+    const { getByTitle, getByRole, getAllByRole, queryByText } = render(AppearanceSettings);
+    expect(getByTitle("Zoom").textContent).toContain("120%");
+    expect(getByRole("button", { name: "Zoom 120%" })).toBeTruthy();
+    expect(queryByText("Text size")).toBeNull();
+    expect(queryByText("Desktop zoom")).toBeNull();
+    await fireEvent.click(getByTitle("Zoom"));
+    expect(getAllByRole("option").map((option) => option.textContent?.trim())).toEqual([
+      "67%",
+      "75%",
+      "80%",
+      "90%",
+      "100%",
+      "110%",
+      "120%",
+      "125%",
+      "130%",
+      "150%",
+      "175%",
+      "200%",
+    ]);
+    expect(getByRole("option", { name: "120%" }).getAttribute("aria-selected")).toBe("true");
+    await fireEvent.mouseDown(getByRole("option", { name: "150%" }));
+    await waitFor(() => expect(getByTitle("Zoom").textContent).toContain("150%"));
+    expect(ui.zoomLevel).toBe(150);
+    expect(localStorage.getItem("agentsview-zoom-level")).toBe("150");
+    ui.zoomOut();
+    await waitFor(() => expect(getByTitle("Zoom").textContent).toContain("130%"));
+    ui.resetZoom();
+    await waitFor(() => expect(getByTitle("Zoom").textContent).toContain("100%"));
   });
 
-  it("changes the font scale when an option is clicked", async () => {
+  it("keeps local Zoom available when server settings are read-only", async () => {
+    settings.readOnly = true;
+    const { getByRole, getByTitle } = render(AppearanceSettings);
+
+    expect((getByRole("button", { name: "Zoom 100%" }) as HTMLButtonElement).disabled).toBe(false);
+    await fireEvent.click(getByTitle("Zoom"));
+    await fireEvent.mouseDown(getByRole("option", { name: "120%" }));
+    await waitFor(() => expect(getByTitle("Zoom").textContent).toContain("120%"));
+    expect(ui.zoomLevel).toBe(120);
+    expect(settingsService.putApiV1Settings).not.toHaveBeenCalled();
+  });
+
+  it("keeps Zoom local while another setting saves", async () => {
+    const paletteResponse = {
+      agent_dirs: {},
+      chart_palette: "matplotlib" as const,
+      github_configured: false,
+      host: "127.0.0.1",
+      port: 8080,
+      read_only: false,
+      require_auth: false,
+      terminal: { mode: "auto" as const },
+    };
+    let finishPalette!: (value: typeof paletteResponse) => void;
+    settingsService.putApiV1Settings.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishPalette = resolve;
+      }),
+    );
+
+    const paletteSave = settings.save({ chart_palette: "matplotlib" });
+    const { getByRole, getByTitle } = render(AppearanceSettings);
+    await fireEvent.click(getByTitle("Zoom"));
+    await fireEvent.mouseDown(getByRole("option", { name: "120%" }));
+
+    await waitFor(() => expect(getByTitle("Zoom").textContent).toContain("120%"));
+    expect(ui.zoomLevel).toBe(120);
+    expect(settingsService.putApiV1Settings).toHaveBeenCalledTimes(1);
+
+    finishPalette(paletteResponse);
+    await paletteSave;
+    expect(settingsService.putApiV1Settings).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem("agentsview-zoom-level")).toBe("120");
+    await waitFor(() => expect(settings.saving).toBe(false));
+  });
+
+  it("rejects an unlisted percentage and shows localized empty text", async () => {
+    const { getByTitle, getByRole, getByText, queryAllByRole } = render(AppearanceSettings);
+    await fireEvent.click(getByTitle("Zoom"));
+    const input = getByRole("combobox", { name: "Zoom" });
+    await fireEvent.input(input, { target: { value: "133" } });
+    expect(getByText("No matches")).toBeTruthy();
+    expect(queryAllByRole("option")).toHaveLength(0);
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(ui.zoomLevel).toBe(100);
+  });
+
+  it("toggles rendering unknown XML blocks as preformatted text", async () => {
     const { getByRole } = render(AppearanceSettings);
-    await fireEvent.click(getByRole("radio", { name: "120%" }));
-    expect(ui.fontScale).toBe(120);
+    const checkbox = getByRole("checkbox", {
+      name: "Render unknown XML blocks as preformatted text",
+    });
+
+    expect((checkbox as HTMLInputElement).checked).toBe(false);
+    await fireEvent.click(checkbox);
+    expect(ui.renderUnknownXmlBlocksAsPreformatted).toBe(true);
+    expect((checkbox as HTMLInputElement).checked).toBe(true);
   });
 
   it("toggles high contrast", async () => {
@@ -33,5 +175,111 @@ describe("AppearanceSettings", () => {
     expect(ui.highContrast).toBe(false);
     await fireEvent.click(getByRole("button", { name: "Off" }));
     expect(ui.highContrast).toBe(true);
+  });
+
+  it("saves and confirms the selected chart palette", async () => {
+    settingsService.putApiV1Settings.mockResolvedValue({
+      agent_dirs: {},
+      chart_palette: "matplotlib",
+      github_configured: false,
+      host: "127.0.0.1",
+      port: 8080,
+      read_only: false,
+      require_auth: false,
+      terminal: { mode: "auto" },
+    });
+    const { getByRole } = render(AppearanceSettings);
+
+    await fireEvent.click(getByRole("radio", { name: "Matplotlib" }));
+
+    expect(settingsService.putApiV1Settings).toHaveBeenCalledWith({
+      chart_palette: "matplotlib",
+    });
+    expect(getByRole("radio", { name: "Matplotlib" }).getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("saves the chart palette when the server is read-only", async () => {
+    settings.readOnly = true;
+    settingsService.putApiV1Settings.mockResolvedValue({
+      agent_dirs: {},
+      chart_palette: "matplotlib",
+      github_configured: false,
+      host: "127.0.0.1",
+      port: 8080,
+      read_only: true,
+      require_auth: false,
+      terminal: { mode: "auto" },
+    });
+    const { getByRole } = render(AppearanceSettings);
+
+    await fireEvent.click(getByRole("radio", { name: "Matplotlib" }));
+
+    expect(settingsService.putApiV1Settings).toHaveBeenCalledWith({
+      chart_palette: "matplotlib",
+    });
+    await waitFor(() =>
+      expect(getByRole("radio", { name: "Matplotlib" }).getAttribute("aria-checked")).toBe("true"),
+    );
+  });
+
+  describe("message colors", () => {
+    it("applies the color-blind preset to every role and turns on patterns", async () => {
+      const { getByRole, getAllByRole } = render(AppearanceSettings);
+      const reset = getByRole("button", { name: "Reset to defaults" }) as HTMLButtonElement;
+      expect(reset.disabled).toBe(true);
+      // Chart colors has a "Color-blind safe" option too.
+      const preset = within(getByRole("radiogroup", { name: "Message color preset" }));
+
+      await fireEvent.click(preset.getByRole("radio", { name: "Color-blind safe" }));
+
+      const userField = within(getByRole("group", { name: "Color for User messages" }));
+      expect(userField.getByRole("textbox", { name: "Hex color" })).toHaveProperty(
+        "value",
+        "#0072b2",
+      );
+      expect(
+        getByRole("checkbox", { name: "Mark message types with line patterns as well as color" }),
+      ).toHaveProperty("checked", true);
+      expect(
+        preset.getByRole("radio", { name: "Color-blind safe" }).getAttribute("aria-checked"),
+      ).toBe("true");
+      expect(getAllByRole("button", { name: /^Reset color for / })).toHaveLength(5);
+      expect(reset.disabled).toBe(false);
+    });
+
+    it("warns which modes a hard-to-read color fails in", async () => {
+      const { getByRole, queryByText } = render(AppearanceSettings);
+      const group = within(getByRole("group", { name: "Color for User messages" }));
+      const hex = group.getByRole("textbox", { name: "Hex color" });
+
+      await fireEvent.input(hex, { target: { value: "#f0e442" } });
+      await fireEvent.change(hex, { target: { value: "#f0e442" } });
+
+      const warning = await waitFor(() => {
+        const node = queryByText(/color marker may be hard to see/);
+        expect(node).not.toBeNull();
+        return node!;
+      });
+      expect(warning.textContent).toContain("light mode and high-contrast light mode");
+      expect(warning.textContent).toContain("needs 3:1");
+      expect(hex.getAttribute("aria-invalid")).toBe("true");
+      expect(document.getElementById(hex.getAttribute("aria-describedby")!)?.textContent).toContain(
+        "hard to see",
+      );
+      expect(getByRole("radio", { name: "Custom" }).getAttribute("aria-checked")).toBe("true");
+    });
+
+    it("resets one role back to the theme color", async () => {
+      messageColors.setColor("tool", "#f0e442");
+      const { getByRole, queryByText } = render(AppearanceSettings);
+
+      await fireEvent.click(getByRole("button", { name: "Reset color for Tool calls" }));
+
+      const group = within(getByRole("group", { name: "Color for Tool calls" }));
+      // --accent-amber in the light theme.
+      expect(group.getByRole("textbox", { name: "Hex color" })).toHaveProperty("value", "#d97706");
+      expect(queryByText(/hard to see|hard to read/)).toBeNull();
+      expect(messageColors.isDefault).toBe(true);
+    });
   });
 });

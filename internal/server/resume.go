@@ -2,8 +2,10 @@ package server
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -18,6 +20,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
+	"go.kenn.io/agentsview/internal/shellquote"
 )
 
 // resumeRequest is the JSON body for POST /api/v1/sessions/{id}/resume.
@@ -39,21 +42,34 @@ type resumeResponse struct {
 }
 
 // resumeAgents maps agent type strings to their resume command templates.
-// The %s placeholder is replaced with the (quoted) session ID.
+// The %s placeholder is replaced with the (quoted) session ID. TraeX ships the
+// traex, traecli, and trae-cli aliases; the shortest is used. The Augure Code
+// agent's command is the vendor's own `augure resume` CLI, not the agent id.
 var resumeAgents = map[string]string{
-	"claude":   "claude --resume %s",
-	"codex":    "codex resume %s",
-	"copilot":  "copilot --resume=%s",
-	"cursor":   "cursor agent --resume %s",
-	"gemini":   "gemini --resume %s",
-	"opencode": "opencode --session %s",
-	"amp":      "amp --resume %s",
-	"kiro":     "kiro-cli chat --resume-id %s",
+	"claude":      "claude --resume %s",
+	"codex":       "codex resume %s",
+	"traex":       "traex resume %s",
+	"augure-code": "augure resume %s",
+	"copilot":     "copilot --resume=%s",
+	"cursor":      "cursor agent --resume %s",
+	"gemini":      "gemini --resume %s",
+	"opencode":    "opencode --session %s",
+	"amp":         "amp --resume %s",
+	"kiro":        "kiro-cli chat --resume-id %s",
+	"pi":          "pi --session %s",
 }
 
 const syntheticModel = "<synthetic>"
 
 func resumeCommand(agent, tmpl, rawID, model string) string {
+	if parser.SharesSessionIDs(parser.AgentType(agent)) {
+		// A second file sharing a session id is stored under a derived id; the CLI resumes the original.
+		rawID = parser.BaseSessionID(rawID)
+	}
+	if agent == "codex" || agent == "traex" || agent == "augure-code" {
+		// Codex stores a revert page as <thread>_<rollout>; the CLI resumes the thread.
+		rawID = parser.CodexThreadIDFromSessionKey(rawID)
+	}
 	cmd := fmt.Sprintf(tmpl, shellQuote(rawID))
 	if !resumeAgentNeedsModel(agent) {
 		return cmd
@@ -64,14 +80,15 @@ func resumeCommand(agent, tmpl, rawID, model string) string {
 	switch agent {
 	case "claude":
 		cmd += " --model " + shellQuote(model)
-	case "codex":
+	case "codex", "traex", "augure-code":
 		cmd += " -m " + shellQuote(model)
 	}
 	return cmd
 }
 
 func resumeAgentNeedsModel(agent string) bool {
-	return agent == "claude" || agent == "codex"
+	return agent == "claude" || agent == "codex" || agent == "traex" ||
+		agent == "augure-code"
 }
 
 func primaryResumeModel(counts []db.ModelCount) string {
@@ -153,7 +170,14 @@ func commandWithCwd(cmd, cwd string) string {
 	if !isDir(cwd) {
 		return cmd
 	}
-	return fmt.Sprintf("cd %s && %s", shellQuote(cwd), cmd)
+	return commandWithDir(cmd, cwd)
+}
+
+func commandWithDir(cmd, dir string) string {
+	if dir == "" {
+		return cmd
+	}
+	return fmt.Sprintf("cd %s && %s", shellQuote(dir), cmd)
 }
 
 func commandWithCleanup(cmd, cleanupPath string) string {
@@ -205,23 +229,19 @@ func claudeMessagePointWindowsScript(
 	b.WriteString("try { ")
 	if cwd != "" {
 		b.WriteString("Set-Location -LiteralPath ")
-		b.WriteString(powerShellSingleQuote(cwd))
+		b.WriteString(shellquote.PowerShell(cwd))
 		b.WriteString("; ")
 	}
 	b.WriteString("Get-Content -Raw -Encoding UTF8 -LiteralPath ")
-	b.WriteString(powerShellSingleQuote(promptPath))
+	b.WriteString(shellquote.PowerShell(promptPath))
 	b.WriteString(" | & 'claude'")
 	if skipPermissions {
 		b.WriteString(" --dangerously-skip-permissions")
 	}
 	b.WriteString(" } finally { Remove-Item -LiteralPath ")
-	b.WriteString(powerShellSingleQuote(promptPath))
+	b.WriteString(shellquote.PowerShell(promptPath))
 	b.WriteString(" -Force -ErrorAction SilentlyContinue }")
 	return b.String()
-}
-
-func powerShellSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 func powerShellEncodedCommand(script string) string {
@@ -435,7 +455,7 @@ func detectTerminalDarwin(
 		)
 		return "osascript", []string{"-e", appleScript}, "Terminal", nil
 	}
-	return "", nil, "", fmt.Errorf("osascript not found on macOS")
+	return "", nil, "", errors.New("osascript not found on macOS")
 }
 
 // readSessionCwd reads the first few lines of a session JSONL file
@@ -533,12 +553,9 @@ func cursorLastWorkingDir(session *db.Session) string {
 func resolveCursorResumePaths(
 	session *db.Session, lastCwd string,
 ) (launchDir, workspaceDir string) {
-	workspaceDir = resolveCursorWorkspaceDirWithHint(
-		session,
-		func() string { return lastCwd },
-	)
+	workspaceDir = normalizeCursorDir(session.Cwd)
 	if workspaceDir == "" {
-		workspaceDir = lastCwd
+		workspaceDir = resolveCursorWorkspaceDirWithHint(session, func() string { return lastCwd })
 	}
 	if lastCwd != "" {
 		return lastCwd, workspaceDir
@@ -564,49 +581,32 @@ func resolveCursorWorkspaceDirFromTranscriptPath(
 	dir, ambiguous := resolveCursorProjectDirFromSessionFile(
 		*session.FilePath,
 	)
+	if ambiguous {
+		return "", true
+	}
 	if canonical := normalizeCursorDir(dir); canonical != "" {
-		return canonical, ambiguous
+		return canonical, false
 	}
 	return "", false
-}
-
-func resolveCursorWorkspaceDirFromTranscriptPathHint(
-	session *db.Session, hint string,
-) string {
-	if session.FilePath == nil {
-		return ""
-	}
-	dir := resolveCursorProjectDirFromSessionFileHint(
-		*session.FilePath, hint,
-	)
-	return normalizeCursorDir(dir)
 }
 
 func resolveCursorWorkspaceDirWithHint(
 	session *db.Session, hintFn func() string,
 ) string {
 	projectDir := normalizeCursorDir(session.Project)
-	if dir, ambiguous := resolveCursorWorkspaceDirFromTranscriptPath(
-		session,
-	); dir != "" {
-		if ambiguous {
-			hint := projectDir
-			if hintFn != nil {
-				if value := hintFn(); value != "" {
-					hint = value
-				}
-			}
-			if hint != "" {
-				if hinted := resolveCursorWorkspaceDirFromTranscriptPathHint(
-					session, hint,
-				); hinted != "" {
-					return hinted
-				}
-			}
-			// Ambiguous with no useful hint — don't guess.
-			return projectDir
+	hint := projectDir
+	if hintFn != nil {
+		if value := hintFn(); value != "" {
+			hint = value
 		}
-		return dir
+	}
+	if session.FilePath == nil {
+		return projectDir
+	}
+	if dir := resolveCursorProjectDirFromSessionFileHint(
+		*session.FilePath, hint,
+	); dir != "" {
+		return normalizeCursorDir(dir)
 	}
 	return projectDir
 }
@@ -624,26 +624,28 @@ func isVirtualSessionPath(path string) bool {
 	if _, _, ok := parser.ParseVirtualSourcePathForBase(path, "data.sqlite3"); ok {
 		return true
 	}
-	if _, _, ok := parser.ParseVirtualSourcePathForBase(path, "opencode.db"); ok {
+	if _, _, ok := parser.ParseOpenCodeSQLiteVirtualPath(path); ok {
 		return true
 	}
 	return false
 }
 
-// resolveSessionDir determines the project directory for a session.
-// It tries the session file's embedded cwd first, then the cached cwd,
-// then Cursor's transcript-derived workspace path, then falls back to
-// the session's project field. Virtual DB-backed file paths are storage
-// locators only, so they skip source-file cwd reads and use cached cwd.
-// All returned candidates must be absolute paths pointing to existing
-// directories.
+// resolveSessionDir returns an existing directory for launch operations.
 func resolveSessionDir(session *db.Session) string {
+	return resolveSessionPath(session, isDir)
+}
+
+// resolveSessionPath selects the first accepted candidate in metadata order:
+// embedded cwd, cached cwd, Cursor's resolved workspace, then project. Virtual
+// DB-backed file paths skip source-file reads. Cursor reconstruction still
+// returns only an existing resolved workspace.
+func resolveSessionPath(session *db.Session, accept func(string) bool) string {
 	if session.FilePath != nil && !isVirtualSessionPath(*session.FilePath) {
-		if cwd := readSessionCwd(*session.FilePath); isDir(cwd) {
+		if cwd := readSessionCwd(*session.FilePath); accept(cwd) {
 			return cwd
 		}
 	}
-	if isDir(session.Cwd) {
+	if accept(session.Cwd) {
 		return session.Cwd
 	}
 	if session.Agent == "cursor" {
@@ -651,7 +653,7 @@ func resolveSessionDir(session *db.Session) string {
 			return dir
 		}
 	}
-	if isDir(session.Project) {
+	if accept(session.Project) {
 		return session.Project
 	}
 	return ""
@@ -663,10 +665,10 @@ func resolveSessionDir(session *db.Session) string {
 // contents when the transcript path maps to multiple plausible
 // workspace roots.
 func resolveCursorWorkspaceDir(session *db.Session) string {
-	return resolveCursorWorkspaceDirWithHint(
-		session,
-		func() string { return cursorLastWorkingDir(session) },
-	)
+	if dir, ambiguous := resolveCursorWorkspaceDirFromTranscriptPath(session); !ambiguous {
+		return dir
+	}
+	return ""
 }
 
 func normalizeCursorDir(path string) string {
@@ -731,9 +733,8 @@ func detectTerminalLinux(cmd string) (string, []string, string, error) {
 		return path, buildTerminalArgs(c.bin, cmd), c.bin, nil
 	}
 
-	return "", nil, "", fmt.Errorf(
-		"no terminal emulator found; install kitty, alacritty, " +
-			"gnome-terminal, or set $TERMINAL",
+	return "", nil, "", errors.New("no terminal emulator found; install kitty, alacritty, " +
+		"gnome-terminal, or set $TERMINAL",
 	)
 }
 
@@ -768,7 +769,7 @@ func buildTerminalArgs(bin, cmd string) []string {
 // inside the terminal identified by the opener. Returns nil if the
 // opener kind is not "terminal" (or "action" for special openers like
 // Claude Desktop) or the terminal is not supported.
-func launchResumeInOpener(
+func launchResumeInOpener(ctx context.Context,
 	o Opener, cmd string, cwd string,
 ) *exec.Cmd {
 	if o.ID == "claude-desktop" {
@@ -779,13 +780,13 @@ func launchResumeInOpener(
 	}
 
 	if runtime.GOOS == "darwin" {
-		return launchResumeDarwin(o, cmd, cwd)
+		return launchResumeDarwin(ctx, o, cmd, cwd)
 	}
 
 	// Linux: launch via CLI binary with per-terminal arg patterns.
 	// Wrap the resume command so the shell stays open after it exits.
 	args := buildTerminalArgs(o.ID, cmd+"; exec bash")
-	proc := exec.Command(o.Bin, args...)
+	proc := exec.CommandContext(ctx, o.Bin, args...)
 	if cwd != "" {
 		proc.Dir = cwd
 	}
@@ -798,7 +799,7 @@ func launchResumeInOpener(
 // launchResumeDarwin launches a resume command in a macOS terminal
 // app. Uses AppleScript for iTerm2/Terminal.app and `open -na` with
 // appropriate flags for others.
-func launchResumeDarwin(
+func launchResumeDarwin(ctx context.Context,
 	o Opener, cmd string, cwd string,
 ) *exec.Cmd {
 	// For AppleScript-based terminals, build a single shell command
@@ -830,7 +831,7 @@ func launchResumeDarwin(
 				end tell
 			end tell`, safe,
 		)
-		return exec.Command("osascript", "-e", script)
+		return exec.CommandContext(ctx, "osascript", "-e", script)
 	case "terminal":
 		script := fmt.Sprintf(
 			`tell application "Terminal"
@@ -838,7 +839,7 @@ func launchResumeDarwin(
 				do script "%s"
 			end tell`, safe,
 		)
-		return exec.Command("osascript", "-e", script)
+		return exec.CommandContext(ctx, "osascript", "-e", script)
 	case "ghostty":
 		var args []string
 		if cwd != "" {
@@ -846,14 +847,14 @@ func launchResumeDarwin(
 		}
 		args = append(args, "-e", "bash", "-c",
 			cmd+"; exec bash")
-		return macExecCommand(o.Bin, args...)
+		return macExecCommand(ctx, o.Bin, args...)
 	case "kitty":
 		var args []string
 		if cwd != "" {
 			args = append(args, "-d", cwd)
 		}
 		args = append(args, "bash", "-c", cmd+"; exec bash")
-		return macExecCommand(o.Bin, args...)
+		return macExecCommand(ctx, o.Bin, args...)
 	case "alacritty":
 		var args []string
 		if cwd != "" {
@@ -861,7 +862,7 @@ func launchResumeDarwin(
 		}
 		args = append(args, "-e", "bash", "-c",
 			cmd+"; exec bash")
-		return macExecCommand(o.Bin, args...)
+		return macExecCommand(ctx, o.Bin, args...)
 	case "wezterm":
 		args := []string{"start"}
 		if cwd != "" {
@@ -869,7 +870,7 @@ func launchResumeDarwin(
 		}
 		args = append(args, "--", "bash", "-c",
 			cmd+"; exec bash")
-		return macExecCommand(o.Bin, args...)
+		return macExecCommand(ctx, o.Bin, args...)
 	default:
 		return nil
 	}
@@ -878,10 +879,10 @@ func launchResumeDarwin(
 // launchClaudeDesktop builds an exec.Cmd that opens a Claude Code
 // session in Claude Desktop via the claude:// URL scheme. The URL
 // format is claude://resume?session={id}&cwd={path}.
-func launchClaudeDesktop(sessionID string, cwd string) *exec.Cmd {
+func launchClaudeDesktop(ctx context.Context, sessionID string, cwd string) *exec.Cmd {
 	u := "claude://resume?session=" + url.QueryEscape(sessionID)
 	if cwd != "" {
 		u += "&cwd=" + url.QueryEscape(cwd)
 	}
-	return exec.Command("open", u)
+	return exec.CommandContext(ctx, "open", u)
 }

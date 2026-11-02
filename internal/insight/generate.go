@@ -3,14 +3,21 @@ package insight
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"unicode/utf16"
+
+	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // geminiInsightModel is the model passed to the gemini CLI
@@ -29,15 +36,18 @@ type Result struct {
 	Model   string
 }
 
-// ValidAgentNames lists the supported insight agent names in display
-// order. ValidAgents is a lookup set derived from it.
-var ValidAgentNames = []string{
-	"claude",
-	"codex",
-	"copilot",
-	"gemini",
-	"kiro",
+// ValidTypes lists the insight types the generate route accepts.
+var ValidTypes = map[string]bool{
+	"daily_activity":      true,
+	"agent_analysis":      true,
+	CannedType:            true,
+	ToolEffectivenessType: true,
 }
+
+// ValidAgentNames lists the supported insight agent names in display
+// order. ValidAgents is a lookup set derived from it. The names live in
+// internal/config so configuration validation accepts exactly this set.
+var ValidAgentNames = config.InsightAgentNames()
 
 // ValidAgents is the set of supported insight agent names.
 var ValidAgents = func() map[string]bool {
@@ -80,26 +90,8 @@ type AgentConfig struct {
 
 // GenerateOptions holds optional insight generation overrides.
 type GenerateOptions struct {
-	Agents map[string]AgentConfig
-}
-
-// Generate invokes an AI agent CLI to generate an insight.
-// The agent parameter selects which CLI to use (claude,
-// codex, gemini). The prompt is passed via stdin.
-func Generate(
-	ctx context.Context, agent, prompt string,
-) (Result, error) {
-	return GenerateStream(ctx, agent, prompt, nil)
-}
-
-// GenerateStream invokes an AI agent CLI to generate an
-// insight while optionally streaming process logs.
-func GenerateStream(
-	ctx context.Context, agent, prompt string, onLog LogFunc,
-) (Result, error) {
-	return GenerateStreamWithOptions(
-		ctx, agent, prompt, onLog, GenerateOptions{},
-	)
+	Agents   map[string]AgentConfig
+	Endpoint *EndpointConfig
 }
 
 // GenerateStreamWithOptions invokes an AI agent CLI to generate an
@@ -112,6 +104,9 @@ func GenerateStreamWithOptions(
 		return Result{}, fmt.Errorf(
 			"unsupported agent: %s", agent,
 		)
+	}
+	if opts.Endpoint != nil {
+		return generateEndpoint(ctx, *opts.Endpoint, prompt)
 	}
 
 	path, err := resolveAgentBinary(agent, opts)
@@ -177,10 +172,11 @@ func truncateLogLine(line string, maxBytes int) string {
 	if maxBytes <= 0 || len(line) <= maxBytes {
 		return line
 	}
-	omitted := len(line) - maxBytes
+	prefix := stringutil.SafeTruncate(line, maxBytes)
+	omitted := len(line) - len(prefix)
 	return fmt.Sprintf(
 		"%s... [truncated %d bytes]",
-		line[:maxBytes], omitted,
+		prefix, omitted,
 	)
 }
 
@@ -312,13 +308,13 @@ func generateClaude(
 // versions: {"result":"...","model":"..."}.
 func parseCLIResult(data []byte) (result, model string) {
 	// Try JSON array format (Claude Code v2+).
-	var events []json.RawMessage
+	var events []jsontext.Value
 	if json.Unmarshal(data, &events) == nil {
 		for _, raw := range events {
 			var ev struct {
-				Type       string                     `json:"type"`
-				Result     string                     `json:"result"`
-				ModelUsage map[string]json.RawMessage `json:"modelUsage"`
+				Type       string                    `json:"type"`
+				Result     string                    `json:"result"`
+				ModelUsage map[string]jsontext.Value `json:"modelUsage"`
 			}
 			if json.Unmarshal(raw, &ev) != nil {
 				continue
@@ -397,7 +393,7 @@ func generateCodex(
 	if waitErr := cmd.Wait(); waitErr != nil {
 		if parseErr != nil {
 			return Result{}, fmt.Errorf(
-				"codex failed: %w (parse: %v)\nstderr: %s",
+				"codex failed: %w (parse: %w)\nstderr: %s",
 				waitErr, parseErr, stderrText,
 			)
 		}
@@ -494,6 +490,68 @@ func parseCodexStream(
 	return strings.Join(messages, "\n"), nil
 }
 
+// PromptArgLimit returns the largest prompt, as measured by promptArgSize,
+// that agent can receive, or zero when the prompt goes through stdin or an
+// HTTP body. Copilot's CLI takes the prompt as one argument, which Linux caps
+// at 128 KiB and Windows caps, for the whole command line, at 32,767
+// characters. macOS has no per-argument cap, only 1 MiB for all arguments and
+// the environment together, so its limit leaves 128 KiB for the rest.
+func PromptArgLimit(agent string, opts GenerateOptions) int {
+	if agent != "copilot" || opts.Endpoint != nil {
+		return 0
+	}
+	switch runtime.GOOS {
+	case "windows":
+		return 30 << 10
+	case "darwin":
+		return 896 << 10
+	default:
+		return 120 << 10
+	}
+}
+
+// promptArgSize measures a prompt the way the OS limits it as an argument.
+var promptArgSize = func(prompt string) int {
+	if runtime.GOOS == "windows" {
+		return windowsArgLength(prompt)
+	}
+	return len(prompt)
+}
+
+// windowsArgLength returns the UTF-16 length of s once quoted for a Windows
+// command line, following syscall.EscapeArg.
+func windowsArgLength(s string) int {
+	if s == "" {
+		return 2
+	}
+	n := 0
+	for _, r := range s {
+		n += utf16.RuneLen(r)
+	}
+	hasSpace := strings.ContainsAny(s, " \t")
+	if hasSpace {
+		n += 2
+	}
+	if !strings.ContainsAny(s, `"\`) {
+		return n
+	}
+	slashes := 0
+	for i := range len(s) {
+		switch s[i] {
+		case '\\':
+			slashes++
+			continue
+		case '"':
+			n += slashes + 1
+		}
+		slashes = 0
+	}
+	if hasSpace {
+		n += slashes
+	}
+	return n
+}
+
 // generateCopilot invokes `copilot -p <prompt> --silent`.
 // The prompt is passed as the -p argument (copilot does not
 // read prompts from stdin). Output is plain text on stdout.
@@ -560,9 +618,7 @@ func generateCopilot(
 
 	content := strings.TrimSpace(string(stdoutBytes))
 	if content == "" {
-		return Result{}, fmt.Errorf(
-			"copilot returned empty result",
-		)
+		return Result{}, errors.New("copilot returned empty result")
 	}
 
 	return Result{
@@ -578,9 +634,7 @@ func generateGemini(
 	cfg AgentConfig,
 ) (Result, error) {
 	if strings.TrimSpace(cfg.Sandbox) == "" && !cfg.AllowUnsafe {
-		return Result{}, fmt.Errorf(
-			"gemini insights require an explicit sandbox or unsafe opt-in; set [agent.gemini].sandbox to a Gemini sandbox provider or [agent.gemini].allow_unsafe = true",
-		)
+		return Result{}, errors.New("gemini insights require an explicit sandbox or unsafe opt-in; set [agent.gemini].sandbox to a Gemini sandbox provider or [agent.gemini].allow_unsafe = true")
 	}
 	cmd := exec.CommandContext(
 		ctx, path,
@@ -626,7 +680,7 @@ func generateGemini(
 	if waitErr := cmd.Wait(); waitErr != nil {
 		if parseErr != nil {
 			return Result{}, fmt.Errorf(
-				"gemini failed: %w (parse: %v)\nstderr: %s",
+				"gemini failed: %w (parse: %w)\nstderr: %s",
 				waitErr, parseErr, stderrText,
 			)
 		}
@@ -816,7 +870,7 @@ func generateKiro(
 	}
 	content := strings.TrimSpace(strings.Join(lines, "\n"))
 	if content == "" {
-		return Result{}, fmt.Errorf("kiro returned empty result")
+		return Result{}, errors.New("kiro returned empty result")
 	}
 
 	return Result{

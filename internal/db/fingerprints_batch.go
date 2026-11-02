@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 )
@@ -66,22 +67,23 @@ func (m fingerprintBuilders) mergeInto(out map[string]string) {
 // MessageContentAggregate mirrors MessageContentFingerprint's
 // sum/max/min triple for the batched lookup.
 type MessageContentAggregate struct {
-	Sum int64
-	Max int64
-	Min int64
+	Count int
+	Sum   int64
+	Max   int64
+	Min   int64
 }
 
 // MessageContentFingerprints is the batched twin of
 // MessageContentFingerprint. Sessions without messages are absent from the
 // map; the zero MessageContentAggregate matches the per-session result.
-func (db *DB) MessageContentFingerprints(
+func (db *DB) MessageContentFingerprints(ctx context.Context,
 	sessionIDs []string,
 ) (map[string]MessageContentAggregate, error) {
 	out := make(map[string]MessageContentAggregate, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(`
-			SELECT session_id, COALESCE(SUM(content_length), 0),
+		rows, err := db.getReader().Query(ctx, `
+			SELECT session_id, COUNT(*), COALESCE(SUM(content_length), 0),
 				COALESCE(MAX(content_length), 0),
 				COALESCE(MIN(content_length), 0)
 			FROM messages
@@ -97,7 +99,7 @@ func (db *DB) MessageContentFingerprints(
 			var sessionID string
 			var agg MessageContentAggregate
 			if err := rows.Scan(
-				&sessionID, &agg.Sum, &agg.Max, &agg.Min,
+				&sessionID, &agg.Count, &agg.Sum, &agg.Max, &agg.Min,
 			); err != nil {
 				return err
 			}
@@ -112,17 +114,17 @@ func (db *DB) MessageContentFingerprints(
 }
 
 // MessageTokenFingerprints is the batched twin of MessageTokenFingerprint.
-func (db *DB) MessageTokenFingerprints(
+func (db *DB) MessageTokenFingerprints(ctx context.Context,
 	sessionIDs []string,
 ) (map[string]string, error) {
 	out := make(map[string]string, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(`
-			SELECT session_id, ordinal, model, token_usage, context_tokens,
+		rows, err := db.getReader().Query(ctx, `
+			SELECT session_id, ordinal, model, reasoning_effort, provider_id, token_usage, context_tokens,
 				output_tokens, has_context_tokens, has_output_tokens,
 				claude_message_id, claude_request_id,
-				source_type, source_subtype, source_uuid,
+				source_type, source_subtype, prompt_source, source_uuid,
 				source_parent_uuid, is_sidechain, is_compact_boundary
 			 FROM messages
 			 WHERE session_id IN (`+ph+`)
@@ -138,11 +140,11 @@ func (db *DB) MessageTokenFingerprints(
 			var sessionID string
 			var r tokenFingerprintRow
 			if err := rows.Scan(
-				&sessionID, &r.ordinal, &r.model, &r.tokenUsage,
+				&sessionID, &r.ordinal, &r.model, &r.reasoningEffort, &r.providerID, &r.tokenUsage,
 				&r.contextTokens, &r.outputTokens,
 				&r.hasContextTokens, &r.hasOutputTokens,
 				&r.claudeMessageID, &r.claudeRequestID,
-				&r.sourceType, &r.sourceSubtype, &r.sourceUUID,
+				&r.sourceType, &r.sourceSubtype, &r.promptSource, &r.sourceUUID,
 				&r.sourceParentUUID, &r.isSidechain, &r.isCompactBoundary,
 			); err != nil {
 				return err
@@ -163,13 +165,13 @@ func (db *DB) MessageTokenFingerprints(
 
 // MessageContentHashFingerprints is the batched twin of
 // MessageContentHashFingerprint.
-func (db *DB) MessageContentHashFingerprints(
+func (db *DB) MessageContentHashFingerprints(ctx context.Context,
 	sessionIDs []string,
 ) (map[string]string, error) {
 	out := make(map[string]string, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(`
+		rows, err := db.getReader().Query(ctx, `
 			SELECT session_id, ordinal, content, content_length
 			 FROM messages
 			 WHERE session_id IN (`+ph+`)
@@ -207,14 +209,14 @@ func (db *DB) MessageContentHashFingerprints(
 
 // MessageRoleTimeFingerprintsWithTimestampNormalizer is the batched twin of
 // MessageRoleTimeFingerprintWithTimestampNormalizer.
-func (db *DB) MessageRoleTimeFingerprintsWithTimestampNormalizer(
+func (db *DB) MessageRoleTimeFingerprintsWithTimestampNormalizer(ctx context.Context,
 	sessionIDs []string,
 	normalizeTimestamp func(string) string,
 ) (map[string]string, error) {
 	out := make(map[string]string, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(`
+		rows, err := db.getReader().Query(ctx, `
 			SELECT session_id, ordinal, role, COALESCE(timestamp, '')
 			 FROM messages
 			 WHERE session_id IN (`+ph+`)
@@ -252,13 +254,13 @@ func (db *DB) MessageRoleTimeFingerprintsWithTimestampNormalizer(
 }
 
 // MessageFlagsFingerprints is the batched twin of MessageFlagsFingerprint.
-func (db *DB) MessageFlagsFingerprints(
+func (db *DB) MessageFlagsFingerprints(ctx context.Context,
 	sessionIDs []string,
 ) (map[string]string, error) {
 	out := make(map[string]string, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(`
+		rows, err := db.getReader().Query(ctx, `
 			SELECT session_id, ordinal, is_system, has_thinking,
 				has_tool_use, thinking_text
 			 FROM messages
@@ -294,16 +296,57 @@ func (db *DB) MessageFlagsFingerprints(
 	return out, nil
 }
 
+// MessageDialogueFingerprints hashes classified dialogue in ordinal order.
+// Sessions with no classified rows have an empty fingerprint.
+func (db *DB) MessageDialogueFingerprints(ctx context.Context, sessionIDs []string) (map[string]string, error) {
+	out := make(map[string]string, len(sessionIDs))
+	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
+		ph, args := sessionIDArgs(chunk)
+		rows, err := db.getReader().Query(ctx, `SELECT session_id, ordinal, dialogue_text
+            FROM messages WHERE session_id IN (`+ph+`) AND dialogue_text IS NOT NULL
+            ORDER BY session_id, ordinal`, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		builders := fingerprintBuilders{}
+		for rows.Next() {
+			var id, dialogue string
+			var ordinal int
+			if err := rows.Scan(&id, &ordinal, &dialogue); err != nil {
+				return err
+			}
+			EncodeMessageDialogueFingerprint(builders.get(id), ordinal, dialogue)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		builders.mergeInto(out)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// EncodeMessageDialogueFingerprint appends one classified message's record.
+// Callers omit unclassified messages and encode records in ordinal order.
+func EncodeMessageDialogueFingerprint(b *strings.Builder, ordinal int, dialogue string) {
+	sum := sha256.Sum256([]byte(SanitizeUTF8(dialogue)))
+	fmt.Fprintf(b, "%d|%x;", ordinal, sum)
+}
+
 // SystemMessageFingerprints is the batched twin of SystemMessageFingerprint.
 // The ordinal list is joined in Go rather than with GROUP_CONCAT so the
 // per-session ordering never depends on SQLite's aggregate scan order.
-func (db *DB) SystemMessageFingerprints(
+func (db *DB) SystemMessageFingerprints(ctx context.Context,
 	sessionIDs []string,
 ) (map[string]string, error) {
 	out := make(map[string]string, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(`
+		rows, err := db.getReader().Query(ctx, `
 			SELECT session_id, ordinal FROM messages
 			WHERE session_id IN (`+ph+`) AND is_system = 1
 			ORDER BY session_id, ordinal`,
@@ -340,11 +383,11 @@ func (db *DB) SystemMessageFingerprints(
 
 // ToolCallCounts is the batched twin of ToolCallCount. Sessions without
 // tool calls are absent from the map; zero matches the per-session result.
-func (db *DB) ToolCallCounts(sessionIDs []string) (map[string]int, error) {
+func (db *DB) ToolCallCounts(ctx context.Context, sessionIDs []string) (map[string]int, error) {
 	out := make(map[string]int, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(`
+		rows, err := db.getReader().Query(ctx, `
 			SELECT session_id, COUNT(*) FROM tool_calls
 			WHERE session_id IN (`+ph+`)
 			GROUP BY session_id`,
@@ -372,13 +415,13 @@ func (db *DB) ToolCallCounts(sessionIDs []string) (map[string]int, error) {
 
 // ToolCallContentFingerprints is the batched twin of
 // ToolCallContentFingerprint.
-func (db *DB) ToolCallContentFingerprints(
+func (db *DB) ToolCallContentFingerprints(ctx context.Context,
 	sessionIDs []string,
 ) (map[string]int64, error) {
 	out := make(map[string]int64, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(`
+		rows, err := db.getReader().Query(ctx, `
 			SELECT session_id, COALESCE(SUM(result_content_length), 0)
 			FROM tool_calls
 			WHERE session_id IN (`+ph+`)
@@ -406,20 +449,20 @@ func (db *DB) ToolCallContentFingerprints(
 }
 
 // ToolCallFingerprints is the batched twin of ToolCallFingerprint.
-func (db *DB) ToolCallFingerprints(
+func (db *DB) ToolCallFingerprints(ctx context.Context,
 	sessionIDs []string,
 ) (map[string]string, error) {
 	out := make(map[string]string, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(`
+		rows, err := db.getReader().Query(ctx, `
 			SELECT tc.session_id, m.ordinal, tc.tool_name, tc.category,
 				COALESCE(tc.tool_use_id, ''), COALESCE(tc.input_json, ''),
 				COALESCE(tc.skill_name, ''),
 				COALESCE(tc.subagent_session_id, ''),
 				COALESCE(tc.result_content_length, 0),
 				COALESCE(tc.result_content, ''),
-				COALESCE(tc.file_path, '')
+				COALESCE(tc.file_path, ''), COALESCE(tc.observed_outcome, ''), COALESCE(tc.observed_repeat, ''), COALESCE(tc.sequence_ending, '')
 			 FROM tool_calls tc
 			 JOIN messages m ON m.id = tc.message_id
 			 WHERE tc.session_id IN (`+ph+`)
@@ -434,16 +477,16 @@ func (db *DB) ToolCallFingerprints(
 		var indexer toolCallIndexer
 		for rows.Next() {
 			var sessionID string
-			var r toolCallFingerprintRow
+			var r ToolCallFingerprintFields
 			if err := rows.Scan(
-				&sessionID, &r.messageOrdinal, &r.toolName, &r.category,
-				&r.toolUseID, &r.inputJSON, &r.skillName,
-				&r.subagentSessionID, &r.resultContentLength,
-				&r.resultContent, &r.filePath,
+				&sessionID, &r.MessageOrdinal, &r.ToolName, &r.Category,
+				&r.ToolUseID, &r.InputValue, &r.SkillName,
+				&r.SubagentSessionID, &r.ResultContentLength,
+				&r.ResultValue, &r.FilePathValue, &r.ObservedOutcome, &r.ObservedRepeat, &r.SequenceEnding,
 			); err != nil {
 				return err
 			}
-			r.callIndex = indexer.next(sessionID, r.messageOrdinal)
+			r.CallIndex = indexer.next(sessionID, r.MessageOrdinal)
 			r.appendTo(builders.get(sessionID))
 		}
 		if err := rows.Err(); err != nil {
@@ -460,14 +503,14 @@ func (db *DB) ToolCallFingerprints(
 
 // ToolResultEventFingerprintsWithTimestampNormalizer is the batched twin of
 // ToolResultEventFingerprintWithTimestampNormalizer.
-func (db *DB) ToolResultEventFingerprintsWithTimestampNormalizer(
+func (db *DB) ToolResultEventFingerprintsWithTimestampNormalizer(ctx context.Context,
 	sessionIDs []string,
 	normalizeTimestamp func(string) string,
 ) (map[string]string, error) {
 	out := make(map[string]string, len(sessionIDs))
 	err := forEachSessionIDBatch(sessionIDs, func(chunk []string) error {
 		ph, args := sessionIDArgs(chunk)
-		rows, err := db.getReader().Query(`
+		rows, err := db.getReader().Query(ctx, `
 			SELECT session_id, tool_call_message_ordinal, call_index,
 				event_index, COALESCE(tool_use_id, ''),
 				COALESCE(agent_id, ''),
@@ -599,6 +642,8 @@ func (db *DB) PinnedMessagesBySession(
 type tokenFingerprintRow struct {
 	ordinal           int
 	model             string
+	reasoningEffort   string
+	providerID        string
 	tokenUsage        string
 	contextTokens     int
 	outputTokens      int
@@ -608,6 +653,7 @@ type tokenFingerprintRow struct {
 	claudeRequestID   string
 	sourceType        string
 	sourceSubtype     string
+	promptSource      string
 	sourceUUID        string
 	sourceParentUUID  string
 	isSidechain       bool
@@ -620,24 +666,30 @@ type tokenFingerprintRow struct {
 // session on every push.
 func (r tokenFingerprintRow) appendTo(b *strings.Builder) {
 	model := SanitizeUTF8(r.model)
+	reasoningEffort := SanitizeUTF8(r.reasoningEffort)
+	providerID := SanitizeUTF8(r.providerID)
 	tokenUsage := SanitizeUTF8(r.tokenUsage)
 	claudeMsgID := SanitizeUTF8(r.claudeMessageID)
 	claudeReqID := SanitizeUTF8(r.claudeRequestID)
 	srcType := SanitizeUTF8(r.sourceType)
 	srcSubtype := SanitizeUTF8(r.sourceSubtype)
+	promptSource := SanitizeUTF8(r.promptSource)
 	srcUUID := SanitizeUTF8(r.sourceUUID)
 	srcParentUUID := SanitizeUTF8(r.sourceParentUUID)
 	fmt.Fprintf(b,
-		"%d|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
-			"%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
+		"%d|%d:%s|%d:%s|%d:%s|%d:%s|%d|%d|%t|%t|%s|%s|"+
+			"%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%t|%t;",
 		r.ordinal,
 		len(model), model,
+		len(reasoningEffort), reasoningEffort,
+		len(providerID), providerID,
 		len(tokenUsage), tokenUsage,
 		r.contextTokens, r.outputTokens,
 		r.hasContextTokens, r.hasOutputTokens,
 		claudeMsgID, claudeReqID,
 		len(srcType), srcType,
 		len(srcSubtype), srcSubtype,
+		len(promptSource), promptSource,
 		len(srcUUID), srcUUID,
 		len(srcParentUUID), srcParentUUID,
 		r.isSidechain, r.isCompactBoundary,
@@ -677,42 +729,69 @@ func (r flagsFingerprintRow) appendTo(b *strings.Builder) {
 		r.ordinal, r.isSystem, r.hasThinking, r.hasToolUse, sum)
 }
 
-type toolCallFingerprintRow struct {
-	messageOrdinal      int
-	callIndex           int
-	toolName            string
-	category            string
-	toolUseID           string
-	inputJSON           string
-	skillName           string
-	subagentSessionID   string
-	resultContentLength int
-	resultContent       string
-	filePath            string
+// ToolCallFingerprintFields holds one tool-call fingerprint row.
+// InputValue, ResultValue, and FilePathValue hold text for persisted fingerprints
+// or hexadecimal SHA-256 digests for compact comparisons.
+type ToolCallFingerprintFields struct {
+	MessageOrdinal      int
+	CallIndex           int
+	ToolName            string
+	Category            string
+	ToolUseID           string
+	InputValue          string
+	SkillName           string
+	SubagentSessionID   string
+	ResultContentLength int
+	ResultValue         string
+	FilePathValue       string
+	ObservedOutcome     string
+	ObservedRepeat      string
+	SequenceEnding      string
 }
 
-func (r toolCallFingerprintRow) appendTo(b *strings.Builder) {
-	toolName := SanitizeUTF8(r.toolName)
-	category := SanitizeUTF8(r.category)
-	toolUseID := SanitizeUTF8(r.toolUseID)
-	inputJSON := SanitizeUTF8(r.inputJSON)
-	skillName := SanitizeUTF8(r.skillName)
-	subagentSessionID := SanitizeUTF8(r.subagentSessionID)
-	resultContent := SanitizeUTF8(r.resultContent)
-	filePath := SanitizeUTF8(r.filePath)
+func (r ToolCallFingerprintFields) sanitized() ToolCallFingerprintFields {
+	r.ToolName = SanitizeUTF8(r.ToolName)
+	r.Category = SanitizeUTF8(r.Category)
+	r.ToolUseID = SanitizeUTF8(r.ToolUseID)
+	r.InputValue = SanitizeUTF8(r.InputValue)
+	r.SkillName = SanitizeUTF8(r.SkillName)
+	r.SubagentSessionID = SanitizeUTF8(r.SubagentSessionID)
+	r.ResultValue = SanitizeUTF8(r.ResultValue)
+	r.FilePathValue = SanitizeUTF8(r.FilePathValue)
+	return r
+}
+
+func (r ToolCallFingerprintFields) appendTo(b *strings.Builder) {
+	AppendToolCallFingerprintFields(b, r.sanitized())
+}
+
+// AppendToolCallFingerprintFields appends one length-prefixed tool-call row.
+func AppendToolCallFingerprintFields(b *strings.Builder, r ToolCallFingerprintFields) {
 	fmt.Fprintf(b,
 		"%d|%d|%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%d:%s|%d|%d:%s|%d:%s;",
-		r.messageOrdinal, r.callIndex,
-		len(toolName), toolName,
-		len(category), category,
-		len(toolUseID), toolUseID,
-		len(inputJSON), inputJSON,
-		len(skillName), skillName,
-		len(subagentSessionID), subagentSessionID,
-		r.resultContentLength,
-		len(resultContent), resultContent,
-		len(filePath), filePath,
+		r.MessageOrdinal, r.CallIndex,
+		len(r.ToolName), r.ToolName,
+		len(r.Category), r.Category,
+		len(r.ToolUseID), r.ToolUseID,
+		len(r.InputValue), r.InputValue,
+		len(r.SkillName), r.SkillName,
+		len(r.SubagentSessionID), r.SubagentSessionID,
+		r.ResultContentLength,
+		len(r.ResultValue), r.ResultValue,
+		len(r.FilePathValue), r.FilePathValue,
 	)
+	fmt.Fprintf(b, "%d:%s|%d:%s|%d:%s;", len(r.ObservedOutcome), r.ObservedOutcome, len(r.ObservedRepeat), r.ObservedRepeat, len(r.SequenceEnding), r.SequenceEnding)
+}
+
+func (r ToolCallFingerprintFields) appendComparisonTo(b *strings.Builder) {
+	r = r.sanitized()
+	inputHash := sha256.Sum256([]byte(r.InputValue))
+	resultHash := sha256.Sum256([]byte(r.ResultValue))
+	pathHash := sha256.Sum256([]byte(r.FilePathValue))
+	r.InputValue = hex.EncodeToString(inputHash[:])
+	r.ResultValue = hex.EncodeToString(resultHash[:])
+	r.FilePathValue = hex.EncodeToString(pathHash[:])
+	AppendToolCallFingerprintFields(b, r)
 }
 
 // toolCallIndexer derives the per-message call index from rows ordered by
@@ -779,4 +858,65 @@ func (r toolResultEventFingerprintRow) appendTo(
 		contentSum,
 		len(timestamp), timestamp,
 	)
+}
+
+// MessageComparisonFields holds the encoded streams for a published message.
+type MessageComparisonFields struct {
+	ContentHash string
+	RoleTime    string
+	Flags       string
+	Dialogue    string
+	Token       string
+	ToolCalls   string
+	ToolResults string
+}
+
+// MessageComparisonRow describes every published message field and its
+// dependent calls and events, using the same encodings as session comparisons.
+func MessageComparisonRow(m Message, normalizeTimestamp func(string) string) MessageComparisonFields {
+	var contentHash, roleTime, flags, dialogue, token, toolCalls, toolResults strings.Builder
+	appendContentHashFingerprintRow(&contentHash, m.Ordinal, m.ContentLength, m.Content)
+	appendRoleTimeFingerprintRow(&roleTime, m.Ordinal, m.Role, m.Timestamp, normalizeTimestamp)
+	flagsFingerprintRow{ordinal: m.Ordinal, isSystem: m.IsSystem, hasThinking: m.HasThinking, hasToolUse: m.HasToolUse, thinkingText: m.ThinkingText}.appendTo(&flags)
+	if m.DialogueText != nil {
+		EncodeMessageDialogueFingerprint(&dialogue, m.Ordinal, *m.DialogueText)
+	}
+	tokenFingerprintRow{
+		ordinal: m.Ordinal, model: m.Model, reasoningEffort: m.ReasoningEffort, providerID: m.ProviderID, tokenUsage: string(m.TokenUsage),
+		contextTokens: m.ContextTokens, outputTokens: m.OutputTokens, hasContextTokens: m.HasContextTokens, hasOutputTokens: m.HasOutputTokens,
+		claudeMessageID: m.ClaudeMessageID, claudeRequestID: m.ClaudeRequestID, sourceType: m.SourceType, sourceSubtype: m.SourceSubtype,
+		promptSource: m.PromptSource, sourceUUID: m.SourceUUID, sourceParentUUID: m.SourceParentUUID, isSidechain: m.IsSidechain, isCompactBoundary: m.IsCompactBoundary,
+	}.appendTo(&token)
+	for i, tc := range m.ToolCalls {
+		call := ToolCallFingerprintFields{
+			MessageOrdinal: m.Ordinal, CallIndex: i, ToolName: tc.ToolName, Category: tc.Category, ToolUseID: tc.ToolUseID, InputValue: tc.InputJSON,
+			SkillName: tc.SkillName, SubagentSessionID: tc.SubagentSessionID, ResultContentLength: tc.ResultContentLength,
+			ResultValue: DedupToolCallResultSummary(tc.ResultContent, tc.ResultEvents), FilePathValue: tc.FilePath,
+		}
+		if tc.ObservedOutcome != nil {
+			call.ObservedOutcome = *tc.ObservedOutcome
+		}
+		if tc.ObservedRepeat != nil {
+			call.ObservedRepeat = *tc.ObservedRepeat
+		}
+		if tc.SequenceEnding != nil {
+			call.SequenceEnding = *tc.SequenceEnding
+		}
+		call.appendComparisonTo(&toolCalls)
+		for _, ev := range tc.ResultEvents {
+			toolResultEventFingerprintRow{
+				messageOrdinal: m.Ordinal, callIndex: i, eventIndex: ev.EventIndex, toolUseID: ev.ToolUseID, agentID: ev.AgentID,
+				subagentSessionID: ev.SubagentSessionID, source: ev.Source, status: ev.Status, content: ev.Content, contentLength: ev.ContentLength, timestamp: ev.Timestamp,
+			}.appendTo(&toolResults, normalizeTimestamp)
+		}
+	}
+	return MessageComparisonFields{
+		ContentHash: contentHash.String(),
+		RoleTime:    roleTime.String(),
+		Flags:       flags.String(),
+		Dialogue:    dialogue.String(),
+		Token:       token.String(),
+		ToolCalls:   toolCalls.String(),
+		ToolResults: toolResults.String(),
+	}
 }

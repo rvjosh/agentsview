@@ -47,9 +47,11 @@ agentsview daemon status
 agentsview daemon restart
 ```
 
-A non-loopback `host` in `config.toml` requires `require_auth = true`; the
-server refuses to start rather than persistently exposing an unauthenticated
-API. The `--host` flag remains available for one-off unauthenticated binds.
+A non-loopback host from `config.toml` or from `AGENTSVIEW_HOST` (under a
+[container deployment](/docs/configuration/#container-deployment)) requires
+`require_auth`; the server refuses to start rather than persistently exposing
+an unauthenticated API. The `--host` flag remains available for one-off
+unauthenticated binds.
 
 When the server runs inside WSL, AgentsView advertises the WSL `eth0` address
 instead of `127.0.0.1` so the printed URL is usable from the Windows host and
@@ -86,13 +88,14 @@ When `require_auth` is disabled, normal local loopback use remains ungated.
 
 ## HTTP Remote Sync
 
-Configured `[[remote_hosts]]` entries can use `transport = "http"` when the
-remote machine is already running an AgentsView daemon:
+A `[[remote_hosts]]` entry syncs a remote machine over one of two transports:
+HTTP, described here, or [SSH](#ssh-remote-sync). An HTTP entry requires the URL
+and bearer token of a running AgentsView daemon:
 
 ```toml
 [[remote_hosts]]
 host = "devbox1"
-transport = "http"
+transport = "http" # optional; default
 url = "http://devbox1.tailnet.ts.net:8080"
 token = "remote-token"
 interval = "5m" # optional: sync periodically while the collector daemon runs
@@ -107,7 +110,7 @@ state. Changing only `url` is fine when the same logical machine moves.
 The daemon on the remote machine must bind a non-loopback interface (set
 `host = "0.0.0.0"` with `require_auth = true` in its config.toml) or every sync
 fails with a connection-refused error. See
-[Remote Hosts](/configuration/#remote-hosts) for the full remote-side setup,
+[Remote Hosts](/docs/configuration/#remote-hosts) for the full remote-side setup,
 including keeping detached daemons alive.
 
 Use `require_auth = true` on remote nodes when practical, or at minimum keep
@@ -129,6 +132,12 @@ connection refusal usually means the daemon is not running, is still bound to
 loopback, or the URL port is wrong; DNS and timeout messages point back to the
 configured `url`.
 
+A bare `agentsview source sync` treats offline, unreachable, and timed-out configured
+HTTP hosts as absent fleet members. It prints a skipped-host progress line,
+continues with local and reachable remote sources, and exits successfully unless
+another error occurs. `agentsview source sync --host X` remains strict and reports an
+unavailable explicitly selected host as an error.
+
 For always-available fleet nodes launched with `agentsview daemon start`, set:
 
 ```toml
@@ -140,16 +149,149 @@ That setting controls detached writable daemons, including config-driven and
 Docker, or a foreground shell never create the idle tracker and already stay
 alive until their supervisor stops them.
 
-Run `agentsview sync` on the collector to sync local sessions and every
+Run `agentsview source sync` on the collector to sync local sessions and every
 configured host. Set `interval` on a `[[remote_hosts]]` entry when a running
 collector daemon should sync that host periodically; omit it or set it to `0s`
-for manual sync only. See [`agentsview sync`](/commands/#agentsview-sync) for
+for manual sync only. See [`agentsview source sync`](/docs/commands/#agentsview-sync) for
 single-host selection and failure behavior.
+
+## SSH Remote Sync
+
+SSH remote sync collects sessions from a machine you can reach with `ssh`. The
+remote machine needs no AgentsView install and no running daemon. The feature is
+available in 0.46.0 and later.
+
+### Set Up
+
+Add an entry with `transport = "ssh"`:
+
+```toml
+[[remote_hosts]]
+host = "devbox"
+transport = "ssh"
+destination = "user@devbox.example.com" # optional; defaults to host
+interval = "15m" # optional: sync periodically while the collector daemon runs
+```
+
+`host` names the machine in your archive, as for HTTP hosts. `destination` is
+the argument passed to `ssh`. It can be a `~/.ssh/config` alias or
+`user@hostname`. Set the port, user, identity file, `ProxyJump`, and
+`ControlMaster` in `~/.ssh/config`; the entry has no fields for them. See
+[Remote Hosts](/docs/configuration/#remote-hosts) for the validation rules.
+
+AgentsView runs `ssh` without a prompt (`BatchMode=yes`), so a key must work
+without asking for a password or passphrase. Check it first:
+
+```bash
+ssh -o BatchMode=yes user@devbox.example.com true
+```
+
+Then run `agentsview source sync --host devbox`. A bare `agentsview source sync`, the daemon's
+periodic `interval` sync, and full rebuilds also include SSH hosts. Sessions get
+the same IDs, machine name, and paths as HTTP hosts. Mirrors, manifests, and
+delta transfers work as described in [Incremental Sync](#incremental-sync).
+
+A daemon started by a service manager may not see your SSH agent. For
+daemon-driven SSH sync, set `IdentityAgent` in `~/.ssh/config` or use a key
+without a passphrase.
+
+### What Lands On The Remote
+
+AgentsView installs one file per version on the remote account:
+
+```text
+~/.cache/agentsview/bin/<id>/agentsview
+~/.cache/agentsview/bin/<id>/.last-used
+```
+
+The `<id>` is `v<version>` for a release build. A development build uses
+`<version>-<16 hex characters of the executable's SHA-256>`, so two builds never
+share a binary. Each sync updates `.last-used` for the binary it runs. An
+install removes other binaries that have been idle for more than 30 days and
+leftover `.tmp-*` upload directories older than one day. If one cannot be
+removed, the install still succeeds. If another collector's cleanup removes a
+binary just after a sync picked it, that sync installs it again and carries
+on.
+
+Each sync runs a short `agentsview remote-sync serve` process per step: target
+resolution, manifest, and archive. Each process reads its own configuration
+read-only, writes only temporary SQLite snapshots that it removes before it
+exits, and then ends. Nothing keeps running on the remote. Responses are
+compressed with zstd, and ssh compression is turned off so the stream is not
+compressed twice.
+
+### Where The Binary Comes From
+
+At the start of each sync, one ssh call reports the remote platform and looks
+for a usable binary. AgentsView picks the first match:
+
+1. The cached binary for this version, under `~/.cache/agentsview/bin/`.
+1. An `agentsview` on the remote's `PATH` that speaks the same remote-sync
+   protocol version. Your own install wins over an upload. AgentsView first
+   runs `agentsview version` and skips a `PATH` binary older than v0.23.0, or
+   one whose version is not a release number, such as `dev` or a bare commit
+   hash. Releases before v0.23.0 would start a server instead of answering.
+1. An upload, described next. Sync progress shows
+   `Installing agentsview on <host>` while it runs.
+
+A release build downloads `agentsview_<version>_<os>_<arch>.tar.gz` from the
+GitHub release for its version and checks it against the release's `SHA256SUMS`.
+It does not check `SHA256SUMS.sig`. The verified tarball is cached under
+`<data_dir>/ssh-binaries/<version>/` and streamed to the remote, where it is
+unpacked, probed, and moved into place. A checksum mismatch deletes the download
+and fails that host's sync.
+
+A development build has no release to download. When the remote's OS and
+architecture match the collector's, AgentsView uploads its own executable.
+Otherwise the sync fails with a message to install agentsview on the remote or
+to sync from a release build.
+
+### Offline Hosts
+
+A bare `agentsview source sync` skips an SSH host that the network cannot reach, the
+same as an offline HTTP host. `agentsview source sync --host devbox` reports it as an
+error. `ssh` must exit with status 255 and print one of these OpenSSH messages:
+
+- `Could not resolve hostname`
+- `connect to host ... port ...: Connection refused`, `Connection timed out`,
+  `Operation timed out`, `No route to host`, or `Network is unreachable`
+- `Connection timed out during banner exchange`
+
+These also cover a `ProxyJump` host that is down. Every other failure is
+reported with the last line `ssh` printed. That includes authentication
+failures, host key verification failures, ssh configuration errors, and a
+target that is down behind a reachable jump host.
+
+`ssh` checks the connection every 15 seconds while a sync runs. If the host
+stops answering for about a minute, `ssh` exits with
+`Timeout, server ... not responding.` That is reported as a failure, not
+skipped, because the sync had already started.
+
+### Limits
+
+- Remotes must run Linux or macOS on amd64 or arm64. Windows remotes are not
+  supported.
+- Release Linux binaries link against glibc. On a remote with an older glibc,
+  the check after install fails and the error shows its output.
+- Discovery sees the environment of a non-interactive SSH session. Variables set
+  only in interactive shell start-up files are not visible.
+- A shell start-up file that prints to stdout in non-interactive sessions
+  corrupts the response stream, as it does for `scp` and `rsync`. Sync then
+  fails with an error that names this cause.
+- The first sync to a remote, and the first after each upgrade, uploads about 50
+  MB. A development build uploads itself again after each rebuild.
+- A `serve` process killed with `SIGKILL` can leave one
+  `agentsview-sqlite-snapshot-*` directory in the remote's temporary directory.
+- Offline detection depends on OpenSSH's English error text. With another ssh
+  client, or new OpenSSH wording, an unreachable host is reported as a failure
+  instead of being skipped.
 
 ## Incremental Sync
 
 Starting in 0.37.4, HTTP remote sync keeps a persistent mirror of each remote
-machine's syncable source files under:
+machine's syncable source files under the path below. SSH remote sync uses the
+same mirror and the same steps; each step asks a short-lived process over `ssh`
+instead of a daemon.
 
 ```text
 <data_dir>/remote-mirrors/<sanitized-host>-<hash>/
@@ -162,9 +304,7 @@ concurrent syncs of that host from the same data directory.
 
 The mirror adds an on-disk copy of the remote session sources to the collector,
 in addition to the indexed database. Budget roughly the size of each remote
-host's syncable source corpus for it. Incremental transfer applies only to the
-HTTP transport. SSH remote sync is deprecated, receives only critical fixes,
-and continues to copy a full session tree on each run.
+host's syncable source corpus for it.
 
 ### How A Sync Works
 
@@ -173,34 +313,64 @@ and continues to copy a full session tree on each run.
 1. The collector locks the host mirror and requests a gzip-compressed manifest
    of regular, non-symlink files. Each entry carries its absolute remote path,
    size, and modification time.
-1. The collector walks the mirror and compares file size and modification time
-   at microsecond precision. It schedules missing or changed files for fetch and
-   removes mirror files that disappeared from the manifest.
-1. When fewer than half of the manifest's files need fetching, the collector
-   requests only that delta. At half or more, it requests a full archive instead
-   of sending a large file list. The current collector advertises gzip support
-   for both archive modes.
+1. The remote sends manifest entries sorted by mirror path. As each entry
+   arrives, the collector walks the mirror in the same order and compares file
+   size and modification time at microsecond precision, so neither the manifest
+   nor the mirror listing is held in memory. It schedules missing or changed
+   files for fetch and removes mirror files that disappeared from the manifest.
+   Each list stays in memory up to 4 MiB of paths and moves to a temporary file
+   next to the mirror past that. Before changing the mirror, it durably merges
+   those paths into a bounded recovery journal next to the mirror. When more
+   than 8,192 files change, or their paths add up to more than 4 MiB, the
+   journal records one full import instead, and that sync re-reads every
+   session from the host.
+1. The collector requests only missing or changed files, in requests of at
+   most 4 MiB of paths each. When every manifest file needs fetching, it
+   requests a full archive instead of sending the full file list. Archive
+   transfers prefer Zstandard compression; gzip remains available through HTTP
+   encoding negotiation. Manifests use gzip.
 1. The archive is extracted into the mirror with remote modification times
-   preserved. AgentsView then imports from the complete mirror, so parsers that
-   read sibling files behave the same way they do against a full source tree.
-   The separate database skip cache avoids unnecessary parsing of unchanged
-   sessions during normal syncs.
+   preserved. AgentsView classifies the pending journal paths and imports only
+   their affected sources. A provider whose exact scope cannot be proven falls
+   back to discovery under that provider's roots; it does not widen other
+   providers. The journal is retired only after session writes and the remote
+   skip cache are durable.
+
+An explicit full import reparses the complete mirror without forcing unchanged
+bytes across the network. If a rejected delta request requires a full archive,
+the collector still imports only the affected sources.
+
+Sync logs report target resolution time and manifest time. The manifest time
+includes the mirror comparison. They also report each archive's encoding,
+compressed byte count, download time, and extraction time. Download time
+includes waiting for the remote response. The existing import log reports
+planning, processing, and cache persistence times.
 
 For a configured full sync that includes local sources, mirror preparation
-finishes before database work begins. The collector then ingests local sources
-and every prepared HTTP mirror through the same batched temporary-database path,
-with FTS maintenance suspended during ingest and rebuilt once before an atomic
-swap. Configured SSH hosts run afterward. A preparation, parser, batch-write, or
-FTS failure leaves the active archive unchanged and prevents the SSH phase.
+finishes before database work begins. Up to four remote hosts prepare at once
+for this combined rebuild. Mirror locks keep the same acquisition order across
+collectors to avoid deadlocks. The collector then ingests local sources
+and every prepared remote mirror through the same batched temporary-database
+path, with FTS maintenance suspended during ingest and rebuilt once before an
+atomic swap. A preparation, parser, batch-write, or FTS failure leaves the
+active archive unchanged.
 
 Remote-only syncs, including
-`agentsview sync --host <configured-http-host> --full`, continue to import into
+`agentsview source sync --host <configured-http-host> --full`, continue to import into
 the active archive and do not use the combined rebuild path.
 
 If no directory-scoped files changed, the collector skips the archive request
-and imports directly from the existing mirror. Files that disappear remotely are
-deleted from the mirror, but remote import is intentionally non-destructive:
-sessions already stored in the AgentsView database remain available.
+and, when no recovery work is pending, performs no import. Files that disappear
+remotely are deleted from the mirror, but remote import is intentionally
+non-destructive: sessions already stored in the AgentsView database remain
+available.
+
+If a process stops after mirror mutation, the next sync replays the pending
+journal. Cache invalidation is armed once per observed remote version so a
+same-mtime extraction cannot be hidden by stale cache state. A deterministic
+parse failure is then retained in the existing error-skip cache, retried on
+replay as a skip, and re-armed only when the remote path changes again. Recovery
+work is bounded; overflow collapses to one conservative full import.
 
 Windsurf is a special case. Its state database is sanitized into a curated
 export for every transfer, so the raw tree cannot safely participate in the
@@ -209,16 +379,47 @@ each sync while the rest of the host remains eligible for delta transfer. The
 Windsurf content in the mirror is the sanitized export, not a byte-for-byte copy
 of the remote state database.
 
+### Curated Provider Exports
+
+Most providers export their configured directories as-is. Providers whose
+configured root is a broad application-data directory export a curated file
+list instead, so caches, extension state, and credential files stored near the
+sessions never enter the manifest, the archive, or the mirror:
+
+- **Cursor** exports only the transcript files its parser discovers under each
+  project's `agent-transcripts/` directory.
+- **VS Code Copilot** exports only chat session files under
+  `workspaceStorage/<hash>/chatSessions/` and
+  `globalStorage/{emptyWindowChatSessions,transferredChatSessions}/`, plus each
+  exporting workspace's `workspace.json` for project attribution.
+- **Zed** exports `threads/threads.db` as a consistent SQLite snapshot taken
+  with the online backup API, so committed write-ahead-log data arrives as one
+  standalone database without `-wal` or `-shm` sidecars. Hermes state databases
+  use the same snapshot mechanism.
+- **RooCode** and **Kilo Legacy** export only their discovered per-task session
+  files, **Poolside** narrows its root to `trajectories/`, and **Windsurf**
+  exports the sanitized copy described above.
+
+Budget mirror disk for the curated session files only, not for the full
+application-data directories those editors keep around them. When the last
+session under a curated Cursor or VS Code Copilot root disappears, the root
+stays advertised with an empty file list so the next sync empties the mirror
+instead of failing.
+
+An unreadable snapshot database is treated as missing: the sync continues, the
+mirror drops its cached copy, and the file transfers again once the remote
+application repairs it. Sessions already imported into the AgentsView database
+remain available throughout. Any other read failure during target resolution
+fails that host's sync without touching the mirror.
+
 ### When AgentsView Downloads A Full Archive
 
 A full HTTP transfer occurs in these cases:
 
 - the per-host mirror is new or was removed
-- at least half of the manifest files are missing or changed
+- every manifest file is missing or changed
 - a delta request is rejected after a manifest succeeded; the collector retries
   once with a full archive
-- the remote daemon does not support manifests, in which case the collector uses
-  the legacy full-transfer path on every sync
 
 Windsurf's curated export is also fetched in full on every sync, independently
 of the directory-scoped archive decision.
@@ -229,20 +430,15 @@ the local database or turn remote sync into a destructive reconciliation.
 
 ### Compatibility And Recovery
 
-A current collector works with older remote daemons that already expose the
-HTTP remote-sync target and archive endpoints. A missing manifest route —
-including an old daemon's HTML app shell answering that route — makes the
-collector report that incremental transfer is unavailable and use the legacy
-full-archive flow. That flow extracts to a temporary directory and does not
-create or update the persistent mirror. During a configured full local sync,
-the temporary source still uses the collector's new batched ingest path.
+HTTP remote sync requires the collector and remote daemon to use the same
+remote-sync protocol version. Every target, manifest, and archive request
+carries that version, and successful responses echo it. A missing or mismatched
+request version returns HTTP 426 before targets or archive data are exchanged,
+so upgrade both hosts before syncing again after either side changes protocol.
 
-Therefore the collector can be upgraded and tested before its spokes. Upgrading
-only the collector provides the database-ingest speedup; upgrading each spoke
-adds manifest-delta transfer and avoids downloading its complete archive. A
-spoke old enough to lack the target or archive endpoints was not compatible
-with HTTP remote sync before this change either. Older collectors also continue
-to use the full-archive endpoint on a current remote.
+An HTTP remote on Windows running an older AgentsView can fail a sync with a
+message to upgrade AgentsView on the remote host. The older release lists its
+files in a different order under the same protocol version.
 
 The normal mirror comparison detects interrupted extraction when the resulting
 file size or modification time differs from the manifest, and the next sync
@@ -265,8 +461,10 @@ The remote daemon recomputes its allowed sync targets for each request and
 rejects paths outside them. Manifest walks omit symlinks and special files;
 delta requests must either match an allowed extra file exactly or use an
 absolute path in the same POSIX, drive-letter, or UNC dialect as the allowed
-root. Symlinked roots or intermediate components are refused. Mirror deletions
-and type-conflict cleanup are separately confined to the per-host mirror root.
+root. Symlinked roots or intermediate components are refused. The collector
+rejects a manifest whose entry is larger than 256 KiB, which is well above the
+longest path any supported system allows. Mirror deletions and type-conflict
+cleanup are separately confined to the per-host mirror root.
 
 These checks limit what authenticated sync requests can read, but they do not
 replace network isolation or bearer-token security. Keep the daemon on a private
@@ -286,14 +484,39 @@ Use header-based auth for normal API calls whenever possible.
 
 ## Public URL And Trusted Origins
 
-When you access AgentsView through a hostname or reverse proxy, tell the server
-about the public URL:
+The bind address, browser URL, and trusted origins serve different purposes:
+
+| Setting | Purpose |
+| --- | --- |
+| `--host` / `--port` | Choose the backend HTTP listener (default `127.0.0.1:8080`). |
+| `--proxy-bind-host` / `--public-port` | Choose the managed Caddy listener when `--proxy caddy` is enabled. |
+| `--public-url` | Choose the browser URL and add it to the trusted origins. Managed Caddy also uses it as its site address. |
+| `--public-origin` | Add trusted origins for request `Host` and `Origin` checks without selecting a browser URL. |
+
+For a hostname or reverse proxy you already operate, set the URL you intend to
+open in the browser:
 
 ```bash
 agentsview serve --public-url https://agents.example.com
 ```
 
-For additional trusted origins, use `--public-origin`:
+This setting does not configure DNS, port forwarding, certificates, or an
+external reverse proxy. The startup message labels it **browser URL**, separately
+from the backend's listening address; it does not confirm that the URL is
+reachable. Here, "public" means the client-facing address, which may be local
+or private.
+
+Opening that URL locally is useful when you want to use the same HTTPS hostname
+and proxy route as other clients. Direct backend access uses a different browser
+origin, with separate browser storage. On a headless server, use `--no-browser`;
+the URL still contributes to origin validation and managed Caddy configuration.
+
+Use a concrete hostname or IP in `--public-url`. Wildcard addresses such as
+`0.0.0.0` and `::` select listening interfaces, so they belong in `--host` or
+`--proxy-bind-host`, not the browser URL.
+
+For trust-only configuration, use `--public-origin`. It works on its own or
+alongside `--public-url`:
 
 ```bash
 agentsview serve \
@@ -312,10 +535,47 @@ These can also be persisted:
 ```toml
 public_url = "https://agents.example.com"
 public_origins = [
-  "https://agents.example.com",
   "https://internal.example.com",
 ]
 ```
+
+You do not need to repeat `public_url` in `public_origins`. Neither setting
+enables bearer-token authentication; that is controlled by `--require-auth`.
+
+### Reverse Proxy Subpaths
+
+Use `--base-path` when an external reverse proxy mounts AgentsView below a URL
+prefix. Keep `--public-url` origin-only; the server adds the mount path to the
+browser URL and uses it for assets, API requests, live event streams, and
+client-side navigation.
+
+```bash
+agentsview serve \
+  --base-path /av \
+  --public-url http://agents.example.com
+```
+
+The proxy must preserve `/av` in the upstream request. For nginx, omit the
+trailing slash from `proxy_pass` so nginx does not strip the location prefix:
+
+```nginx
+location = /av {
+    return 301 /av/;
+}
+
+location /av/ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+}
+```
+
+The same flag works with `serve --background`. The configuration-only
+`daemon start` and `daemon restart` commands do not accept serve-specific flags,
+so start a subpath-mounted background server with `agentsview serve --background
+--base-path /av`.
 
 ### Forwarded Dev Environments
 
@@ -383,7 +643,7 @@ on both the local SQLite server and the PostgreSQL read server:
 agentsview serve --write-timeout 120s
 
 # PostgreSQL-backed read server (the multi-tenant / large-dataset case)
-agentsview pg serve --write-timeout 120s
+agentsview replica pg serve --write-timeout 120s
 ```
 
 Set it to `0` to disable the deadline entirely. If aggregates are slow enough to
@@ -417,13 +677,39 @@ agentsview serve \
 | `--proxy`           |             | Proxy mode — currently `caddy`                        |
 | `--caddy-bin`       | `caddy`     | Path to the Caddy binary                              |
 | `--proxy-bind-host` | `127.0.0.1` | Interface for Caddy to bind                           |
-| `--public-port`     | `8443`      | External port for the public URL                      |
+| `--public-port`     | URL port or `8443`      | Managed Caddy HTTP/HTTPS listener and URL port                      |
 | `--tls-cert`        |             | TLS certificate file path                             |
 | `--tls-key`         |             | TLS key file path                                     |
 | `--allowed-subnet`  |             | Client CIDR allowlist (repeatable or comma-separated) |
 
 Caddy must already be installed and available on `PATH` unless you override it
 with `--caddy-bin`.
+
+### Listener And URL Ports
+
+`--public-port` applies only to managed Caddy. It controls Caddy's listening
+port and the port in the resolved `--public-url`; it does not change the backend
+`--port`. It works with both HTTP and HTTPS, as selected by the URL scheme.
+HTTPS requires `--tls-cert` and `--tls-key`; HTTP must omit them.
+
+- If the URL has an explicit port, Caddy uses that port.
+- If the URL omits a port, Caddy uses `--public-port`, or `8443` when the flag is
+  unset. Thus `--proxy caddy --public-url https://agents.example.com` resolves to
+  `https://agents.example.com:8443`, not port 443.
+- If both the URL and `--public-port` specify ports, they must match. For HTTPS
+  on port 443, use `--public-port 443` or put `:443` in the URL.
+
+Caddy binds to `127.0.0.1` by default, even when the URL contains a remote
+hostname. To accept LAN connections, set `--proxy-bind-host` and an
+`--allowed-subnet` as shown below. DNS and routing remain your responsibility.
+
+With an external proxy, leave `--proxy` unset and put its browser-facing port
+directly in `--public-url`. `--public-port` has no effect in that mode. For
+example, if an existing proxy listens on 443 and forwards to backend port 8080:
+
+```bash
+agentsview serve --port 8080 --public-url https://agents.example.com --no-browser
+```
 
 ### Subnet Allowlists
 
@@ -451,7 +737,7 @@ Access** section lets you:
 - view the auto-generated auth token
 - connect the frontend to another AgentsView server by URL and token
 
-![Settings remote access](/assets/generated/screenshots/settings-remote.png)
+![Settings remote access](/docs/assets/generated/screenshots/settings-remote.png)
 
 Changes that affect bind or auth behavior may require a server restart.
 
@@ -461,13 +747,13 @@ Changes that affect bind or auth behavior may require a server restart.
 | ------------------- | ----------- | --------------------------------------------------- |
 | `--host`            | `127.0.0.1` | Interface to bind                                   |
 | `--require-auth`    | `false`     | Require a bearer token for API requests             |
-| `--public-url`      |             | Public URL for hostname or proxy access             |
+| `--public-url`      |             | Browser URL, also added to trusted origins             |
 | `--public-origin`   |             | Trusted browser origin (repeatable/comma-separated) |
 | `--write-timeout`   | `30s`       | API response write deadline; `0` disables it        |
 | `--proxy`           |             | Managed proxy mode (`caddy`)                        |
 | `--caddy-bin`       | `caddy`     | Caddy binary path                                   |
 | `--proxy-bind-host` | `127.0.0.1` | Interface for managed proxy                         |
-| `--public-port`     | `8443`      | External port for managed proxy                     |
+| `--public-port`     | URL port or `8443`      | Managed Caddy HTTP/HTTPS listener and URL port                     |
 | `--tls-cert`        |             | TLS certificate path                                |
 | `--tls-key`         |             | TLS key path                                        |
 | `--allowed-subnet`  |             | Client CIDR allowlist (repeatable/comma-separated)  |
@@ -497,12 +783,12 @@ allowed_subnets = ["192.168.1.0/24"]
 | `host`                  | Server bind interface; non-loopback values require `require_auth = true`   |
 | `require_auth`          | Require bearer-token authentication for API access                         |
 | `auth_token`            | Auto-generated 256-bit bearer token; overridden by `AGENTSVIEW_AUTH_TOKEN` |
-| `public_url`            | Public URL for host/origin validation                                      |
-| `public_origins`        | Additional trusted CORS origins                                            |
+| `public_url`            | Browser URL, trusted origin, and managed Caddy site address                                      |
+| `public_origins`        | Additional trusted origins for request Host/Origin checks                                            |
 | `proxy.mode`            | Managed proxy mode (`caddy`)                                               |
 | `proxy.bin`             | Path to proxy binary                                                       |
 | `proxy.bind_host`       | Interface for proxy to bind                                                |
-| `proxy.public_port`     | External port for proxy                                                    |
+| `proxy.public_port`     | Managed Caddy HTTP/HTTPS listener and URL port                                                    |
 | `proxy.tls_cert`        | TLS certificate path                                                       |
 | `proxy.tls_key`         | TLS key path                                                               |
 | `proxy.allowed_subnets` | CIDR allowlist for proxy connections                                       |

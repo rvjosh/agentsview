@@ -3,7 +3,6 @@ package remotesync
 import (
 	"archive/tar"
 	"bytes"
-	"context"
 	"database/sql"
 	"errors"
 	"io"
@@ -29,7 +28,7 @@ func TestBuildManifestListsRegularFilesWithSizeAndMtime(t *testing.T) {
 	extra := filepath.Join(dir, "index.jsonl")
 	require.NoError(t, os.WriteFile(extra, []byte("x"), 0o644))
 
-	m, err := BuildManifest(TargetSet{
+	m, err := BuildManifest(t.Context(), TargetSet{
 		Dirs:       map[parser.AgentType][]string{parser.AgentClaude: {sub}},
 		ExtraFiles: []string{extra},
 	})
@@ -47,7 +46,7 @@ func TestBuildManifestListsRegularFilesWithSizeAndMtime(t *testing.T) {
 
 func TestBuildManifestToleratesMissingRootsAndExtraFiles(t *testing.T) {
 	dir := t.TempDir()
-	m, err := BuildManifest(TargetSet{
+	m, err := BuildManifest(t.Context(), TargetSet{
 		Dirs: map[parser.AgentType][]string{
 			parser.AgentClaude: {filepath.Join(dir, "gone")},
 		},
@@ -57,8 +56,30 @@ func TestBuildManifestToleratesMissingRootsAndExtraFiles(t *testing.T) {
 	assert.Empty(t, m.Files)
 }
 
+func TestBuildManifestPrunesForbiddenRootNestedInAllowedRoot(t *testing.T) {
+	root := t.TempDir()
+	allowed := filepath.Join(root, "sessions")
+	forbidden := filepath.Join(allowed, ".forbidden-provider")
+	keep := filepath.Join(allowed, "session.jsonl")
+	secret := filepath.Join(forbidden, "chat.db")
+	require.NoError(t, os.MkdirAll(forbidden, 0o755))
+	require.NoError(t, os.WriteFile(keep, []byte("session"), 0o644))
+	require.NoError(t, os.WriteFile(secret, []byte("authentication state"), 0o600))
+
+	manifest, err := BuildManifest(t.Context(), TargetSet{
+		Dirs:           map[parser.AgentType][]string{parser.AgentClaude: {allowed}},
+		ForbiddenRoots: []string{forbidden},
+	})
+
+	require.NoError(t, err)
+	require.Len(t, manifest.Files, 1)
+	assert.Equal(t, keep, manifest.Files[0].Path)
+	assert.NotEqual(t, secret, manifest.Files[0].Path,
+		"the manifest must never advertise a file under a forbidden root")
+}
+
 func TestBuildManifestRejectsFileScopedAgents(t *testing.T) {
-	_, err := BuildManifest(TargetSet{
+	_, err := BuildManifest(t.Context(), TargetSet{
 		Dirs: map[parser.AgentType][]string{parser.AgentWindsurf: {"/srv/Windsurf/User"}},
 		Files: map[parser.AgentType][]string{
 			parser.AgentWindsurf: {"/srv/Windsurf/User/workspaceStorage/a/state.vscdb"},
@@ -78,12 +99,11 @@ func TestHermesManifestMatchesStandaloneDatabaseSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = writer.Close() })
 	var journalMode string
-	require.NoError(t,
-		writer.QueryRow(`PRAGMA journal_mode = WAL`).Scan(&journalMode))
+	require.NoError(t, writer.QueryRowContext(t.Context(), `PRAGMA journal_mode = WAL`).Scan(&journalMode))
 	assert.Equal(t, "wal", journalMode)
-	_, err = writer.Exec(`PRAGMA wal_autocheckpoint = 0`)
+	_, err = writer.ExecContext(t.Context(), `PRAGMA wal_autocheckpoint = 0`)
 	require.NoError(t, err)
-	_, err = writer.Exec(`
+	_, err = writer.ExecContext(t.Context(), `
 		UPDATE sessions
 		SET title = 'Manifest includes WAL commit'
 		WHERE id = 'database-only'
@@ -100,15 +120,15 @@ func TestHermesManifestMatchesStandaloneDatabaseSnapshot(t *testing.T) {
 		ExtraFiles: append([]string{stateDB}, hermesTestSidecars(stateDB)...),
 	}
 
-	manifest, err := BuildManifest(targets)
+	manifest, err := BuildManifest(t.Context(), targets)
 	require.NoError(t, err)
 	require.Len(t, manifest.Files, 1)
 	assert.Equal(t, stateDB, manifest.Files[0].Path)
 
 	var archive bytes.Buffer
-	require.NoError(t, WriteArchive(&archive, targets))
+	require.NoError(t, WriteArchive(t.Context(), &archive, targets))
 	extracted := t.TempDir()
-	_, err = ExtractTarStream(context.Background(), &archive, extracted)
+	_, err = ExtractTarStream(t.Context(), &archive, extracted)
 	require.NoError(t, err)
 	extractedDB, err := safeRemappedRemotePath(extracted, stateDB)
 	require.NoError(t, err)
@@ -133,13 +153,13 @@ func TestInvalidHermesStateDBDoesNotBlockTranscriptArchive(t *testing.T) {
 		ExtraFiles: append([]string{stateDB}, hermesTestSidecars(stateDB)...),
 	}
 
-	manifest, err := BuildManifest(targets)
+	manifest, err := BuildManifest(t.Context(), targets)
 	require.NoError(t, err)
 	require.Len(t, manifest.Files, 1)
 	assert.Equal(t, transcript, manifest.Files[0].Path)
 
 	var archive bytes.Buffer
-	require.NoError(t, WriteArchive(&archive, targets))
+	require.NoError(t, WriteArchive(t.Context(), &archive, targets))
 	tr := tar.NewReader(&archive)
 	var names []string
 	for {

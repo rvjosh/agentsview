@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -30,12 +29,8 @@ var (
 )
 
 func TestSessionFormatSourcesCoverRegistry(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	require.True(t, ok, "resolve format inventory test path")
-
 	inventoryPath := filepath.Join(
-		filepath.Dir(testFile), "..", "..", "docs", "internal",
-		"session-format-sources.md",
+		"..", "..", "docs", "internal", "session-format-sources.md",
 	)
 	raw, err := os.ReadFile(inventoryPath)
 	require.NoError(t, err)
@@ -49,11 +44,8 @@ func TestSessionFormatSourcesCoverRegistry(t *testing.T) {
 		documented[agent] = true
 	}
 
-	expected := make(map[AgentType]bool, len(Registry)-1)
+	expected := make(map[AgentType]bool, len(Registry))
 	for _, def := range Registry {
-		if def.Type == AgentGrok {
-			continue
-		}
 		expected[def.Type] = true
 	}
 

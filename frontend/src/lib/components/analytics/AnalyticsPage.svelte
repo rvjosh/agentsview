@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { modelPickerItems } from "../../utils/model-groups.js";
   import { Card } from "@kenn-io/kit-ui";
   import { onMount, onDestroy, untrack } from "svelte";
   import RangePicker from "../shared/RangePicker.svelte";
@@ -14,6 +15,7 @@
   import HourOfWeekHeatmap from "./HourOfWeekHeatmap.svelte";
   import SessionShape from "./SessionShape.svelte";
   import VelocityMetrics from "./VelocityMetrics.svelte";
+  import OutcomeTotals from "./OutcomeTotals.svelte";
   import ToolUsage from "./ToolUsage.svelte";
   import TopSkills from "./TopSkills.svelte";
   import SkillTrend from "./SkillTrend.svelte";
@@ -22,14 +24,21 @@
   import TopSessions from "./TopSessions.svelte";
   import ActiveFilters from "./ActiveFilters.svelte";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
+  import SidebarToggleButton from "../layout/SidebarToggleButton.svelte";
   import FilterDropdown from "../usage/FilterDropdown.svelte";
-  import { analytics } from "../../stores/analytics.svelte.js";
+  import {
+    analytics,
+    ANALYTICS_DEFAULT_WINDOW_DAYS,
+  } from "../../stores/analytics.svelte.js";
+  import { outcomeTotals } from "../../stores/outcomeTotals.svelte.js";
+  import { settings } from "../../stores/settings.svelte.js";
   import { analyticsPageDates } from "../../stores/analyticsPageDates.js";
   import {
     sessions,
     filtersToParams,
   } from "../../stores/sessions.svelte.js";
   import { events } from "../../stores/events.svelte.js";
+  import { starred } from "../../stores/starred.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { router } from "../../stores/router.svelte.js";
@@ -41,10 +50,22 @@
     sessionParamsToPanelDate,
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
-  import { rollingRange } from "../../utils/dates.js";
+  import { parseLocalDate, rollingRange } from "../../utils/dates.js";
   import { exportAnalyticsCSV } from "../../utils/csv-export.js";
   import RefreshControl from "../shared/RefreshControl.svelte";
   import { m } from "../../i18n/index.js";
+
+  interface Props {
+    suppressSessionDateRestore?: boolean;
+    suppressSessionDateRefresh?: boolean;
+    onSessionDateRestoreSuppressed?: () => void;
+  }
+
+  let {
+    suppressSessionDateRestore = false,
+    suppressSessionDateRefresh = false,
+    onSessionDateRestoreSuppressed,
+  }: Props = $props();
 
   const SESSION_ANALYTICS_WINDOW_PARAM = "window_days";
 
@@ -61,6 +82,8 @@
   );
 
   function applyRange(sel: RangeSelection) {
+    cancelInitialLoad();
+    userDateSelectionPending = true;
     if (sel.mode === "relative" && sel.days > 0) {
       sessionDateIntentEstablished = true;
       analytics.setRollingWindow(sel.days);
@@ -175,11 +198,16 @@
   function writeSessionDateParams(state: PanelDateState): void {
     const sessionChanged = syncSessionFiltersForDateState(state);
     const params = filtersToParams(sessions.filters);
+    if (starred.filterOnly) params.starred = "true";
     delete params[SESSION_ANALYTICS_WINDOW_PARAM];
     if (state.mode === "rolling" && state.windowDays) {
       params[SESSION_ANALYTICS_WINDOW_PARAM] = String(state.windowDays);
     }
-    router.replaceParams(params);
+    if (router.isRootPath) {
+      router.navigateToSessions(params);
+    } else {
+      router.replaceParams(params);
+    }
     if (sessionChanged) sessions.load();
   }
 
@@ -218,23 +246,31 @@
     });
   }
 
-  function refreshAnalytics(): Promise<void> {
+  async function refreshAnalytics(): Promise<void> {
+    cancelInitialLoad();
     const refresh = analytics.fetchAll();
-    const state = currentAnalyticsPanelDate();
-    if (state && !analyticsDateYokeIsClear()) {
-      yokedDates.updateFromPanel(state);
-      writeSessionDateParams(state);
+    // A pull-request lookup can take minutes, so refresh keeps its totals;
+    // changing the window or filters reloads them through the outcome effect.
+    const outcomes = outcomeWindow && !outcomeFiltersUnsupported &&
+      (!outcomeTotals.includePullRequests || outcomeTotals.pullRequestLookupFailed)
+      ? outcomeTotals.load(outcomeWindow)
+      : undefined;
+    if (!router.isRootPath && !suppressSessionDateRefresh) {
+      const state = currentAnalyticsPanelDate();
+      if (state && !analyticsDateYokeIsClear()) {
+        yokedDates.updateFromPanel(state);
+        writeSessionDateParams(state);
+      }
     }
-    return refresh;
+    await Promise.all([refresh, outcomes]);
   }
 
-  function handleDateRangeChange(from: string, to: string) {
-    const state = panelDateState(from, to, { mode: "fixed" });
-    if (!state) return;
-    sessionDateIntentEstablished = true;
-    analytics.setDateRange(from, to);
-    yokedDates.updateFromPanel(state);
-    writeSessionDateParams(state);
+  function handleActivityRangeSelect(from: string, to: string) {
+    analytics.setActivitySelection(from, to);
+  }
+
+  function handleActivityRangeClear() {
+    analytics.clearActivitySelection();
   }
 
   function shortTz(tz: string): string {
@@ -267,14 +303,12 @@
   });
 
   $effect(() => {
-    const selected = analytics.model
-      .split(",")
-      .filter((model) => model.length > 0);
+    const selected = analytics.model.split(",").filter(Boolean);
     untrack(() => mergeIntoKnownModels(selected));
   });
 
   const modelItems = $derived(
-    knownModels.map((name) => ({ name })),
+    modelPickerItems(knownModels, analytics.model, analytics.modelAliases),
   );
   function handleExportCSV() {
     exportAnalyticsCSV({
@@ -293,6 +327,83 @@
   let analyticsDateUrlInitComplete = $state(false);
   let lastAnalyticsDateUrlSignature: string | null = $state(null);
   let sessionDateIntentEstablished = false;
+  let userDateSelectionPending = false;
+  const INITIAL_LOAD_CEILING_MS = 2000;
+  let initialLoadTimer: ReturnType<typeof setTimeout> | undefined;
+  // Child mount effects run before the page's first-load effect.
+  let initialLoadDeferred = $state(sessions.loading || sessions.machineFilterPending);
+
+  function cancelInitialLoad() {
+    clearTimeout(initialLoadTimer);
+    initialLoadTimer = undefined;
+    initialLoadDeferred = false;
+  }
+
+  function releaseInitialLoad() {
+    if (!initialLoadDeferred) return;
+    cancelInitialLoad();
+    void analytics.fetchAll();
+  }
+
+  function startAnalyticsLoad(deferrable = false) {
+    cancelInitialLoad();
+    if (deferrable && sessions.loading) {
+      initialLoadDeferred = true;
+      initialLoadTimer = setTimeout(releaseInitialLoad, INITIAL_LOAD_CEILING_MS);
+    } else {
+      void analytics.fetchAll();
+    }
+  }
+
+  analytics.setFetchStartHandler(cancelInitialLoad);
+
+  // The outcome totals are read on their own, not through analytics.fetchAll,
+  // because the GitHub half of the aggregation shells out once per repository
+  // and must never be pulled into the page's normal refresh.
+  const outcomeFiltersUnsupported = $derived(Boolean(
+    analytics.machine || analytics.model || analytics.termination ||
+    analytics.minUserMessages > 0 || analytics.recentlyActive ||
+    analytics.selectedDow !== null || analytics.selectedHour !== null,
+  ));
+
+  const outcomeWindow = $derived.by(() => {
+    if (sync.serverVersion?.session_stats_available !== true) return null;
+    const from = analytics.selectedDate ?? analytics.selectedActivityRange?.from ?? analytics.from;
+    const to = analytics.selectedDate ?? analytics.selectedActivityRange?.to ?? analytics.to;
+    const start = parseLocalDate(from);
+    const end = parseLocalDate(to);
+    if (!start || !end) return null;
+    // Dashboard dates include the last day; stats bounds exclude the end.
+    // Advance by a local calendar day so DST changes keep midnight aligned.
+    end.setDate(end.getDate() + 1);
+    return {
+      since: start.toISOString(),
+      until: end.toISOString(),
+      timezone: analytics.timezone,
+      agent: analytics.agent || undefined,
+      includeProject: analytics.project ? [analytics.project] : undefined,
+      includeOneShot: analytics.includeOneShot,
+      includeAutomated: analytics.includeAutomated,
+    };
+  });
+
+  $effect(() => {
+    const window = outcomeWindow;
+    const unsupported = outcomeFiltersUnsupported;
+    untrack(() => {
+      if (!window || unsupported) outcomeTotals.reset();
+      else void outcomeTotals.load(window);
+    });
+  });
+
+  $effect(() => {
+    if (initialLoadDeferred && !sessions.loading && !sessions.machineFilterPending) {
+      untrack(() => {
+        clearTimeout(initialLoadTimer);
+        initialLoadTimer = setTimeout(releaseInitialLoad, 0);
+      });
+    }
+  });
 
   onMount(() => {
     // The URL-date effect owns the initial load so deep links and stored yoke
@@ -307,6 +418,7 @@
   // the sidebar filters change. Uses untrack on analytics state
   // so that local drill-downs don't re-trigger.
   $effect(() => {
+    if (sessions.machineFilterPending) return;
     const headerProject = sessions.filters.project;
     const headerMachine = sessions.filters.machine;
     const headerAgent = sessions.filters.agent;
@@ -388,16 +500,30 @@
     }
 
     if (changed && analyticsDateUrlInitComplete) {
-      untrack(() => analytics.fetchAll());
+      untrack(() => startAnalyticsLoad());
     }
   });
 
   $effect(() => {
+    if (sessions.machineFilterPending) return;
     const route = router.route;
     const params = router.params;
     const earliestSession = sync.stats?.earliest_session ?? undefined;
     untrack(() => {
       if (route !== "sessions") return;
+      if (router.isRootPath) {
+        if (lastAnalyticsDateUrlSignature !== "root-landing") {
+          analytics.applyRollingWindow(
+            ANALYTICS_DEFAULT_WINDOW_DAYS,
+          );
+          startAnalyticsLoad(lastAnalyticsDateUrlSignature === null && !analyticsDateUrlInitRan);
+        }
+        lastAnalyticsDateUrlSignature = "root-landing";
+        analyticsDateUrlInitRan = false;
+        analyticsDateUrlInitComplete = false;
+        sessionDateIntentEstablished = false;
+        return;
+      }
 
       const fixedState = sessionParamsToPanelDate(params, {
         earliest: earliestSession,
@@ -415,6 +541,8 @@
       }
 
       const firstRun = !analyticsDateUrlInitRan;
+      const initialHydration = firstRun && !userDateSelectionPending;
+      userDateSelectionPending = false;
       const dateSignature = sessionAnalyticsDateUrlSignature(
         params,
         state,
@@ -425,7 +553,7 @@
       if (!state) {
         if (hasDateParams) {
           if (firstRun) {
-            analytics.fetchAll();
+            startAnalyticsLoad(initialHydration);
           }
           lastAnalyticsDateUrlSignature = dateSignature;
           analyticsDateUrlInitRan = true;
@@ -434,15 +562,20 @@
         }
         let changed = false;
         if (firstRun) {
-          const seed = yokedDates.seedForPanel();
-          const retained = seed
-            ? null
-            : analyticsPageDates.restoreWithIntent("sessions");
-          state = seed
-            ? rangeToPanelDate(seed)
-            : retained?.state ?? null;
-          sessionDateIntentEstablished = seed !== null ||
-            retained?.explicitDateIntent === true;
+          if (suppressSessionDateRestore) {
+            sessionDateIntentEstablished = false;
+            onSessionDateRestoreSuppressed?.();
+          } else {
+            const seed = yokedDates.seedForPanel();
+            const retained = seed
+              ? null
+              : analyticsPageDates.restoreWithIntent("sessions");
+            state = seed
+              ? rangeToPanelDate(seed)
+              : retained?.state ?? null;
+            sessionDateIntentEstablished = seed !== null ||
+              retained?.explicitDateIntent === true;
+          }
           if (state) {
             changed = applyAnalyticsPanelDate(state);
             if (sessionDateIntentEstablished) {
@@ -463,8 +596,8 @@
             if (sessionChanged) sessions.load();
           }
         }
-        if (changed || firstRun) {
-          analytics.fetchAll();
+        if (changed || initialHydration) {
+          startAnalyticsLoad(initialHydration);
         }
         lastAnalyticsDateUrlSignature = dateSignature;
         analyticsDateUrlInitRan = true;
@@ -480,8 +613,8 @@
         sessionChanged = syncSessionFiltersForDateState(state);
         yokedDates.updateFromPanel(state);
       }
-      if (changed || firstRun) {
-        analytics.fetchAll();
+      if (changed || initialHydration) {
+        startAnalyticsLoad(initialHydration);
       }
       if (sessionChanged && !firstRun) {
         sessions.load();
@@ -493,7 +626,10 @@
   });
 
   onDestroy(() => {
+    cancelInitialLoad();
+    analytics.setFetchStartHandler(undefined);
     analytics.cancelInFlightReads();
+    outcomeTotals.reset();
     const state = currentAnalyticsPanelDate();
     if (state) {
       analyticsPageDates.retain(
@@ -508,11 +644,16 @@
 
 <div class="analytics-page">
   <div class="analytics-toolbar">
-    {#if !ui.sidebarOpen}
-      <div class="toolbar-filter-anchor">
+    {#if !ui.isMobileViewport && !ui.sidebarOpen}
+      <div
+        class="toolbar-filter-anchor"
+        data-sidebar-focus-region="content"
+      >
+        <SidebarToggleButton placement="content" />
         <SessionFilterControl
           showDisplay={false}
           showStarred={false}
+          showLabelFilters={false}
           align="left"
         />
       </div>
@@ -526,14 +667,18 @@
     />
     <RefreshControl
       lastUpdatedAt={analytics.lastUpdatedAt}
+      queryDurationMs={analytics.lastQueryDurationMs}
+      querySteps={analytics.lastQuerySteps}
+      liveQuery={analytics.liveQuery}
       busy={analytics.isQuerying}
       onRefresh={refreshAnalytics}
       label={m.analytics_refresh()}
     />
     <FilterDropdown
       label={m.analytics_model()}
+      selectedLabel={analytics.model !== analytics.displayedModels ? analytics.model : ""}
       items={modelItems}
-      excludedCsv={analytics.model}
+      excludedCsv={analytics.displayedModels}
       mode="include"
       onToggle={(name) => analytics.toggleModel(name)}
       onSelectAll={() => analytics.clearModel()}
@@ -570,7 +715,11 @@
             </span>
           </h3>
         </div>
-        <ActivityTimeline onDateRangeChange={handleDateRangeChange} />
+        <ActivityTimeline
+          deferInitialFetch={initialLoadDeferred}
+          onRangeSelect={handleActivityRangeSelect}
+          onRangeClear={handleActivityRangeClear}
+        />
         <div class="chart-divider"></div>
         <HourOfWeekHeatmap />
       </Card>
@@ -587,7 +736,7 @@
         <SessionShape />
       </Card>
 
-      <Card level="default" padding="none" class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel wide">
         <ToolUsage />
       </Card>
 
@@ -605,6 +754,21 @@
 
       <Card level="default" padding="none" class="chart-panel wide">
         <AgentComparison />
+      </Card>
+
+      <Card level="default" padding="none" class="chart-panel wide">
+        <OutcomeTotals
+          stats={outcomeTotals.stats}
+          loading={outcomeTotals.loading}
+          unavailable={outcomeFiltersUnsupported}
+          backendAvailable={sync.serverVersion?.session_stats_available}
+          githubConfigured={settings.githubConfigured}
+          error={outcomeTotals.error}
+          includePullRequests={outcomeTotals.includePullRequests}
+          onIncludePullRequests={() => {
+            if (outcomeWindow) void outcomeTotals.loadWithPullRequests(outcomeWindow);
+          }}
+        />
       </Card>
     </div>
 
@@ -656,6 +820,9 @@
   .analytics-content {
     flex: 1;
     overflow-y: auto;
+    /* Reserve the scrollbar's width up front so right-aligned controls do not
+       shift when loaded results first make a tall pane scroll. */
+    scrollbar-gutter: stable;
     padding: 16px;
     display: flex;
     flex-direction: column;
@@ -703,7 +870,7 @@
     padding: 12px;
     min-height: 200px;
     min-width: 0;
-    overflow-x: hidden;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
     gap: 0;

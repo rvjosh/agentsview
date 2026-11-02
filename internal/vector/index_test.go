@@ -1,7 +1,6 @@
 package vector
 
 import (
-	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -9,30 +8,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 	kitvec "go.kenn.io/kit/vector"
 	"go.kenn.io/kit/vector/sqlitevec"
 )
 
-func TestOpenCreatesSchema(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "vectors.db")
-
-	ix, err := Open(ctx, path, false, 4000)
-	require.NoError(t, err)
-	defer ix.Close()
-
-	var name string
-	require.NoError(t, ix.db.QueryRowContext(ctx,
-		`SELECT name FROM sqlite_master WHERE type='table' AND name='vector_messages'`).Scan(&name))
-	require.Equal(t, "vector_messages", name)
-
-	require.NoError(t, ix.db.QueryRowContext(ctx,
-		`SELECT name FROM sqlite_master WHERE type='table' AND name='message_vectors_generations'`).Scan(&name))
-	require.Equal(t, "message_vectors_generations", name)
-}
-
 func TestOpenReadOnlyOnMissingFileFails(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "missing-vectors.db")
 
 	_, err := Open(ctx, path, true, 4000)
@@ -44,7 +27,7 @@ func TestOpenReadOnlyOnMissingFileFails(t *testing.T) {
 // handed out writable handles. A read-only Open on a valid vectors.db must
 // refuse writes at the SQLite level.
 func TestOpenReadOnlyRefusesWrites(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 
 	rw, err := Open(ctx, path, false, 4000)
@@ -69,7 +52,7 @@ func TestOpenReadOnlyRefusesWrites(t *testing.T) {
 // writable and read-only branches must escape the path, and read-only must
 // still refuse writes.
 func TestOpenPathWithSpecialCharacters(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	dir := filepath.Join(t.TempDir(), "we%41rd dir")
 	require.NoError(t, os.MkdirAll(dir, 0o755))
 	path := filepath.Join(dir, "vectors.db")
@@ -101,7 +84,7 @@ func TestOpenPathWithSpecialCharacters(t *testing.T) {
 }
 
 func TestOpenSplitOptionsUse15PercentOverlap(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 
 	ix, err := Open(ctx, path, false, 4000)
@@ -121,7 +104,7 @@ func TestChunkOverlapIs15Percent(t *testing.T) {
 }
 
 func TestEnsureGenerationLifecycle(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 
 	ix, err := Open(ctx, path, false, 4000)
@@ -151,7 +134,7 @@ func TestEnsureGenerationLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, ok)
 
-	require.NoError(t, ix.SetStateByID(ctx, infos[0].ID, sqlitevec.StateActive))
+	require.NoError(t, ix.forceActivateGeneration(ctx, infos[0].key))
 
 	active, ok, err := ix.ActiveFingerprint(ctx)
 	require.NoError(t, err)
@@ -172,7 +155,7 @@ func TestEnsureGenerationLifecycle(t *testing.T) {
 // ErrGenerationNotFound via errors.Is, not just any error, so callers can
 // distinguish "not found" from other failures.
 func TestGenerationByIDUnknownIDReturnsSentinel(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 
 	ix, err := Open(ctx, path, false, 4000)
@@ -186,7 +169,7 @@ func TestGenerationByIDUnknownIDReturnsSentinel(t *testing.T) {
 }
 
 func TestGenerationCoverageCounts(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 
 	ix, err := Open(ctx, path, false, 4000)
@@ -225,7 +208,7 @@ func TestGenerationCoverageCounts(t *testing.T) {
 // (the content changed since it was embedded) counts as Missing, not
 // Embedded, since kit's store treats such a document as pending re-embed.
 func TestGenerationCoverageStaleRevisionCountsAsMissing(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 
 	ix, err := Open(ctx, path, false, 4000)
@@ -294,7 +277,8 @@ CREATE TABLE vector_meta (
 // must detect as a mismatch (absent key, mirror state present) and reset.
 func seedV1Mirror(t *testing.T, path string) {
 	t.Helper()
-	ctx := context.Background()
+
+	ctx := t.Context()
 	raw, err := sql.Open("sqlite3", path)
 	require.NoError(t, err)
 	defer raw.Close()
@@ -338,7 +322,8 @@ CREATE INDEX `+spec.VectorsPrefix+`_stamps_by_doc_revision ON `+spec.stampsTable
 // Opens: sqlitevec.New must not need any CREATE TABLE on a mode=ro handle.
 func seedV2Mirror(t *testing.T, path string) {
 	t.Helper()
-	ctx := context.Background()
+
+	ctx := t.Context()
 	ix, err := Open(ctx, path, false, 4000)
 	require.NoError(t, err)
 	require.NoError(t, ix.Close())
@@ -358,7 +343,7 @@ UPDATE vector_meta SET value = '2' WHERE key = ?`, mirrorSchemaVersionKey)
 }
 
 func TestMirrorSchemaVersionFreshDBStampsVersionNothingDropped(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 
 	ix, err := Open(ctx, path, false, 4000)
@@ -377,7 +362,7 @@ func TestMirrorSchemaVersionFreshDBStampsVersionNothingDropped(t *testing.T) {
 }
 
 func TestMirrorSchemaVersionCurrentVersionUntouchedOnReopen(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 
 	ix, err := Open(ctx, path, false, 4000)
@@ -410,7 +395,7 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 // and recreated with the v2 columns and defaults, and vector_meta must be
 // cleared except for the freshly stamped version key.
 func TestMirrorSchemaVersionMismatchResetsWritePath(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 	seedV1Mirror(t, path)
 
@@ -439,7 +424,7 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 INSERT INTO vector_messages (doc_key, session_id, ordinal, ordinal_end, content, content_hash)
 VALUES (?, ?, ?, ?, ?, ?)`,
 		"d2", "s1", 0, 0, "duplicate slot", "h2")
-	assert.Error(t, err, "the unique (session_id, ordinal) index must be retained")
+	require.Error(t, err, "the unique (session_id, ordinal) index must be retained")
 
 	var metaCount int
 	require.NoError(t, ix.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM vector_meta`).Scan(&metaCount))
@@ -452,7 +437,7 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 
 	err = ix.db.QueryRowContext(ctx,
 		`SELECT name FROM sqlite_master WHERE name = 'message_vectors_gen7'`).Scan(new(string))
-	assert.ErrorIs(t, err, sql.ErrNoRows, "the stray abandoned per-generation table must be dropped")
+	require.ErrorIs(t, err, sql.ErrNoRows, "the stray abandoned per-generation table must be dropped")
 
 	var genCount int
 	require.NoError(t, ix.db.QueryRowContext(ctx,
@@ -466,7 +451,7 @@ VALUES (?, ?, ?, ?, ?, ?)`,
 // per message) must still be reset on writable open — the stamp, not the
 // column set, is what marks the rows incompatible.
 func TestMirrorSchemaVersionV2StampResetsWritePath(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 	seedV2Mirror(t, path)
 
@@ -494,7 +479,7 @@ func TestMirrorSchemaVersionV2StampResetsWritePath(t *testing.T) {
 // generation tables of a mirror shaped by a different identity scheme and
 // never reach the sentinel.
 func TestMirrorSchemaVersionV2StampReadOnlyReturnsSentinel(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 	seedV2Mirror(t, path)
 
@@ -503,11 +488,61 @@ func TestMirrorSchemaVersionV2StampReadOnlyReturnsSentinel(t *testing.T) {
 	defer ro.Close()
 
 	_, err = ro.Search(ctx, fakeSearchEncoder(), "alpha", 10)
-	assert.ErrorIs(t, err, ErrMirrorVersionMismatch)
+	require.ErrorIs(t, err, ErrMirrorVersionMismatch)
 
-	_, err = ro.StaleActive(ctx, "any-fingerprint", "")
+	_, err = ro.StaleActive(ctx, legacySpace("any-fingerprint"), "")
 	assert.ErrorIs(t, err, ErrMirrorVersionMismatch,
 		"StaleActive must apply the same version gate Search does")
+}
+
+func TestMirrorSchemaVersionV3UpgradesInPlace(t *testing.T) {
+	ctx := t.Context()
+	archive := seedRunCapArchive(t, false)
+	dbtest.SeedSessionWithMessages(t, archive, "newer", "project", []db.Message{dbtest.UserMsg("newer", 0, "new work")},
+		func(s *db.Session) { s.EndedAt = new("2024-02-01T00:00:00Z") })
+	path := filepath.Join(t.TempDir(), "vectors.db")
+	ix, err := Open(ctx, path, false, 4000)
+	require.NoError(t, err)
+	gen := fakeGeneration("fake-model")
+	_, err = ix.Build(ctx, legacyRunSource(t, archive), fakeBuildEncoder(), gen, BuildOptions{})
+	require.NoError(t, err)
+	before, err := ix.Search(ctx, fakeBuildEncoder(), "work", 10)
+	require.NoError(t, err)
+	require.NotEmpty(t, before)
+	require.NoError(t, ix.metaSet(ctx, mirrorSchemaVersionKey, "3"))
+	require.NoError(t, ix.metaDelete(ctx, runMaxRunesMetaKey))
+	require.NoError(t, ix.Close())
+
+	ro, err := Open(ctx, path, true, 4000)
+	require.NoError(t, err)
+	hits, err := ro.Search(ctx, fakeBuildEncoder(), "work", 10)
+	require.NoError(t, err)
+	assert.Equal(t, before, hits, "version-3 vectors remain readable before a build")
+	require.NoError(t, ro.Close())
+
+	upgraded, err := Open(ctx, path, false, 4000)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, upgraded.Close()) })
+	version, ok, err := upgraded.metaGet(ctx, mirrorSchemaVersionKey)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, "4", version)
+	active, ok, err := upgraded.ActiveFingerprint(ctx)
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, gen.Fingerprint(), active)
+	hits, err = upgraded.Search(ctx, fakeBuildEncoder(), "work", 10)
+	require.NoError(t, err)
+	assert.Equal(t, before, hits, "restamping preserves stored vectors")
+	pending, err := upgraded.countPending(ctx, active)
+	require.NoError(t, err)
+	assert.Zero(t, pending, "restamping preserves content stamps")
+
+	result, err := upgraded.Build(ctx, archive, fakeBuildEncoder(), gen, BuildOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, gen.Fingerprint(), result.Fingerprint)
+	assert.Equal(t, 5, result.Fill.Documents, "only the split assistant run re-embeds")
+	assertRunCapPieces(t, upgraded, 6)
 }
 
 // TestMirrorSchemaVersionReadOnlyMismatchSearchReturnsSentinel covers the
@@ -517,7 +552,7 @@ func TestMirrorSchemaVersionV2StampReadOnlyReturnsSentinel(t *testing.T) {
 // rather than misreading v1-shaped rows or falling through to
 // ErrNoActiveGeneration.
 func TestMirrorSchemaVersionReadOnlyMismatchSearchReturnsSentinel(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 	seedV1Mirror(t, path)
 
@@ -527,7 +562,7 @@ func TestMirrorSchemaVersionReadOnlyMismatchSearchReturnsSentinel(t *testing.T) 
 
 	_, err = ro.Search(ctx, fakeSearchEncoder(), "alpha", 10)
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrMirrorVersionMismatch)
+	require.ErrorIs(t, err, ErrMirrorVersionMismatch)
 	assert.NotErrorIs(t, err, ErrNoActiveGeneration,
 		"a version mismatch must not be reported as an empty index")
 }
@@ -537,7 +572,7 @@ func TestMirrorSchemaVersionReadOnlyMismatchSearchReturnsSentinel(t *testing.T) 
 // be flagged as a mismatch, so Search proceeds to its normal
 // ErrNoActiveGeneration/BuildingError/hit-returning behavior.
 func TestMirrorSchemaVersionReadOnlyCurrentVersionSearchUnaffected(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 
 	rw, err := Open(ctx, path, false, 4000)
@@ -559,7 +594,7 @@ func TestMirrorSchemaVersionReadOnlyCurrentVersionSearchUnaffected(t *testing.T)
 // rebuild-required sentinel Search and StaleActive return) instead of
 // reporting coverage counts computed over stale-shape rows.
 func TestGenerationsReadOnlyMismatchReturnsSentinel(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	path := filepath.Join(t.TempDir(), "vectors.db")
 	seedV2Mirror(t, path)
 

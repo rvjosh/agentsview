@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,41 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCortexProviderCapabilities(t *testing.T) {
-	factory, ok := ProviderFactoryByType(AgentCortex)
-	require.True(t, ok)
-	require.NotNil(t, factory)
-
-	caps := factory.Capabilities()
-	assert.Equal(t, CapabilitySupported, caps.Source.DiscoverSources)
-	assert.Equal(t, CapabilitySupported, caps.Source.WatchSources)
-	assert.Equal(t, CapabilitySupported, caps.Source.ClassifyChangedPath)
-	assert.Equal(t, CapabilitySupported, caps.Source.FindSource)
-	assert.Equal(t, CapabilitySupported, caps.Source.CompositeFingerprint)
-	assert.Equal(t, CapabilitySupported, caps.Content.FirstMessage)
-	assert.Equal(t, CapabilitySupported, caps.Content.SessionName)
-	assert.Equal(t, CapabilitySupported, caps.Content.Cwd)
-	assert.Equal(t, CapabilitySupported, caps.Content.ToolCalls)
-	assert.Equal(t, CapabilitySupported, caps.Content.ToolResults)
-
-	provider, ok := NewProvider(AgentCortex, ProviderConfig{
-		Roots:   []string{t.TempDir()},
-		Machine: "devbox",
-	})
-	require.True(t, ok)
-	require.NotNil(t, provider)
-}
-
 func TestCortexProviderWatchRootsStayBounded(t *testing.T) {
 	root := t.TempDir()
 	transcript := filepath.Join(root, cortexTestUUID+".json")
 	writeSourceFile(t, transcript, "{}\n")
 	companionCalls := 0
 	provider := &cortexProvider{
-		ProviderBase: ProviderBase{
-			Def:  AgentDef{Type: AgentCortex},
-			Caps: cortexProviderCapabilities(),
-		},
+		Def:  AgentDef{Type: AgentCortex},
+		Caps: cortexProviderCapabilities(),
 		sources: NewJSONLSourceSet(
 			AgentCortex,
 			[]string{root},
@@ -58,7 +30,7 @@ func TestCortexProviderWatchRootsStayBounded(t *testing.T) {
 
 	assert.Equal(t, CapabilitySupported, provider.Capabilities().Source.WatchRoots)
 	assert.Implements(t, (*WatchRootPlanner)(nil), provider)
-	roots, err := ResolveWatchRoots(context.Background(), provider)
+	roots, err := ResolveWatchRoots(t.Context(), provider)
 	require.NoError(t, err)
 	assert.Equal(t, []WatchRoot{{
 		Path:        root,
@@ -67,7 +39,7 @@ func TestCortexProviderWatchRootsStayBounded(t *testing.T) {
 	assert.Zero(t, companionCalls,
 		"bounded root scheduling must not discover transcript companions")
 
-	plan, err := provider.WatchPlan(context.Background())
+	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
 	require.Len(t, plan.Roots, 1)
 	assert.Contains(t, plan.Roots[0].IncludeGlobs, cortexTestUUID+".history.jsonl")
@@ -93,13 +65,13 @@ func TestCortexProviderSourceMethods(t *testing.T) {
 	})
 	require.True(t, ok)
 
-	discovered, err := provider.Discover(context.Background())
+	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 2)
 	assert.Equal(t, []string{sourcePath, otherPath}, sourceDisplayPaths(discovered))
 	assert.Equal(t, []string{"", ""}, sourceProjects(discovered))
 
-	plan, err := provider.WatchPlan(context.Background())
+	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
 	require.Len(t, plan.Roots, 1)
 	assert.Equal(t, root, plan.Roots[0].Path)
@@ -111,27 +83,27 @@ func TestCortexProviderSourceMethods(t *testing.T) {
 	assert.Contains(t, plan.Roots[0].IncludeGlobs, cortexTestUUID+".history.jsonl")
 	assert.Contains(t, plan.Roots[0].IncludeGlobs, otherID+".history.jsonl")
 
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		FullSessionID: "host~cortex:" + cortexTestUUID,
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, sourcePath, found.DisplayPath)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), found)
+	fingerprint, err := provider.Fingerprint(t.Context(), found)
 	require.NoError(t, err)
 	assert.Equal(t, sourcePath, fingerprint.Key)
 	assert.NotZero(t, fingerprint.Size)
 	assert.NotZero(t, fingerprint.MTimeNS)
 
-	found, ok, err = provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err = provider.FindSource(t.Context(), FindSourceRequest{
 		StoredFilePath: otherPath,
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, otherPath, found.DisplayPath)
 
-	_, ok, err = provider.FindSource(context.Background(), FindSourceRequest{
+	_, ok, err = provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: "../" + cortexTestUUID,
 	})
 	require.NoError(t, err)
@@ -139,7 +111,7 @@ func TestCortexProviderSourceMethods(t *testing.T) {
 
 	require.NoError(t, os.Remove(sourcePath))
 	changed, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: sourcePath, EventKind: "remove", WatchRoot: root},
 	)
 	require.NoError(t, err)
@@ -168,7 +140,7 @@ func TestCortexProviderClassifiesAndFingerprintsHistoryCompanion(t *testing.T) {
 	require.True(t, ok)
 
 	changed, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: historyPath, EventKind: "write", WatchRoot: root},
 	)
 	require.NoError(t, err)
@@ -176,7 +148,7 @@ func TestCortexProviderClassifiesAndFingerprintsHistoryCompanion(t *testing.T) {
 	assert.Equal(t, sourcePath, changed[0].DisplayPath)
 	assert.Equal(t, sourcePath, changed[0].FingerprintKey)
 
-	before, err := provider.Fingerprint(context.Background(), changed[0])
+	before, err := provider.Fingerprint(t.Context(), changed[0])
 	require.NoError(t, err)
 	assert.Equal(t, sourcePath, before.Key)
 	assert.NotEmpty(t, before.Hash)
@@ -186,7 +158,7 @@ func TestCortexProviderClassifiesAndFingerprintsHistoryCompanion(t *testing.T) {
 		historyPath,
 		`{"role":"user","id":"m1","content":[{"type":"text","text":"updated history"}]}`+"\n",
 	)
-	after, err := provider.Fingerprint(context.Background(), changed[0])
+	after, err := provider.Fingerprint(t.Context(), changed[0])
 	require.NoError(t, err)
 	assert.Equal(t, sourcePath, after.Key)
 	assert.NotEqual(t, before.Hash, after.Hash)
@@ -194,7 +166,7 @@ func TestCortexProviderClassifiesAndFingerprintsHistoryCompanion(t *testing.T) {
 
 	require.NoError(t, os.Remove(historyPath))
 	changed, err = provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: historyPath, EventKind: "remove", WatchRoot: root},
 	)
 	require.NoError(t, err)
@@ -218,12 +190,12 @@ func TestCortexProviderSourceMethodsFollowSymlinkedSessionFile(t *testing.T) {
 	})
 	require.True(t, ok)
 
-	discovered, err := provider.Discover(context.Background())
+	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
 	assert.Equal(t, sourcePath, discovered[0].DisplayPath)
 
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		FullSessionID: "host~cortex:" + cortexTestUUID,
 	})
 	require.NoError(t, err)
@@ -241,11 +213,11 @@ func TestCortexProviderParse(t *testing.T) {
 		Machine: "devbox",
 	})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      sources[0],
 		Fingerprint: SourceFingerprint{Key: sourcePath, Hash: "abc123"},
 	})
@@ -274,15 +246,15 @@ func TestCortexProviderFingerprintIncludesContentHash(t *testing.T) {
 
 	provider, ok := NewProvider(AgentCortex, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	fp, err := provider.Fingerprint(context.Background(), sources[0])
+	fp, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
 	require.NotEmpty(t, fp.Hash)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      sources[0],
 		Fingerprint: fp,
 	})

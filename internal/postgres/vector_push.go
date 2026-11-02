@@ -11,106 +11,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/storage"
 )
-
-// VectorGenerationInfo identifies the local embedding generation being pushed.
-// Machines whose embedding config produces the same Fingerprint share one PG
-// generation (and one chunk table); Model and Dimension are recorded for
-// diagnostics and to size the halfvec column.
-type VectorGenerationInfo struct {
-	Fingerprint string
-	Model       string
-	Dimension   int
-}
-
-// VectorPushChunk is one embedded slice of a document. ChunkIndex is stable
-// within a doc_key so re-pushes overwrite the same (doc_key, chunk_index) row.
-type VectorPushChunk struct {
-	ChunkIndex int
-	Embedding  []float32
-}
-
-// VectorPushDoc mirrors one local vectors.db document row plus its embeddings.
-// DocKey is globally unique and shared across generations, which is why
-// vector_documents is a single backend-agnostic table upserted by doc_key
-// rather than a per-generation table.
-type VectorPushDoc struct {
-	DocKey      string
-	SessionID   string
-	SourceUUID  string
-	Ordinal     int
-	OrdinalEnd  int
-	Subordinate bool
-	OffsetsJSON string
-	Content     string
-	ContentHash string
-	Chunks      []VectorPushChunk
-}
-
-// VectorPushSource supplies one transaction-owned local export for a PG push
-// phase. The export keeps generation metadata, aggregate hashes, and document
-// and chunk reads on one SQLite snapshot.
-type VectorPushSource interface {
-	BeginExport(ctx context.Context, sessionIDs []string) (VectorExport, bool, error)
-}
-
-type VectorExport interface {
-	Generation() VectorGenerationInfo
-	SessionDocHashes(
-		ctx context.Context, sessionIDs []string,
-	) (map[string]string, error)
-	SessionDocs(
-		ctx context.Context, sessionID string,
-	) ([]VectorPushDoc, string, error)
-	Close() error
-}
-
-// ErrVectorSourceNotReady marks a Generation error meaning the local vector
-// index exists but is not safe to export right now — an embeddings build is
-// rewriting it (or one was interrupted), so its session coverage is partial. A
-// push that ran anyway would read that partial view as truth and evict or
-// overwrite valid PG vectors. pushVectors turns this into a clean phase skip;
-// the next push after the build completes sends everything that changed.
-var ErrVectorSourceNotReady = errors.New(
-	"local vector index is not fully embedded (build in progress or interrupted)")
-
-// VectorPushResult summarizes the vector push phase. Skipped is set (with a
-// human reason) when the phase cannot run: no source, no active generation, or
-// no pgvector extension. The counters describe what changed on PG.
-//
-// DocsDeleted counts vector_documents rows removed: on eviction of a whole
-// session and when a doc vanished from a re-pushed session (its shared row is
-// removed only when no other generation still embeds it). Conflicts counts
-// sessions this pusher left untouched because the PG owner marker names a
-// different machine — on the push path (a locally changed session PG says
-// another machine owns) and on the evict path (an owned-elsewhere session
-// absent from local, kept rather than evicted). The user-facing print of
-// Conflicts lands with the CLI wiring.
-type VectorPushResult struct {
-	Skipped           bool
-	SkippedReason     string
-	SessionsPushed    int
-	SessionsUnchanged int
-	// SessionsDeferred counts sessions whose vector reconciliation was
-	// withheld this run — a failed session-phase push, an export hash
-	// that diverged mid-push, or an eviction abandoned because the local
-	// generation changed; the delta state is untouched, so the next
-	// generation-wide reconciliation sends them.
-	SessionsDeferred int
-	DocsPushed       int
-	ChunksPushed     int
-	DocsDeleted      int
-	SessionsEvicted  int
-	Conflicts        int
-	// GenerationID is the PG id of the generation this phase reconciled,
-	// zero when the phase was skipped or found no active generation. The
-	// watch orchestrator records it after a clean generation-wide pass so
-	// a later push against a different generation id — a re-embed, or a
-	// reset/drop that recreated the row under any machine — promotes the
-	// next scoped push to a generation-wide reconciliation instead of
-	// writing only the changed sessions' chunks into it.
-	GenerationID int64
-}
 
 // vectorChunkInsertBatch caps rows per multi-row INSERT so parameter counts
 // stay well under PG's 65535 bound (each chunk row binds 3 parameters).
@@ -192,7 +95,7 @@ func (id vectorOwnerIdentity) owns(ownerMarker, machine string) bool {
 func (s *Sync) vectorOwnerIdentity(
 	ctx context.Context,
 ) (vectorOwnerIdentity, error) {
-	markerID, err := s.pushMarkerID()
+	markerID, err := s.pushMarkerID(ctx)
 	if err != nil {
 		return vectorOwnerIdentity{}, err
 	}
@@ -229,9 +132,9 @@ func (s *Sync) pushVectors(
 	ctx context.Context, full bool, scope []string,
 	lastReconciledGeneration int64,
 	failedSessions map[string]struct{},
-	onProgress func(PushProgress),
-) (VectorPushResult, error) {
-	var res VectorPushResult
+	onProgress func(storage.PushProgress),
+) (storage.VectorPushResult, error) {
+	var res storage.VectorPushResult
 	if s.vectorSource == nil {
 		res.Skipped, res.SkippedReason = true, "no vector source configured"
 		return res, nil
@@ -240,8 +143,33 @@ func (s *Sync) pushVectors(
 		log.Printf("vector push: no changed sessions; deferring reconciliation to the next generation-wide push")
 		return res, nil
 	}
+	// A source that builds embeddings on demand prepares only after the
+	// replica proves it can store and register its generation, so a push
+	// that would skip vectors does no build work.
+	baseSchemaReady := false
+	if preparer, ok := s.vectorSource.(storage.VectorExportPreparer); ok {
+		if skipped, err := s.prepareVectorBaseSchema(ctx, &res); err != nil || skipped {
+			return res, err
+		}
+		baseSchemaReady = true
+		planned, building, err := preparer.PlannedGeneration(ctx)
+		if err != nil {
+			return res, fmt.Errorf("planning local vector generation: %w", err)
+		}
+		if building {
+			if _, err := s.registerVectorGeneration(ctx, planned); err != nil {
+				if s.skipVectorsOnPrivilegeError(err, &res) {
+					return res, nil
+				}
+				return res, err
+			}
+		}
+		if err := preparer.PrepareExport(ctx); err != nil {
+			return res, fmt.Errorf("preparing local vector generation: %w", err)
+		}
+	}
 	export, hasGen, err := s.vectorSource.BeginExport(ctx, scope)
-	if errors.Is(err, ErrVectorSourceNotReady) {
+	if errors.Is(err, storage.ErrVectorSourceNotReady) {
 		res.Skipped, res.SkippedReason = true, err.Error()
 		log.Printf("vector push: skipped: %v", err)
 		return res, nil
@@ -254,7 +182,7 @@ func (s *Sync) pushVectors(
 		return res, nil
 	}
 	if export == nil {
-		return res, fmt.Errorf("resolving local vector generation: BeginExport returned a nil export")
+		return res, errors.New("resolving local vector generation: BeginExport returned a nil export")
 	}
 	defer func() {
 		if export != nil {
@@ -262,18 +190,12 @@ func (s *Sync) pushVectors(
 		}
 	}()
 	gen := export.Generation()
-	unavailable, err := ensureVectorBaseSchemaPG(ctx, s.pg)
-	if err != nil {
-		if s.skipVectorsOnPrivilegeError(err, &res) {
-			return res, nil
+	if !baseSchemaReady {
+		if skipped, err := s.prepareVectorBaseSchema(ctx, &res); err != nil || skipped {
+			return res, err
 		}
-		return res, err
 	}
-	if unavailable != "" {
-		res.Skipped, res.SkippedReason = true, unavailable
-		return res, nil
-	}
-	witnessKey, err := s.vectorGenerationWitnessKey()
+	witnessKey, err := s.vectorGenerationWitnessKey(ctx)
 	if err != nil {
 		return res, err
 	}
@@ -342,7 +264,7 @@ func (s *Sync) pushVectors(
 	if requestedScope != nil && scope == nil {
 		_ = export.Close()
 		export, hasGen, err = s.vectorSource.BeginExport(ctx, nil)
-		if errors.Is(err, ErrVectorSourceNotReady) {
+		if errors.Is(err, storage.ErrVectorSourceNotReady) {
 			res.Skipped, res.SkippedReason = true, err.Error()
 			log.Printf("vector push: skipped after scoped promotion: %v", err)
 			return res, nil
@@ -357,9 +279,7 @@ func (s *Sync) pushVectors(
 			return res, nil
 		}
 		if export == nil {
-			return res, fmt.Errorf(
-				"rechecking local vector generation after scoped promotion: BeginExport returned a nil export",
-			)
+			return res, errors.New("rechecking local vector generation after scoped promotion: BeginExport returned a nil export")
 		}
 		gen = export.Generation()
 	}
@@ -416,7 +336,7 @@ func (s *Sync) pushVectors(
 			s.afterScopedVectorApply = nil
 			hook()
 		}
-		retryGenerationWide := func(msg string, args ...any) (VectorPushResult, error) {
+		retryGenerationWide := func(msg string, args ...any) (storage.VectorPushResult, error) {
 			log.Printf(msg, args...)
 			_ = export.Close()
 			export = nil
@@ -447,7 +367,7 @@ func (s *Sync) pushVectors(
 			)
 		}
 	} else {
-		retryGenerationWide := func(msg string, args ...any) (VectorPushResult, error) {
+		retryGenerationWide := func(msg string, args ...any) (storage.VectorPushResult, error) {
 			log.Printf(msg, args...)
 			_ = export.Close()
 			export = nil
@@ -515,7 +435,7 @@ func (s *Sync) lookupVectorGeneration(
 		`SELECT id, created_at FROM vector_generations WHERE fingerprint = $1`,
 		fingerprint,
 	).Scan(&genID, &createdAt)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return vectorGeneration{}, false, nil
 	}
 	if isUndefinedTable(err) {
@@ -554,7 +474,27 @@ SELECT EXISTS (
 // pgvector, instead of failing a push whose session phase succeeded.
 // Privilege errors AFTER setup (mid-push writes) never reach this and still
 // fail the push loudly.
-func (s *Sync) skipVectorsOnPrivilegeError(err error, res *VectorPushResult) bool {
+// prepareVectorBaseSchema installs pgvector and the base vector tables. It
+// reports true when vectors are unavailable on this server or to this role,
+// with res marked skipped.
+func (s *Sync) prepareVectorBaseSchema(
+	ctx context.Context, res *storage.VectorPushResult,
+) (bool, error) {
+	unavailable, err := ensureVectorBaseSchemaPG(ctx, s.pg)
+	if err != nil {
+		if s.skipVectorsOnPrivilegeError(err, res) {
+			return true, nil
+		}
+		return false, err
+	}
+	if unavailable != "" {
+		res.Skipped, res.SkippedReason = true, unavailable
+		return true, nil
+	}
+	return false, nil
+}
+
+func (s *Sync) skipVectorsOnPrivilegeError(err error, res *storage.VectorPushResult) bool {
 	if !isInsufficientPrivilege(err) {
 		return false
 	}
@@ -580,9 +520,10 @@ func (s *Sync) skipVectorsOnPrivilegeError(err error, res *VectorPushResult) boo
 // Failed sessions are excluded from eviction the same way: the local hash map
 // only lists sessions with embedded docs, so a failed session whose docs all
 // vanished locally would otherwise be evicted — vector state running ahead of
-// the sessions/messages rows its session-phase push failed to write. full
-// re-sends
-// unchanged sessions too, while still honoring out-of-scope exclusion,
+// the sessions/messages rows its session-phase push failed to write. full,
+// or a session's entry in s.fullVectorSessions, re-sends unchanged sessions
+// too, except those the running full push already pushed before an
+// interruption, while still honoring out-of-scope exclusion,
 // ownership conflicts, and failed-session deferral. onProgress, when non-nil,
 // receives a Phase "vectors" report after every pushed session and every
 // vectorProgressStride examined ones, so long delta scans stay visible
@@ -591,8 +532,8 @@ func (s *Sync) applyVectorDeltas(
 	ctx context.Context, gen vectorGeneration,
 	owner vectorOwnerIdentity, full bool,
 	local map[string]string, pgState map[string]vectorPushStateRow,
-	export VectorExport, failedSessions map[string]struct{}, onProgress func(PushProgress),
-	res *VectorPushResult,
+	export storage.VectorExport, failedSessions map[string]struct{}, onProgress func(storage.PushProgress),
+	res *storage.VectorPushResult,
 ) error {
 	allGenIDs, err := s.allVectorGenerationIDs(ctx)
 	if err != nil {
@@ -618,7 +559,7 @@ func (s *Sync) applyVectorDeltas(
 		if onProgress == nil {
 			return
 		}
-		onProgress(PushProgress{
+		onProgress(storage.PushProgress{
 			Phase:               "vectors",
 			VectorSessionsDone:  examined,
 			VectorSessionsTotal: len(local),
@@ -635,12 +576,14 @@ func (s *Sync) applyVectorDeltas(
 			res.Conflicts++
 			continue
 		}
-		if !full && hasState && prev.docAggHash == agg {
+		_, repair := s.fullVectorSessions[sessionID]
+		if !repair && hasState && prev.docAggHash == agg &&
+			(!full || s.fullRun.vectorDone(gen.id, sessionID, agg)) {
 			res.SessionsUnchanged++
 			continue
 		}
 		if _, failed := failedSessions[sessionID]; failed {
-			res.SessionsDeferred++
+			res.DeferSession(sessionID)
 			continue
 		}
 		outcome, err := s.pushVectorSession(ctx, scope, export, sessionID, agg)
@@ -651,13 +594,16 @@ func (s *Sync) applyVectorDeltas(
 			res.Conflicts++
 		}
 		if outcome.deferred {
-			res.SessionsDeferred++
+			res.DeferSession(sessionID)
 		}
 		if outcome.pushed {
 			res.SessionsPushed++
 			res.DocsPushed += outcome.docs
 			res.ChunksPushed += outcome.chunks
 			res.DocsDeleted += outcome.deleted
+			if err := s.fullRun.recordVector(ctx, gen.id, sessionID, agg); err != nil {
+				return err
+			}
 			report()
 		} else if examined%vectorProgressStride == 0 {
 			report()
@@ -665,7 +611,7 @@ func (s *Sync) applyVectorDeltas(
 	}
 	report()
 
-	var evict []string
+	var evict, foreign []string
 	for sessionID, st := range pgState {
 		if _, inLocal := local[sessionID]; inLocal {
 			continue
@@ -674,17 +620,41 @@ func (s *Sync) applyVectorDeltas(
 			continue
 		}
 		if _, failed := failedSessions[sessionID]; failed {
-			res.SessionsDeferred++
+			res.DeferSession(sessionID)
 			continue
 		}
 		switch {
 		case !st.sessionExists || owner.owns(st.ownerMarker, st.machine):
 			evict = append(evict, sessionID)
 		default:
-			res.Conflicts++
+			foreign = append(foreign, sessionID)
 		}
 	}
+	conflicts, err := s.countLocalForeignVectorSessions(ctx, foreign)
+	if err != nil {
+		return err
+	}
+	res.Conflicts += conflicts
 	return s.evictVectorSessions(ctx, scope, evict, res)
+}
+
+// countLocalForeignVectorSessions counts the foreign-owned eviction candidates
+// that still have a live local sessions row. pgState spans every machine
+// pushing into the generation, so most foreign-owned rows are simply another
+// machine's sessions that this archive never held: those are neither evicted
+// nor conflicts. Only a session this archive also holds, whose vectors this
+// pusher would otherwise evict, is a genuine ownership conflict.
+func (s *Sync) countLocalForeignVectorSessions(
+	ctx context.Context, sessionIDs []string,
+) (int, error) {
+	if len(sessionIDs) == 0 {
+		return 0, nil
+	}
+	present, err := s.local.SessionProjectsByIDs(ctx, sessionIDs)
+	if err != nil {
+		return 0, fmt.Errorf("reading local foreign vector sessions: %w", err)
+	}
+	return len(present), nil
 }
 
 // vectorSessionsOutOfScope computes the set of candidate sessions a filtered
@@ -801,7 +771,7 @@ func (s *Sync) localOutOfScopeVectorSessions(
 // include/exclude filter, mirroring the session push's SQL predicate: an
 // include filter excludes any project not in the allowed set; an exclude filter
 // excludes any project in the excluded set. Caller guarantees exactly one of
-// projects/excludeProjects is set (ValidateProjectFilters rejects both).
+// projects/excludeProjects is set (storage.ValidateProjectFilters rejects both).
 func projectFailsFilter(project string, projects, excludeProjects []string) bool {
 	if len(projects) > 0 {
 		return !slices.Contains(projects, project)
@@ -850,7 +820,7 @@ func (s *Sync) outOfScopeVectorSessions(
 // semantics: an include filter selects sessions whose project is not in the
 // allowed set; an exclude filter selects sessions whose project is in the
 // excluded set. Caller guarantees exactly one of projects/excludeProjects is
-// set (ValidateProjectFilters rejects both).
+// set (storage.ValidateProjectFilters rejects both).
 func vectorOutOfScopeQuery(
 	ids, projects, excludeProjects []string,
 ) (string, []any) {
@@ -864,6 +834,50 @@ func vectorOutOfScopeQuery(
 		[]any{ids, excludeProjects}
 }
 
+// publishGenerationRecipe records gen's recipe for adoption by other hosts.
+// It runs only on generation-wide pushes. A writer that may not add the
+// params column or update the row keeps pushing vectors without publishing.
+func (s *Sync) publishGenerationRecipe(
+	ctx context.Context, gen storage.VectorGenerationInfo,
+) error {
+	if gen.Params == nil {
+		return nil
+	}
+	err := ensureVectorRecipeColumn(ctx, s.pg)
+	if err == nil {
+		err = publishVectorRecipe(ctx, s.pg, gen.Fingerprint, gen.Params)
+	}
+	if !isInsufficientPrivilege(err) {
+		return err
+	}
+	if !s.recipePrivilegeLogged {
+		s.recipePrivilegeLogged = true
+		log.Printf("vector push: cannot publish the embedding recipe "+
+			"(insufficient privilege); pushing vectors without it: %v", err)
+	}
+	return nil
+}
+
+// registerVectorGeneration registers gen, publishes its recipe, and creates
+// its chunk table, returning the generation id.
+func (s *Sync) registerVectorGeneration(
+	ctx context.Context, gen storage.VectorGenerationInfo,
+) (int64, error) {
+	genID, err := ensureVectorGeneration(
+		ctx, s.pg, gen.Fingerprint, gen.Model, gen.Dimension,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.publishGenerationRecipe(ctx, gen); err != nil {
+		return 0, err
+	}
+	if err := ensureVectorChunkTable(ctx, s.pg, genID, gen.Dimension); err != nil {
+		return 0, err
+	}
+	return genID, nil
+}
+
 // resolveVectorGeneration registers the generation, creates its chunk table,
 // and reads whether this machine has already completed a generation-wide push
 // against it. Its id is the generation
@@ -873,15 +887,10 @@ func vectorOutOfScopeQuery(
 // the incarnation witness the promotion check falls back on when a recreated
 // id sequence hands the new generation the memoized id.
 func (s *Sync) resolveVectorGeneration(
-	ctx context.Context, gen VectorGenerationInfo, witnessKey string,
+	ctx context.Context, gen storage.VectorGenerationInfo, witnessKey string,
 ) (vectorGeneration, error) {
-	genID, err := ensureVectorGeneration(
-		ctx, s.pg, gen.Fingerprint, gen.Model, gen.Dimension,
-	)
+	genID, err := s.registerVectorGeneration(ctx, gen)
 	if err != nil {
-		return vectorGeneration{}, err
-	}
-	if err := ensureVectorChunkTable(ctx, s.pg, genID, gen.Dimension); err != nil {
 		return vectorGeneration{}, err
 	}
 	extSchema, err := vectorExtensionSchema(ctx, s.pg)
@@ -910,8 +919,8 @@ SELECT EXISTS (
 	}, nil
 }
 
-func (s *Sync) vectorGenerationWitnessKey() (string, error) {
-	markerID, err := s.pushMarkerID()
+func (s *Sync) vectorGenerationWitnessKey(ctx context.Context) (string, error) {
+	markerID, err := s.pushMarkerID(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -1037,7 +1046,7 @@ type vectorSessionOutcome struct {
 // generation's chunks for them (see deleteParkedVectorDocs). This mirrors the
 // local mirror's park-to-sentinel slot replacement (internal/vector/mirror.go).
 func (s *Sync) pushVectorSession(
-	ctx context.Context, scope vectorPushScope, export VectorExport, sessionID, aggHash string,
+	ctx context.Context, scope vectorPushScope, export storage.VectorExport, sessionID, aggHash string,
 ) (vectorSessionOutcome, error) {
 	tx, err := s.pg.BeginTx(ctx, nil)
 	if err != nil {
@@ -1152,7 +1161,7 @@ UPDATE vector_documents d
 // final ordinal. The caller parks the session's prior rows to negative ordinals
 // first, so every final (session_id, ordinal) slot is free and an ordinal shift
 // cannot collide with a sibling row that has not been updated yet.
-func upsertVectorDocs(ctx context.Context, tx *sql.Tx, docs []VectorPushDoc) error {
+func upsertVectorDocs(ctx context.Context, tx *sql.Tx, docs []storage.VectorPushDoc) error {
 	for _, doc := range docs {
 		offsets := doc.OffsetsJSON
 		if offsets == "" {
@@ -1188,7 +1197,7 @@ ON CONFLICT (doc_key) DO UPDATE SET
 // chunk rows inserted.
 func replaceVectorChunks(
 	ctx context.Context, tx *sql.Tx, gen vectorGeneration,
-	sessionID string, docs []VectorPushDoc,
+	sessionID string, docs []storage.VectorPushDoc,
 ) (int, error) {
 	table := vectorChunkTable(gen.id)
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
@@ -1255,7 +1264,7 @@ DELETE FROM %s WHERE doc_key IN (
 // new owner's next vector push.
 func (s *Sync) evictVectorSessions(
 	ctx context.Context, scope vectorPushScope, sessionIDs []string,
-	res *VectorPushResult,
+	res *storage.VectorPushResult,
 ) error {
 	if len(sessionIDs) == 0 {
 		return nil
@@ -1416,9 +1425,7 @@ func deleteOrphanVectorDocs(
 			" AND NOT EXISTS (SELECT 1 FROM %s c WHERE c.doc_key = d.doc_key)",
 			vectorChunkTable(id))
 	}
-	stmt := fmt.Sprintf(
-		`DELETE FROM vector_documents d WHERE d.session_id = $1%s`,
-		conds.String())
+	stmt := "DELETE FROM vector_documents d WHERE d.session_id = $1" + conds.String()
 	result, err := tx.ExecContext(ctx, stmt, sessionID)
 	if err != nil {
 		return 0, fmt.Errorf("pruning orphan docs for session %s: %w", sessionID, err)
@@ -1450,4 +1457,112 @@ func halfvecLiteral(v []float32) (string, error) {
 	}
 	b.WriteByte(']')
 	return b.String(), nil
+}
+
+// clearUsageOnlyVectorSessions discovers indexed sessions in PostgreSQL rather
+// than the local push candidates, which omit sessions deleted from the archive.
+// Usage-only storage retains no vectors for this archive, including generations
+// that are no longer active. Other archives' sessions remain untouched.
+func (s *Sync) clearUsageOnlyVectorSessions(ctx context.Context) error {
+	var exists bool
+	if err := s.pg.QueryRowContext(ctx, `SELECT to_regclass('vector_documents') IS NOT NULL`).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	owner, err := s.vectorOwnerIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	rows, err := s.pg.QueryContext(ctx, `
+		SELECT s.id, s.owner_marker, s.machine
+		FROM sessions s
+		JOIN (
+			SELECT session_id FROM vector_documents
+			UNION SELECT session_id FROM vector_push_state
+		) indexed ON indexed.session_id = s.id`)
+	if err != nil {
+		return fmt.Errorf("listing usage-only vector sessions: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		var marker, machine sql.NullString
+		if err := rows.Scan(&id, &marker, &machine); err != nil {
+			rows.Close()
+			return err
+		}
+		if owner.owns(marker.String, machine.String) {
+			ids = append(ids, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		if err := s.clearOwnedSessionVectors(ctx, owner, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Sync) clearOwnedSessionVectors(ctx context.Context, owner vectorOwnerIdentity, id string) error {
+	tx, err := s.pg.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Match eviction's ownership lock: another archive may have claimed the
+	// session since discovery. A missing owner cannot authorize this deletion.
+	var marker, machine sql.NullString
+	err = tx.QueryRowContext(ctx,
+		`SELECT owner_marker, machine FROM sessions WHERE id = $1 FOR UPDATE`, id,
+	).Scan(&marker, &machine)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !owner.owns(marker.String, machine.String) {
+		return nil
+	}
+	if err := clearSessionVectorsTx(ctx, tx, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// clearSessionVectorsTx removes every generation's content for an owned
+// session in the same transaction that applies its usage-only projection.
+func clearSessionVectorsTx(ctx context.Context, tx *sql.Tx, sessionID string) error {
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT to_regclass('vector_documents') IS NOT NULL`).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	generations, err := existingChunkGenerationsTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, id := range generations {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+vectorChunkTable(id)+` WHERE doc_key IN (SELECT doc_key FROM vector_documents WHERE session_id = $1)`, sessionID); err != nil {
+			return fmt.Errorf("clearing usage-only vector chunks: %w", err)
+		}
+	}
+	for _, table := range []string{"vector_documents", "vector_push_state"} {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE session_id = $1`, sessionID); err != nil {
+			return fmt.Errorf("clearing usage-only vector content: %w", err)
+		}
+	}
+	return nil
 }

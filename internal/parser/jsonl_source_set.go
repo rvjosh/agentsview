@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"go.kenn.io/agentsview/internal/ctxio"
 )
 
 // JSONLSource is the in-memory payload JSONLSourceSet stores in SourceRef.
@@ -111,6 +114,14 @@ type JSONLSourceSetOptions struct {
 	// providers describe companions once as transcript->companions and the base
 	// drives watch, freshness, and changed-path mapping from that single hook.
 	CompanionFiles func(transcriptPath string) []string
+	// OptionalCompanion lets unreadable companions contribute a marker.
+	OptionalCompanion func(companionPath string) bool
+	// OptionalCompanionDirectories names companions whose directory entries contribute metadata.
+	OptionalCompanionDirectories []string
+	// RejectSymlinkCompanions makes companion freshness use Lstat and ignore
+	// symlinked companions. The default preserves legacy followed-symlink
+	// behavior for existing JSONL providers.
+	RejectSymlinkCompanions bool
 
 	// CompanionTranscript is the inverse of CompanionFiles: it derives the
 	// owning transcript path from a changed sidecar path so companion events
@@ -185,7 +196,7 @@ func (s JSONLSourceSet) DiscoverEach(
 			continue
 		}
 		if !info.IsDir() {
-			err := fmt.Errorf("not a directory")
+			err := errors.New("not a directory")
 			incomplete = errors.Join(incomplete, incompleteDiscoveryError(
 				s.provider, "stat JSONL root "+root, err,
 			))
@@ -338,7 +349,7 @@ func (s JSONLSourceSet) SourceForReconciliation(
 	path = filepath.Clean(path)
 	info, err := s.sourcePathInfo(path)
 	if err != nil || !info.Mode().IsRegular() {
-		return SourceRef{}, false, nil
+		return SourceRef{}, false, nil //nolint:nilerr // Unavailable source paths are represented by the found=false outcome.
 	}
 	for _, root := range s.roots {
 		if !s.pathAllowedByRoot(root, path) ||
@@ -433,7 +444,7 @@ func (s JSONLSourceSet) Fingerprint(
 		return SourceFingerprint{}, err
 	}
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("jsonl source path unavailable")
+		return SourceFingerprint{}, errors.New("jsonl source path unavailable")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -495,8 +506,32 @@ func (s JSONLSourceSet) foldCompanionFingerprint(
 		hasher = h
 	}
 	folded := false
+	companionInfo := siblingMetadataFileInfo
+	if s.options.RejectSymlinkCompanions {
+		companionInfo = siblingMetadataFileInfoStrict
+	}
 	for _, companion := range companions {
-		info, err := siblingMetadataFileInfo(companion)
+		optional := s.options.OptionalCompanion != nil && s.options.OptionalCompanion(companion)
+		var info os.FileInfo
+		var err error
+		if optional && !s.options.RejectSymlinkCompanions {
+			info, err = os.Stat(companion)
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err == nil && !info.Mode().IsRegular() && !info.IsDir() {
+				err = fmt.Errorf("companion is not a regular file: %s", companion)
+			}
+		} else {
+			info, err = companionInfo(companion)
+		}
+		if err != nil && optional {
+			if hasher != nil {
+				_, _ = fmt.Fprintf(hasher, "companion:%s:unreadable\n", filepath.Base(companion))
+				folded = true
+			}
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -508,16 +543,23 @@ func (s JSONLSourceSet) foldCompanionFingerprint(
 			fingerprint.MTimeNS = mtime
 		}
 		if hasher != nil {
-			if err := addSiblingMetadataFingerprintPart(
-				hasher, "companion", companion, info,
-			); err != nil {
-				return err
+			var err error
+			if optional && info.IsDir() && slices.Contains(s.options.OptionalCompanionDirectories, filepath.Base(companion)) {
+				err = addSiblingMetadataDirectoryFingerprintPart(hasher, "companion", companion)
+			} else {
+				err = addSiblingMetadataFingerprintPart(hasher, "companion", companion, info)
+			}
+			if err != nil {
+				if !optional {
+					return err
+				}
+				_, _ = fmt.Fprintf(hasher, "companion:%s:unreadable\n", filepath.Base(companion))
 			}
 		}
 		folded = true
 	}
 	if hasher != nil && folded {
-		fingerprint.Hash = fmt.Sprintf("%x", hasher.Sum(nil))
+		fingerprint.Hash = hex.EncodeToString(hasher.Sum(nil))
 	}
 	return nil
 }
@@ -677,7 +719,7 @@ func (s JSONLSourceSet) sourceForPath(
 	path = filepath.Clean(path)
 	info, err := s.sourcePathInfo(path)
 	if err != nil || !info.Mode().IsRegular() {
-		return SourceRef{}, false, nil
+		return SourceRef{}, false, nil //nolint:nilerr // Unavailable source paths are represented by the found=false outcome.
 	}
 	for _, root := range s.roots {
 		if !s.pathAllowedByRoot(root, path) {
@@ -757,7 +799,9 @@ func (s JSONLSourceSet) sourceForCompanionPath(
 		// not claim as a companion must not remap to it.
 		if !slices.ContainsFunc(
 			s.options.CompanionFiles(transcript),
-			func(companion string) bool { return samePath(companion, path) },
+			func(companion string) bool {
+				return samePath(companion, path) || (s.options.OptionalCompanion != nil && s.options.OptionalCompanion(companion) && pathWithinDir(path, companion))
+			},
 		) {
 			return SourceRef{}, false, nil
 		}
@@ -1058,6 +1102,15 @@ func firstNonEmptyJSONLString(values ...string) string {
 }
 
 func hashJSONLSourceFile(path string) (string, error) {
+	return hashJSONLSourceFileContext(context.Background(), path)
+}
+
+func hashJSONLSourceFileContext(
+	ctx context.Context, path string,
+) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("open %s: %w", path, err)
@@ -1065,8 +1118,8 @@ func hashJSONLSourceFile(path string) (string, error) {
 	defer f.Close()
 
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, ctxio.Reader{Context: ctx, Reader: f}); err != nil {
 		return "", fmt.Errorf("hash %s: %w", path, err)
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

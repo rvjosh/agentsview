@@ -2,7 +2,11 @@ package signals
 
 import (
 	"fmt"
+	"math/rand"
+	"slices"
+	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -140,6 +144,120 @@ func TestAnalyzeHeuristics_RepeatedPrompts(t *testing.T) {
 
 	got := AnalyzeHeuristics(in)
 	assert.Equal(t, 1, got.DuplicatePromptCount)
+}
+
+func TestCountDuplicatePromptsAllocationGrowthStaysNearLinear(t *testing.T) {
+	prompts := func(count int) []promptInfo {
+		items := make([]promptInfo, count)
+		for i := range items {
+			tokens := []string{
+				"shared-0", "shared-1", "shared-2", "shared-3",
+				"shared-4", "shared-5", "shared-6", "shared-7",
+			}
+			for j := range 8 {
+				tokens = append(tokens, fmt.Sprintf("prompt-%d-%d", i, j))
+			}
+			items[i] = promptInfo{
+				Normalized: fmt.Sprintf(
+					"shared alpha beta prompt number %d", i,
+				),
+				Tokens: tokens,
+			}
+		}
+		return items
+	}
+
+	small := prompts(64)
+	large := prompts(256)
+	var got int
+	smallAllocs := testing.AllocsPerRun(3, func() {
+		got = countDuplicatePrompts(small)
+	})
+	assert.Zero(t, got, "fixture prompts must remain distinct")
+	largeAllocs := testing.AllocsPerRun(3, func() {
+		got = countDuplicatePrompts(large)
+	})
+	assert.Zero(t, got, "fixture prompts must remain distinct")
+
+	assert.LessOrEqual(t, largeAllocs, 6*smallAllocs,
+		"quadrupling prompts must not cause quadratic allocation growth")
+}
+
+func TestCountDuplicatePromptsMatchesPairwiseReference(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	vocabulary := []string{
+		"alpha", "beta", "gamma", "delta", "epsilon", "zeta",
+		"eta", "theta", "iota", "kappa", "lambda", "mu",
+	}
+	for trial := range 100 {
+		count := 1 + rng.Intn(60)
+		prompts := make([]promptInfo, 0, count)
+		for i := range count {
+			tokenCount := 4 + rng.Intn(12)
+			tokens := make([]string, tokenCount)
+			for j := range tokenCount {
+				tokens[j] = vocabulary[rng.Intn(len(vocabulary))]
+			}
+			normalized := fmt.Sprintf(
+				"synthetic prompt trial %d item %d", trial, i,
+			)
+			if i > 0 && rng.Intn(8) == 0 {
+				normalized = prompts[rng.Intn(i)].Normalized
+			}
+			prompts = append(prompts, promptInfo{
+				Normalized: normalized,
+				Tokens:     tokens,
+			})
+		}
+
+		assert.Equal(t,
+			countDuplicatePromptsPairwise(prompts),
+			countDuplicatePrompts(prompts),
+			"trial %d", trial,
+		)
+	}
+}
+
+func countDuplicatePromptsPairwise(prompts []promptInfo) int {
+	seen := make([]promptInfo, 0, len(prompts))
+	repeats := 0
+	for _, p := range prompts {
+		if isControlPrompt(p.Normalized) ||
+			len(p.Normalized) < 20 || len(p.Tokens) < 4 {
+			continue
+		}
+		duplicate := false
+		for _, previous := range seen {
+			if p.Normalized == previous.Normalized ||
+				pairwiseJaccard(p.Tokens, previous.Tokens) >= 0.85 {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			repeats++
+			continue
+		}
+		seen = append(seen, p)
+	}
+	return repeats
+}
+
+func pairwiseJaccard(current, previous []string) float64 {
+	currentSet := make(map[string]struct{}, len(current))
+	for _, token := range current {
+		currentSet[token] = struct{}{}
+	}
+	intersections := 0
+	union := len(currentSet)
+	for _, token := range previous {
+		if _, ok := currentSet[token]; ok {
+			intersections++
+		} else {
+			union++
+		}
+	}
+	return float64(intersections) / float64(union)
 }
 
 func TestAnalyzeHeuristics_CodeContext(t *testing.T) {
@@ -346,4 +464,66 @@ func TestCountFrustrationMarkers(t *testing.T) {
 	}
 
 	assert.Equal(t, 2, CountFrustrationMarkers(msgs))
+}
+
+// The prefilter must never reject a prompt the regular expression flags,
+// including prompts whose letters only match under Unicode case folding.
+func TestFrustrationPrefilterAcceptsEveryRegexMatch(t *testing.T) {
+	prompts := []string{
+		"WHY WON'T THIS WORK???!!!",
+		"this is broken after the retry",
+		"Come On, it still fails",
+		"doe\u017f not work",       // long s folds to s
+		"you bro\u212ae the build", // Kelvin sign folds to k
+		"the SAME ERROR shows up",
+		"doesn\u2019t work", // curly apostrophe: regex requires ASCII
+		"Please run the focused test again.",
+		strings.Repeat("a", 5000) + " wtf " + strings.Repeat("b", 5000),
+	}
+	for _, prompt := range prompts {
+		normalized := normalizePrompt(prompt)
+		if frustrationPhraseRe.MatchString(normalized) {
+			assert.True(t, mayContainFrustrationPhrase(normalized), prompt)
+		}
+	}
+	assert.True(t, frustrationPhraseRe.MatchString(normalizePrompt("doe\u017f not work")))
+	assert.False(t, mayContainFrustrationPhrase(normalizePrompt("Please run the focused test again.")))
+}
+
+// After lowercasing, long s is the only non-ASCII rune whose simple fold
+// reaches an ASCII letter; mayContainFrustrationPhrase depends on that.
+func TestLongSIsTheOnlyLowercaseRuneFoldingToASCII(t *testing.T) {
+	var found []rune
+	for r := rune(0x80); r <= unicode.MaxRune; r++ {
+		lower := unicode.ToLower(r)
+		if lower < 0x80 {
+			continue
+		}
+		for f := unicode.SimpleFold(lower); f != lower; f = unicode.SimpleFold(f) {
+			if f < 0x80 {
+				found = append(found, lower)
+				break
+			}
+		}
+	}
+	slices.Sort(found)
+	assert.Equal(t, []rune{'\u017f'}, slices.Compact(found))
+}
+
+func TestStripCodeFencesMatchesRegexp(t *testing.T) {
+	inputs := []string{
+		"",
+		"no fences",
+		"```go\nfunc main() {}\n```",
+		"a ```one``` b ```two``` c",
+		"open ``` never closed",
+		"```a``````b```",
+		"``` ```",
+		"x``````y",
+		"tail ```\n",
+		strings.Repeat("`", 7),
+	}
+	for _, input := range inputs {
+		assert.Equal(t, codeFenceRe.ReplaceAllString(input, " "), stripCodeFences(input), "%q", input)
+	}
 }

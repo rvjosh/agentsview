@@ -67,7 +67,9 @@ func (r *CleanupRegistry) Run(
 }
 
 func retryCleanup(err error) error {
-	if retained, ok := err.(*retainedCleanupError); ok {
+	// Only a top-level aggregate owns the whole error. A nested aggregate may
+	// have joined siblings that also retain resources.
+	if retained, ok := err.(*retainedCleanupError); ok { //nolint:errorlint // Match the owner of the entire error tree, not an arbitrary nested owner.
 		if retained.RetryCleanup() != nil {
 			return retained
 		}
@@ -126,7 +128,7 @@ func cleanupRetriers(err error) []cleanupRetrier {
 			!containsCleanupRetrier(retriers, retrier) {
 			retriers = append(retriers, retrier)
 		}
-		switch wrapped := current.(type) {
+		switch wrapped := current.(type) { //nolint:errorlint // Visit every joined branch; errors.As finds only the first match.
 		case interface{ Unwrap() []error }:
 			stack = append(stack, wrapped.Unwrap()...)
 		case interface{ Unwrap() error }:
@@ -154,6 +156,8 @@ func containsCleanupRetrier(
 			if left.Pointer() == right.Pointer() {
 				return true
 			}
+		default:
+			// Other non-comparable values have no cleanup identity.
 		}
 	}
 	return false

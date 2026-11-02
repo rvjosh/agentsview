@@ -1,10 +1,101 @@
 import { describe, it, expect } from "vite-plus/test";
 import { formatMessageForCopy } from "./copy-message.js";
-import type { Message } from "../api/types/core.js";
+import type { DbMessage as Message } from "../api/generated/index.js";
 
 describe("formatMessageForCopy", () => {
+  it("copies a Bash call's command under a header naming its directory", () => {
+    const msg: Message = {
+      has_context_tokens: false,
+      has_output_tokens: false,
+      id: 1,
+      session_id: "s1",
+      ordinal: 1,
+      role: "assistant",
+      content: "",
+      timestamp: "",
+      has_thinking: false,
+      thinking_text: "",
+      has_tool_use: true,
+      content_length: 0,
+      model: "",
+      context_tokens: 0,
+      output_tokens: 0,
+      is_system: false,
+      tool_calls: [
+        {
+          tool_name: "shell_command",
+          category: "Bash",
+          input_json: JSON.stringify({ command: "make\nmake test", cwd: "/repo" }),
+        },
+      ],
+    };
+    expect(formatMessageForCopy(msg)).toBe("[shell_command] cwd: /repo\n\nmake\nmake test");
+  });
+  it("copies Pi edit operations whole", () => {
+    const newText = "x".repeat(450);
+    const edits = [{ op: "replace", pos: "3:ab", end: "9:cd", lines: [newText] }];
+    const msg: Message = {
+      has_context_tokens: false,
+      has_output_tokens: false,
+      id: 1,
+      session_id: "s1",
+      ordinal: 1,
+      role: "assistant",
+      content: "",
+      timestamp: "",
+      has_thinking: false,
+      thinking_text: "",
+      has_tool_use: true,
+      content_length: 0,
+      model: "",
+      context_tokens: 0,
+      output_tokens: 0,
+      is_system: false,
+      tool_calls: [
+        {
+          tool_name: "edit",
+          category: "Edit",
+          input_json: JSON.stringify({ path: "/repo/a.go", edits }),
+        },
+      ],
+    };
+    const copied = formatMessageForCopy(msg);
+    expect(copied).toContain('"end": "9:cd"');
+    expect(copied).toContain(newText);
+  });
+  it("copies long Bash field values in full", () => {
+    const description = `Run ${"the full integration suite ".repeat(4)}`;
+    const msg: Message = {
+      has_context_tokens: false,
+      has_output_tokens: false,
+      id: 1,
+      session_id: "s1",
+      ordinal: 1,
+      role: "assistant",
+      content: "",
+      timestamp: "",
+      has_thinking: false,
+      thinking_text: "",
+      has_tool_use: true,
+      content_length: 0,
+      model: "",
+      context_tokens: 0,
+      output_tokens: 0,
+      is_system: false,
+      tool_calls: [
+        {
+          tool_name: "Bash",
+          category: "Bash",
+          input_json: JSON.stringify({ command: "make test", description }),
+        },
+      ],
+    };
+    expect(formatMessageForCopy(msg)).toBe(`[Bash] description: ${description}\n\nmake test`);
+  });
   it("includes tool call params", () => {
     const msg: Message = {
+      has_context_tokens: false,
+      has_output_tokens: false,
       id: 1,
       session_id: "s1",
       ordinal: 1,
@@ -41,6 +132,8 @@ describe("formatMessageForCopy", () => {
 
   it("includes Write content", () => {
     const msg: Message = {
+      has_context_tokens: false,
+      has_output_tokens: false,
       id: 2,
       session_id: "s1",
       ordinal: 2,
@@ -74,22 +167,92 @@ describe("formatMessageForCopy", () => {
 
   it("includes kiro-ide Edit with diff key", () => {
     const msg = {
-      id: 3, session_id: "s1", ordinal: 3, role: "assistant",
-      content: "Updating config", timestamp: "",
-      has_thinking: false, thinking_text: "", has_tool_use: true, content_length: 15,
-      model: "", context_tokens: 0, output_tokens: 0, is_system: false,
-      tool_calls: [{
-        tool_name: "Edit", category: "Edit",
-        input_json: JSON.stringify({
-          file: "config.ts",
-          diff: "--- a/config.ts\n+++ b/config.ts\n@@ -1,2 +1,2 @@\n-port: 3000\n+port: 8080",
-        }),
-      }],
+      has_context_tokens: false,
+      has_output_tokens: false,
+      id: 3,
+      session_id: "s1",
+      ordinal: 3,
+      role: "assistant",
+      content: "Updating config",
+      timestamp: "",
+      has_thinking: false,
+      thinking_text: "",
+      has_tool_use: true,
+      content_length: 15,
+      model: "",
+      context_tokens: 0,
+      output_tokens: 0,
+      is_system: false,
+      tool_calls: [
+        {
+          tool_name: "Edit",
+          category: "Edit",
+          input_json: JSON.stringify({
+            file: "config.ts",
+            diff: "--- a/config.ts\n+++ b/config.ts\n@@ -1,2 +1,2 @@\n-port: 3000\n+port: 8080",
+          }),
+        },
+      ],
     } as Message;
     const result = formatMessageForCopy(msg);
     expect(result).toContain("[Edit]");
     expect(result).toContain("file: config.ts");
     expect(result).toContain("-port: 3000");
     expect(result).toContain("+port: 8080");
+  });
+
+  it("includes a raw custom tool input verbatim", () => {
+    const script = '  // setup\ntext(await tools.exec_command({cmd: "echo hello"}));\n';
+    const result = formatMessageForCopy({
+      has_context_tokens: false,
+      has_output_tokens: false,
+      id: 5,
+      session_id: "s1",
+      ordinal: 5,
+      role: "assistant",
+      content: "",
+      timestamp: "",
+      has_thinking: false,
+      thinking_text: "",
+      has_tool_use: true,
+      content_length: 0,
+      model: "",
+      context_tokens: 0,
+      output_tokens: 0,
+      is_system: false,
+      tool_calls: [{ tool_name: "exec", category: "Bash", input_json: script }],
+    });
+    expect(result).toBe(`[exec]\n\n${script}`);
+  });
+
+  it("copies the canonical long path in tool metadata", () => {
+    const path =
+      "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte";
+    const result = formatMessageForCopy({
+      has_context_tokens: false,
+      has_output_tokens: false,
+      id: 4,
+      session_id: "s1",
+      ordinal: 4,
+      role: "assistant",
+      content: "",
+      timestamp: "",
+      has_thinking: false,
+      thinking_text: "",
+      has_tool_use: true,
+      content_length: 0,
+      model: "",
+      context_tokens: 0,
+      output_tokens: 0,
+      is_system: false,
+      tool_calls: [
+        {
+          tool_name: "Read",
+          category: "Read",
+          input_json: JSON.stringify({ file_path: path }),
+        },
+      ],
+    });
+    expect(result).toContain(`file: ${path}`);
   });
 });

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { flushSync, mount, unmount } from "svelte";
 import { EmbeddingsService } from "../../api/generated/index.js";
 import type { VectorBuildStatus } from "../../api/generated/index.js";
@@ -13,13 +13,11 @@ vi.mock("../../api/runtime.js", async (importOriginal) => {
   const orig = await importOriginal<typeof import("../../api/runtime.js")>();
   return {
     ...orig,
-    callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
   };
 });
 
 vi.mock("../../api/generated/index.js", async (importOriginal) => {
-  const orig =
-    await importOriginal<typeof import("../../api/generated/index.js")>();
+  const orig = await importOriginal<typeof import("../../api/generated/index.js")>();
   return {
     ...orig,
     EmbeddingsService: {
@@ -34,9 +32,7 @@ vi.mock("../../utils/clipboard.js", () => ({
 }));
 
 // @ts-ignore
-import SemanticSetupHelp, {
-  __resetResolvedBuildIds,
-} from "./SemanticSetupHelp.svelte";
+import SemanticSetupHelp, { __resetResolvedBuildIds } from "./SemanticSetupHelp.svelte";
 
 const embeddingsService = EmbeddingsService as unknown as {
   getApiV1EmbeddingsStatus: ReturnType<typeof vi.fn>;
@@ -131,20 +127,23 @@ describe("SemanticSetupHelp", () => {
     expect(text()).toContain("Semantic search isn't set up");
     expect(text()).toContain("[vector]");
     expect(text()).toContain("enabled = true");
-    expect(text()).toContain("agentsview embeddings build");
+    expect(text()).toContain("agentsview index embeddings build");
+    expect(text()).toContain(
+      "Already using Nomic with Ollama? Follow the full recipe to keep your index when switching to the shared local server.",
+    );
+    const guide = document.body.querySelector<HTMLAnchorElement>("a");
+    expect(guide?.getAttribute("href")).toBe(
+      "https://agentsview.io/docs/semantic-search/#named-embeddings-servers",
+    );
 
     const copyButtons = document.body.querySelectorAll("button.kit-copy-btn");
     expect(copyButtons.length).toBe(2);
     (copyButtons[0] as HTMLButtonElement).click();
     await settle();
-    expect(mockCopyToClipboard).toHaveBeenCalledWith(
-      expect.stringContaining("[vector.embeddings.servers.local]"),
-    );
+    expect(mockCopyToClipboard).toHaveBeenCalledWith("[vector]\nenabled = true");
     (copyButtons[1] as HTMLButtonElement).click();
     await settle();
-    expect(mockCopyToClipboard).toHaveBeenCalledWith(
-      "agentsview embeddings build",
-    );
+    expect(mockCopyToClipboard).toHaveBeenCalledWith("agentsview index embeddings build");
 
     unmount(component);
   });
@@ -153,9 +152,7 @@ describe("SemanticSetupHelp", () => {
     const reason =
       "vector serving is disabled for this daemon run: another process held " +
       "vectors.write.lock at startup; wait for it to finish, then restart the daemon";
-    embeddingsService.getApiV1EmbeddingsStatus.mockRejectedValue(
-      new ApiError(501, reason),
-    );
+    embeddingsService.getApiV1EmbeddingsStatus.mockRejectedValue(new ApiError(501, reason));
 
     const { component } = mountHelp();
     await settle();
@@ -172,14 +169,14 @@ describe("SemanticSetupHelp", () => {
       "no matching generation",
       "semantic search not available: semantic search: PG has no embedding " +
         "generation matching fingerprint abc123 (present: def456); run " +
-        "'agentsview pg push' from a machine with a matching " +
+        "'agentsview replica pg push' from a machine with a matching " +
         "[vector.embeddings] config",
     ],
     [
       "missing generation chunk table",
       "semantic search not available: semantic search: PG generation 7 " +
         "matches fingerprint abc123 but its chunk table is missing " +
-        "(interrupted push?); re-run 'agentsview pg push' from a machine " +
+        "(interrupted push?); re-run 'agentsview replica pg push' from a machine " +
         "with a matching [vector.embeddings] config",
     ],
   ])(
@@ -195,7 +192,7 @@ describe("SemanticSetupHelp", () => {
       expect(text()).toContain("Semantic search is disabled");
       expect(text()).toContain(reason);
       expect(text()).not.toContain("enabled = true");
-      expect(text()).not.toContain("agentsview embeddings build");
+      expect(text()).not.toContain("agentsview index embeddings build");
 
       unmount(component);
     },
@@ -216,14 +213,10 @@ describe("SemanticSetupHelp", () => {
     embeddingsService.postApiV1EmbeddingsBuild.mockResolvedValueOnce({
       started: true,
     });
-    embeddingsService.getApiV1EmbeddingsStatus.mockResolvedValueOnce(
-      runningStatus(500, 1000),
-    );
+    embeddingsService.getApiV1EmbeddingsStatus.mockResolvedValueOnce(runningStatus(500, 1000));
     build!.click();
     await settle();
-    expect(embeddingsService.postApiV1EmbeddingsBuild).toHaveBeenCalledWith({
-      requestBody: {},
-    });
+    expect(embeddingsService.postApiV1EmbeddingsBuild).toHaveBeenCalledWith({});
     expect(text()).toContain("Building embeddings index...");
 
     await settle(2000);
@@ -241,7 +234,7 @@ describe("SemanticSetupHelp", () => {
   it("shows a specific search 501 reason verbatim in the ready state", async () => {
     const stale =
       "semantic search not available: index is stale (embedding config " +
-      "changed): run 'agentsview embeddings build --full-rebuild'";
+      "changed): run 'agentsview index embeddings build --full-rebuild'";
     embeddingsService.getApiV1EmbeddingsStatus.mockResolvedValueOnce(idleStatus());
 
     const { component } = mountHelp(vi.fn(), stale);
@@ -259,7 +252,7 @@ describe("SemanticSetupHelp", () => {
   it("replaces the generic search 501 message with localized ready copy", async () => {
     const generic =
       "semantic search not available: enable [vector] in config.toml and " +
-      "run 'agentsview embeddings build'";
+      "run 'agentsview index embeddings build'";
     embeddingsService.getApiV1EmbeddingsStatus.mockResolvedValueOnce(idleStatus());
 
     const { component } = mountHelp(vi.fn(), generic);
@@ -328,9 +321,7 @@ describe("SemanticSetupHelp", () => {
     embeddingsService.postApiV1EmbeddingsBuild.mockRejectedValueOnce(
       new ApiError(409, "an embeddings build is already running"),
     );
-    embeddingsService.getApiV1EmbeddingsStatus.mockResolvedValueOnce(
-      idleStatus(),
-    );
+    embeddingsService.getApiV1EmbeddingsStatus.mockResolvedValueOnce(idleStatus());
     const build = [...document.body.querySelectorAll("button")].find((b) =>
       b.textContent?.includes("Build embeddings"),
     );
@@ -345,9 +336,7 @@ describe("SemanticSetupHelp", () => {
   });
 
   it("jumps straight to progress when a build is already running at mount", async () => {
-    embeddingsService.getApiV1EmbeddingsStatus.mockResolvedValueOnce(
-      runningStatus(250, 1000),
-    );
+    embeddingsService.getApiV1EmbeddingsStatus.mockResolvedValueOnce(runningStatus(250, 1000));
 
     const { component } = mountHelp();
     await settle();
@@ -485,16 +474,12 @@ describe("SemanticSetupHelp", () => {
     await settle();
     // Retry starts a build even though the daemon still reports the old
     // last_error; re-probing alone could never clear it.
-    expect(embeddingsService.postApiV1EmbeddingsBuild).toHaveBeenCalledWith({
-      requestBody: {},
-    });
+    expect(embeddingsService.postApiV1EmbeddingsBuild).toHaveBeenCalledWith({});
     expect(text()).toContain("Building embeddings index...");
 
     // The new build finishes cleanly (a later build_id, no last_error), which
     // resolves despite the stale last_error that first put us in "failed".
-    embeddingsService.getApiV1EmbeddingsStatus.mockResolvedValueOnce(
-      idleStatus({ build_id: 5 }),
-    );
+    embeddingsService.getApiV1EmbeddingsStatus.mockResolvedValueOnce(idleStatus({ build_id: 5 }));
     await settle(2000);
     expect(onResolved).toHaveBeenCalledOnce();
 
@@ -502,9 +487,7 @@ describe("SemanticSetupHelp", () => {
   });
 
   it("re-probes rather than building when the failure came from the status call", async () => {
-    embeddingsService.getApiV1EmbeddingsStatus.mockRejectedValueOnce(
-      new Error("network down"),
-    );
+    embeddingsService.getApiV1EmbeddingsStatus.mockRejectedValueOnce(new Error("network down"));
 
     const { component } = mountHelp();
     await settle();

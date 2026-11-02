@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
 import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import { render, screen, fireEvent } from "@testing-library/svelte";
 import { tick } from "svelte";
@@ -13,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   setAgent: vi.fn(),
   navigate: vi.fn(),
   agent: "claude" as string,
+  requestAgent: undefined as string | undefined,
   serverVersion: {
     read_only: false,
   } as {
@@ -24,8 +27,6 @@ vi.mock("../../api/generated/index", () => ({
   InsightsService: { getApiV1Insights: mocks.getInsights },
 }));
 vi.mock("../../api/runtime.js", () => ({
-  configureGeneratedClient: vi.fn(),
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
   isAbortError: vi.fn(() => false),
 }));
 vi.mock("../../api/client.js", () => ({
@@ -48,11 +49,16 @@ vi.mock("../../stores/insights.svelte.js", () => ({
     get agent() {
       return mocks.agent;
     },
+    get requestAgent() {
+      return mocks.requestAgent;
+    },
   },
 }));
 vi.mock("../../stores/router.svelte.js", () => ({
-  router: { navigate: mocks.navigate },
-  getBasePath: () => "",
+  router: {
+    navigate: mocks.navigate,
+    buildHref: () => "/recall?tab=generated",
+  },
 }));
 
 import ActivityInsight from "./ActivityInsight.svelte";
@@ -75,6 +81,7 @@ beforeEach(() => {
   }
   mocks.serverVersion = { read_only: false };
   mocks.agent = "claude";
+  mocks.requestAgent = undefined;
   mocks.getInsights.mockResolvedValue({ insights: [] });
 });
 
@@ -83,13 +90,24 @@ function settle() {
 }
 
 describe("ActivityInsight", () => {
+  it("reports the insight kind when generation fails", async () => {
+    mocks.generateInsight.mockImplementation(() => ({
+      abort: vi.fn(),
+      done: Promise.reject(new Error("Generation failed")),
+    }));
+    render(ActivityInsight, { dateFrom: "2026-06-15", dateTo: "2026-06-21" });
+    await settle();
+    await fireEvent.click(screen.getByRole("button", { name: /generate/i }));
+    await vi.waitFor(() => expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("insight"));
+  });
+
   it("fetches insights with both date bounds (full identity)", async () => {
     render(ActivityInsight, { dateFrom: "2026-06-15", dateTo: "2026-06-21" });
     await settle();
-    expect(mocks.getInsights).toHaveBeenCalledWith({
+    expect(mocks.getInsights.mock.lastCall?.[0]).toEqual({
       type: "daily_activity",
-      dateFrom: "2026-06-15",
-      dateTo: "2026-06-21",
+      date_from: "2026-06-15",
+      date_to: "2026-06-21",
     });
   });
 
@@ -115,7 +133,7 @@ describe("ActivityInsight", () => {
     expect(screen.getByRole("button", { name: /generate/i })).toBeTruthy();
   });
 
-  it("generates for the current range", async () => {
+  it("generates for the current range using the server's default agent", async () => {
     mocks.generateInsight.mockReturnValue({
       abort: vi.fn(),
       done: new Promise(() => {}),
@@ -128,7 +146,7 @@ describe("ActivityInsight", () => {
         type: "daily_activity",
         date_from: "2026-06-15",
         date_to: "2026-06-21",
-        agent: "claude",
+        agent: undefined,
       }),
       expect.any(Function),
     );
@@ -146,6 +164,7 @@ describe("ActivityInsight", () => {
 
   it("generates with the selected agent, not a hardcoded one", async () => {
     mocks.agent = "codex";
+    mocks.requestAgent = "codex";
     mocks.generateInsight.mockReturnValue({
       abort: vi.fn(),
       done: new Promise(() => {}),
@@ -201,18 +220,20 @@ describe("ActivityInsight", () => {
     expect(document.body.textContent).not.toContain("STALE RESULT");
   });
 
-  it("prefills the Insights page range and navigates", async () => {
+  it("prefills Generated insights scope and navigates", async () => {
     render(ActivityInsight, { dateFrom: "2026-06-15", dateTo: "2026-06-21" });
     await settle();
     const link = screen.getByRole("link", {
-      name: /insights page|open in insights/i,
+      name: /generated insights|open in recall/i,
     });
     await fireEvent.click(link);
     expect(mocks.setType).toHaveBeenCalledWith("daily_activity");
     expect(mocks.setDateFrom).toHaveBeenCalledWith("2026-06-15");
     expect(mocks.setDateTo).toHaveBeenCalledWith("2026-06-21");
     expect(mocks.setProject).toHaveBeenCalledWith("");
-    expect(mocks.navigate).toHaveBeenCalledWith("insights");
+    expect(mocks.navigate).toHaveBeenCalledWith("recall", {
+      tab: "generated",
+    });
   });
 
   it("disables Generate when the server version is unavailable", async () => {
@@ -221,6 +242,16 @@ describe("ActivityInsight", () => {
     await settle();
     const btn = screen.getByRole("button", { name: /generate/i });
     expect(btn.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("disables Generate when a writable server denies the capability", async () => {
+    mocks.serverVersion = { read_only: false, insight_generation_available: false };
+    render(ActivityInsight, { dateFrom: "2026-06-15", dateTo: "2026-06-21" });
+    await settle();
+    const btn = screen.getByRole("button", { name: /generate/i });
+    expect(btn.hasAttribute("disabled")).toBe(true);
+    await fireEvent.click(btn);
+    expect(mocks.generateInsight).not.toHaveBeenCalled();
   });
 
   it("allows Generate in read-only mode when insight generation is advertised", async () => {

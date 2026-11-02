@@ -1,80 +1,59 @@
 <script lang="ts">
+  import { Chart, Group, Layer, Rect, Text } from "layerchart";
+  import { Treemap as LayerTreemap } from "layerchart/hierarchy";
+  import { hierarchy } from "d3-hierarchy";
   import { m } from "../../i18n/index.js";
-  import { squarify } from "../../utils/treemap.js";
+  import type { SeriesStyle } from "@kenn-io/kit-ui/utils/palette";
+  import { formatMoney, moneyFromMicrodollars } from "../../money.js";
+  import { seriesPaint } from "../../utils/seriesPaint.js";
+  import SeriesPatternDefs from "../shared/SeriesPatternDefs.svelte";
+  import { treemapLabelSize, type TreemapLabelScale } from "./treemapLabelSize.js";
 
   interface TreemapItem {
     id: string;
     label: string;
     value: number;
-    color: string;
+    style: Pick<SeriesStyle, "color" | "fill">;
     meta?: string;
+    title?: string;
+    selected?: boolean;
+    dimmed?: boolean;
   }
 
   interface Props {
     items: TreemapItem[];
     height?: number;
     onSelect?: (id: string) => void;
+    onOpen?: (id: string) => void;
+    formatValue?: (value: number) => string;
+    labelScale?: TreemapLabelScale;
   }
 
-  const { items, height = 260, onSelect }: Props = $props();
+  const uid = $props.id();
 
-  let containerEl: HTMLDivElement | undefined = $state();
-  let width = $state(600);
-
-  $effect(() => {
-    if (!containerEl) return;
-    const ro = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (entry) {
-        width = Math.floor(entry.contentRect.width);
-      }
-    });
-    ro.observe(containerEl);
-    return () => ro.disconnect();
-  });
-
-  function formatCost(v: number): string {
-    if (v >= 100) return `$${v.toFixed(0)}`;
-    return `$${v.toFixed(2)}`;
+  function formatCost(value: number): string {
+    return formatMoney(moneyFromMicrodollars(value));
   }
 
-  interface Tile {
-    id: string;
-    label: string;
-    value: number;
-    color: string;
-    meta?: string;
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  }
+  const {
+    items,
+    height = 260,
+    onSelect,
+    onOpen,
+    formatValue = formatCost,
+    labelScale = "sqrt",
+  }: Props = $props();
 
-  const tiles = $derived.by((): Tile[] => {
-    if (items.length === 0 || width <= 0 || height <= 0) {
-      return [];
-    }
-    const input = items.map((d) => ({
-      id: d.id,
-      value: d.value,
-    }));
-    const layout = squarify(input, width, height);
-    const byId = new Map(items.map((d) => [d.id, d]));
-    return layout.map((t) => {
-      const src = byId.get(t.id)!;
-      return {
-        id: t.id,
-        label: src.label,
-        value: src.value,
-        color: src.color,
-        meta: src.meta,
-        x: t.x,
-        y: t.y,
-        width: t.width,
-        height: t.height,
-      };
-    });
-  });
+  const root = $derived.by(() =>
+    hierarchy<{ children?: TreemapItem[]; value?: number }>({ children: items })
+      .sum((item) => item.value ?? 0)
+      .sort((a, b) => (b.value ?? 0) - (a.value ?? 0))
+  );
+
+  const total = $derived(root.value ?? 0);
+
+  let measuredWidth = $state(0);
+  const chartWidth = $derived(measuredWidth > 0 ? measuredWidth : 600);
 
   function handleKey(e: KeyboardEvent, id: string) {
     if (e.key === "Enter" || e.key === " ") {
@@ -84,81 +63,62 @@
   }
 </script>
 
-<div class="treemap-container" bind:this={containerEl}>
-<svg
-  width="100%"
-  {height}
-  class="treemap"
-  viewBox="0 0 {width} {height}"
-  preserveAspectRatio="none"
->
-  {#each tiles as tile, i (tile.id)}
-    {@const large = tile.width > 60 && tile.height > 40}
-    {@const medium = tile.width > 40 && tile.height > 20}
-    {@const clipId = `tile-clip-${i}`}
-    <clipPath id={clipId}>
-      <rect
-        x={tile.x}
-        y={tile.y}
-        width={tile.width}
-        height={tile.height}
-      />
-    </clipPath>
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <g
-      class="tile"
-      tabindex="0"
-      role="button"
-      aria-label={m.usage_hide_from_chart({ label: tile.label })}
-      onclick={() => onSelect?.(tile.id)}
-      onkeydown={(e) => handleKey(e, tile.id)}
-      clip-path="url(#{clipId})"
-    >
-      <title>{m.usage_click_to_hide({ label: tile.label })}</title>
-      <rect
-        x={tile.x}
-        y={tile.y}
-        width={tile.width}
-        height={tile.height}
-        rx="3"
-        fill={tile.color}
-      />
-      {#if large}
-        <text
-          x={tile.x + 6}
-          y={tile.y + 16}
-          class="tile-label"
-        >
-          {tile.label}
-        </text>
-        <text
-          x={tile.x + 6}
-          y={tile.y + 30}
-          class="tile-value"
-        >
-          {formatCost(tile.value)}
-        </text>
-        {#if tile.meta}
-          <text
-            x={tile.x + 6}
-            y={tile.y + 42}
-            class="tile-meta"
-          >
-            {tile.meta}
-          </text>
-        {/if}
-      {:else if medium}
-        <text
-          x={tile.x + 4}
-          y={tile.y + 14}
-          class="tile-label-sm"
-        >
-          {tile.label}
-        </text>
-      {/if}
-    </g>
-  {/each}
-</svg>
+<div class="treemap-container" bind:clientWidth={measuredWidth}>
+  <Chart width={chartWidth} {height} padding={0}>
+    <Layer class="treemap" title={m.usage_treemap()}>
+      <SeriesPatternDefs scope={uid} styles={items.map((item) => item.style)} />
+      <LayerTreemap hierarchy={root} padding={2}>
+        {#snippet children({ nodes })}
+          {#each nodes.filter((node) => node.depth === 1) as node, index ((node.data as TreemapItem).id)}
+            {@const tile = node.data as TreemapItem}
+            {@const tileWidth = node.x1 - node.x0}
+            {@const tileHeight = node.y1 - node.y0}
+            {@const large = tileWidth > 60 && tileHeight > 40}
+            {@const medium = tileWidth > 40 && tileHeight > 20}
+            {@const clipId = `${uid}-tile-${index}`}
+            <clipPath id={clipId}>
+              <rect x={node.x0} y={node.y0} width={tileWidth} height={tileHeight} />
+            </clipPath>
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex (Only selectable tiles receive a button role and tab stop.) -->
+            <g
+              class="tile"
+              class:dimmed={tile.dimmed}
+              class:patterned={tile.style.fill !== "solid"}
+              style:--tile-color={tile.style.color}
+              clip-path={`url(#${clipId})`}
+              tabindex={onSelect ? 0 : undefined}
+              role={onSelect ? "button" : undefined}
+              aria-pressed={onSelect ? tile.selected ?? false : undefined}
+              aria-label={onSelect ? tile.title ?? m.usage_click_to_focus({ label: tile.label }) : undefined}
+              onclick={onSelect ? (event) => { if (event.detail < 2 || !onOpen) onSelect(tile.id); } : undefined}
+              ondblclick={onOpen ? () => onOpen(tile.id) : undefined}
+              onkeydown={onSelect ? (event) => handleKey(event, tile.id) : undefined}
+            >
+              <title>{tile.title ?? m.usage_click_to_focus({ label: tile.label })}</title>
+              <Group x={node.x0} y={node.y0}>
+                <Rect
+                  width={tileWidth}
+                  height={tileHeight}
+                  rx={3}
+                  fill={seriesPaint(uid, tile.style)}
+                />
+                {#if large}
+                  {@const fontSize = treemapLabelSize(tile.value, total, tileHeight, labelScale)}
+                  <Text value={tile.label} x={6} y={fontSize + 5} width={tileWidth - 12} truncate class="tile-label" style={`font-size: ${fontSize}px`} />
+                  <Text value={formatValue(tile.value)} x={6} y={fontSize + 19} width={tileWidth - 12} truncate class="tile-value" />
+                  {#if tile.meta}
+                    <Text value={tile.meta} x={6} y={fontSize + 31} width={tileWidth - 12} truncate class="tile-meta" />
+                  {/if}
+                {:else if medium}
+                  <Text value={tile.label} x={4} y={14} width={tileWidth - 8} truncate class="tile-label-sm" />
+                {/if}
+              </Group>
+            </g>
+          {/each}
+        {/snippet}
+      </LayerTreemap>
+    </Layer>
+  </Chart>
 </div>
 
 <style>
@@ -167,28 +127,53 @@
     min-height: 0;
   }
 
-  .treemap {
+  .treemap-container :global(.treemap) {
     display: block;
   }
 
-  .tile {
+  .treemap-container :global(.tile) {
+    touch-action: manipulation;
+  }
+
+  /* On a patterned tile, a halo in the tile's color keeps labels clear of
+     the pattern lines. */
+  .treemap-container :global(.tile.patterned text) {
+    paint-order: stroke;
+    stroke: var(--tile-color);
+    stroke-width: 3px;
+    stroke-linejoin: round;
+  }
+
+  .treemap-container :global(.tile.dimmed) {
+    opacity: 0.35;
+  }
+
+  .treemap-container :global(.tile[role="button"]) {
     cursor: pointer;
   }
 
-  .tile:hover rect {
+  .treemap-container :global(.tile[role="button"]:hover rect) {
     opacity: 0.92;
   }
 
-  .tile:focus-visible {
-    outline: none;
-  }
-
-  .tile:focus-visible rect {
-    stroke: white;
+  .treemap-container :global(.tile rect) {
+    stroke: transparent;
     stroke-width: 2;
   }
 
-  .tile-label {
+  .treemap-container :global(.tile:focus-visible) {
+    outline: none;
+  }
+
+  .treemap-container :global(.tile:focus-visible rect) {
+    stroke: white;
+  }
+
+  .treemap-container :global(.tile[aria-pressed="true"] rect) {
+    stroke: white;
+  }
+
+  .treemap-container :global(.tile-label) {
     fill: white;
     font-size: 11px;
     font-weight: 600;
@@ -196,7 +181,7 @@
     pointer-events: none;
   }
 
-  .tile-value {
+  .treemap-container :global(.tile-value) {
     /* White regardless of theme: drawn over saturated per-agent tile fills */
     fill: white;
     fill-opacity: 0.85;
@@ -206,7 +191,7 @@
     pointer-events: none;
   }
 
-  .tile-meta {
+  .treemap-container :global(.tile-meta) {
     /* White regardless of theme: drawn over saturated per-agent tile fills */
     fill: white;
     fill-opacity: 0.7;
@@ -215,7 +200,7 @@
     pointer-events: none;
   }
 
-  .tile-label-sm {
+  .treemap-container :global(.tile-label-sm) {
     fill: white;
     font-size: 9px;
     font-weight: 500;

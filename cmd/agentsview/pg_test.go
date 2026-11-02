@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,34 +13,25 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/parser"
-	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 func loadPGServeConfigForTest(t *testing.T, args ...string) (config.Config, string, error) {
 	t.Helper()
-	cmd := newPGServeCommand()
+	cmd := newReplicaServeCommand(pgReplica{})
 	if err := cmd.Flags().Parse(args); err != nil {
 		return config.Config{}, "", err
 	}
-	return loadPGServeConfig(cmd)
-}
-
-func restoreTestLogger(t *testing.T) {
-	t.Helper()
-	oldWriter := log.Writer()
-	t.Cleanup(func() {
-		if file, ok := log.Writer().(*os.File); ok && file != os.Stderr && file != os.Stdout {
-			_ = file.Close()
-		}
-		log.SetOutput(oldWriter)
-	})
+	return loadReplicaServeConfig(cmd)
 }
 
 func clearConfiguredAgentEnvVars(t *testing.T) {
 	t.Helper()
 	for _, def := range parser.Registry {
-		if def.EnvVar != "" {
-			t.Setenv(def.EnvVar, "")
+		for _, name := range []string{def.EnvVar, def.NativeEnvVar, def.DefaultRootEnvVar} {
+			if name != "" {
+				t.Setenv(name, "")
+			}
 		}
 	}
 }
@@ -126,8 +116,7 @@ func TestPGServeConfigAcceptsManagedCaddyFlags(t *testing.T) {
 	require.NoError(t, err, "loadPGServeConfigForTest")
 	assert.Equal(t, "caddy", cfg.Proxy.Mode)
 	assert.Equal(t, "https://viewer.example.test:8443", cfg.PublicURL)
-	assert.Equal(t,
-		"https://app.example.test,https://viewer.example.test:8443",
+	assert.Equal(t, "https://app.example.test,https://viewer.example.test:8443",
 		strings.Join(cfg.PublicOrigins, ","))
 	assert.Equal(t, "/usr/local/bin/caddy", cfg.Proxy.Bin)
 	assert.Equal(t, "0.0.0.0", cfg.Proxy.BindHost)
@@ -145,7 +134,7 @@ func TestRunPGPush_IgnoresBrokenUnselectedTarget(t *testing.T) {
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
@@ -160,7 +149,7 @@ url = "postgres://archive"
 
 	var err error
 	out := captureStdout(t, func() {
-		err = runPGPush(PGPushConfig{}, "archive")
+		err = runReplicaPush(pgReplica{}, ReplicaPushConfig{}, "archive")
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pg connection to archive permits plaintext")
@@ -174,7 +163,7 @@ func TestRunPGStatus_IgnoresBrokenUnselectedTarget(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
@@ -187,7 +176,7 @@ machine_name = "workbox"
 url = "postgres://archive"
 `)
 
-	err := runPGStatus("archive", PGStatusConfig{})
+	err := runReplicaStatus(t.Context(), pgReplica{}, "archive", ReplicaStatusConfig{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pg connection to archive permits plaintext")
 	assert.Contains(t, err.Error(), "allow_insecure = true under [pg] or [pg.NAME]")
@@ -200,7 +189,7 @@ func TestRunPGStatus_IgnoresUnreadableLocalWatermark(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
 
@@ -213,7 +202,7 @@ url = "postgres://archive"
 		0o600,
 	))
 
-	err := runPGStatus("archive", PGStatusConfig{})
+	err := runReplicaStatus(t.Context(), pgReplica{}, "archive", ReplicaStatusConfig{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pg connection to archive permits plaintext")
 	assert.Contains(t, err.Error(), "allow_insecure = true under [pg] or [pg.NAME]")
@@ -227,7 +216,7 @@ func TestRunPGPushAll_AggregatesTargetFailures(t *testing.T) {
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "work"
@@ -240,7 +229,7 @@ machine_name = "workbox"
 url = "postgres://archive"
 `)
 
-	err := runPGPush(PGPushConfig{AllTargets: true}, "")
+	err := runReplicaPush(pgReplica{}, ReplicaPushConfig{AllTargets: true}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "2 pg target(s) failed")
 	assert.Contains(t, err.Error(), "work (default): expanding url: environment variable(s) not set: BROKEN_WORK_TARGET")
@@ -253,7 +242,7 @@ func TestRunPGStatusAll_AggregatesTargetFailures(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	restoreUnsetEnv(t, "BROKEN_WORK_TARGET")
 	writeTestConfig(t, dataDir, `
 default_pg = "work"
@@ -266,7 +255,7 @@ machine_name = "workbox"
 url = "postgres://archive"
 `)
 
-	err := runPGStatus("", PGStatusConfig{AllTargets: true})
+	err := runReplicaStatus(t.Context(), pgReplica{}, "", ReplicaStatusConfig{AllTargets: true})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "2 pg target(s) failed")
 	assert.Contains(t, err.Error(), "work (default): expanding url: environment variable(s) not set: BROKEN_WORK_TARGET")
@@ -280,7 +269,7 @@ func TestPGPushCommandPrefixesErrors(t *testing.T) {
 	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
 
@@ -304,7 +293,7 @@ func TestPGStatusCommandPrefixesErrors(t *testing.T) {
 	t.Setenv("AGENTSVIEW_DATA_DIR", dataDir)
 	clearConfiguredAgentEnvVars(t)
 	isolateDefaultAgentDirs(t, dataDir)
-	restoreTestLogger(t)
+	restoreTestLogOutput(t)
 	writeTestConfig(t, dataDir, `
 default_pg = "archive"
 
@@ -320,7 +309,7 @@ url = "postgres://archive"
 func TestRunPGServeRejectsInvalidManagedCaddyConfigBeforePGSetup(t *testing.T) {
 	dataDir := t.TempDir()
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestRunPGServeHelperProcess", "--",
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=TestRunPGServeHelperProcess", "--",
 		"--host", "0.0.0.0",
 		"--public-url", "https://viewer.example.test",
 		"--proxy", "caddy",
@@ -339,7 +328,7 @@ func TestRunPGServeRejectsInvalidManagedCaddyConfigBeforePGSetup(t *testing.T) {
 func TestRunPGServeNonLoopbackWithoutProxyFallsThroughToPGConfig(t *testing.T) {
 	dataDir := t.TempDir()
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestRunPGServeHelperProcess", "--",
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=TestRunPGServeHelperProcess", "--",
 		"--host", "0.0.0.0",
 		"--port", "8081",
 	)
@@ -371,17 +360,17 @@ func TestRunPGServeHelperProcess(t *testing.T) {
 	}
 	require.NotEqual(t, -1, sep, "missing argument separator")
 
-	cmd := newPGServeCommand()
+	cmd := newReplicaServeCommand(pgReplica{})
 	require.NoError(t, cmd.Flags().Parse(args[sep+1:]))
-	cfg, basePath, err := loadPGServeConfig(cmd)
+	cfg, basePath, err := loadReplicaServeConfig(cmd)
 	require.NoError(t, err)
-	runPGServe(cfg, basePath)
+	runReplicaServe(pgReplica{}, cfg, basePath, nil)
 }
 
 func TestWritePGPushSummaryIncludesSkippedConflicts(t *testing.T) {
 	var out bytes.Buffer
 
-	writePGPushSummary(&out, postgres.PushResult{
+	writeReplicaPushSummary(&out, "PostgreSQL", storage.PushResult{
 		SessionsPushed:   3,
 		MessagesPushed:   9,
 		SkippedConflicts: 2,
@@ -395,16 +384,71 @@ func TestWritePGPushSummaryIncludesSkippedConflicts(t *testing.T) {
 		"Warning: skipped 2 session(s) owned by another PostgreSQL push marker")
 }
 
+// A resumed full push reports the sessions the unfinished run already
+// pushed apart from sessions that were simply unchanged.
+func TestWritePGPushSummaryReportsResumedSessions(t *testing.T) {
+	var out bytes.Buffer
+
+	writeReplicaPushSummary(&out, "PostgreSQL", storage.PushResult{
+		SessionsPushed: 1,
+		SkippedResumed: 7,
+		Duration:       time.Second,
+	})
+
+	assert.Contains(t, out.String(),
+		"Skipped 7 session(s) already pushed by the unfinished full push")
+}
+
+// Ownership conflicts must not hide how many sessions the unfinished full
+// push already finished.
+func TestWritePGPushSummaryReportsResumedSessionsWithConflicts(t *testing.T) {
+	var out bytes.Buffer
+
+	writeReplicaPushSummary(&out, "PostgreSQL", storage.PushResult{
+		SessionsPushed:   1,
+		SkippedConflicts: 2,
+		SkippedResumed:   7,
+		Duration:         time.Second,
+	})
+
+	got := out.String()
+	assert.Contains(t, got,
+		"Warning: skipped 2 session(s) owned by another PostgreSQL push marker")
+	assert.Contains(t, got,
+		"Skipped 7 session(s) already pushed by the unfinished full push")
+}
+
+// A full push prints why it ran, so a requested full push that discarded an
+// unfinished one says so on the console rather than only in the log.
+func TestWritePGPushSummaryReportsFullPushReason(t *testing.T) {
+	var discarded bytes.Buffer
+	writeReplicaPushSummary(&discarded, "PostgreSQL", storage.PushResult{
+		SessionsPushed: 3,
+		Full:           true,
+		FullReason:     "requested; discarded an unfinished full push",
+		Duration:       time.Second,
+	})
+	assert.Contains(t, discarded.String(),
+		"PostgreSQL push mode: full (requested; discarded an unfinished full push)")
+
+	var incremental bytes.Buffer
+	writeReplicaPushSummary(&incremental, "PostgreSQL", storage.PushResult{
+		SessionsPushed: 3,
+		Duration:       time.Second,
+	})
+	assert.NotContains(t, incremental.String(), "push mode")
+}
+
 func TestWritePGPushSummaryVectorPhase(t *testing.T) {
 	tests := []struct {
 		name        string
-		vectors     postgres.VectorPushResult
+		vectors     storage.VectorPushResult
 		wantContain []string
 		wantAbsent  []string
 	}{
 		{
 			name: "counters",
-			vectors: postgres.VectorPushResult{
+			vectors: storage.VectorPushResult{
 				SessionsPushed:    2,
 				SessionsUnchanged: 5,
 				DocsPushed:        7,
@@ -417,7 +461,7 @@ func TestWritePGPushSummaryVectorPhase(t *testing.T) {
 		},
 		{
 			name: "skipped with reason",
-			vectors: postgres.VectorPushResult{
+			vectors: storage.VectorPushResult{
 				Skipped:       true,
 				SkippedReason: "pgvector extension unavailable",
 			},
@@ -425,12 +469,12 @@ func TestWritePGPushSummaryVectorPhase(t *testing.T) {
 		},
 		{
 			name:       "skipped without reason prints nothing",
-			vectors:    postgres.VectorPushResult{Skipped: true},
+			vectors:    storage.VectorPushResult{Skipped: true},
 			wantAbsent: []string{"Vectors:"},
 		},
 		{
 			name: "conflicts warning",
-			vectors: postgres.VectorPushResult{
+			vectors: storage.VectorPushResult{
 				SessionsPushed: 1,
 				Conflicts:      3,
 			},
@@ -441,7 +485,7 @@ func TestWritePGPushSummaryVectorPhase(t *testing.T) {
 		},
 		{
 			name: "deferred warning",
-			vectors: postgres.VectorPushResult{
+			vectors: storage.VectorPushResult{
 				SessionsPushed:   1,
 				SessionsDeferred: 2,
 			},
@@ -454,7 +498,7 @@ func TestWritePGPushSummaryVectorPhase(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer
-			writePGPushSummary(&out, postgres.PushResult{
+			writeReplicaPushSummary(&out, "PostgreSQL", storage.PushResult{
 				SessionsPushed: 1,
 				MessagesPushed: 1,
 				Duration:       time.Second,
@@ -474,13 +518,13 @@ func TestWritePGPushSummaryVectorPhase(t *testing.T) {
 func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 	tests := []struct {
 		name        string
-		result      postgres.PushResult
+		result      storage.PushResult
 		wantContain []string
 		wantAbsent  []string
 	}{
 		{
 			name: "conflicts with errors",
-			result: postgres.PushResult{
+			result: storage.PushResult{
 				SessionsPushed:   3,
 				MessagesPushed:   9,
 				SkippedConflicts: 2,
@@ -494,7 +538,7 @@ func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 		},
 		{
 			name: "conflicts without errors omits error count",
-			result: postgres.PushResult{
+			result: storage.PushResult{
 				SessionsPushed:   3,
 				MessagesPushed:   9,
 				SkippedConflicts: 2,
@@ -507,7 +551,7 @@ func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 		},
 		{
 			name: "errors without conflicts",
-			result: postgres.PushResult{
+			result: storage.PushResult{
 				SessionsPushed: 5,
 				MessagesPushed: 12,
 				Errors:         1,
@@ -518,7 +562,7 @@ func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 		},
 		{
 			name: "clean run omits error count",
-			result: postgres.PushResult{
+			result: storage.PushResult{
 				SessionsPushed: 5,
 				MessagesPushed: 12,
 				Duration:       2 * time.Second,
@@ -530,7 +574,7 @@ func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer
-			writePGPushSummary(&out, tt.result)
+			writeReplicaPushSummary(&out, "PostgreSQL", tt.result)
 			got := out.String()
 			for _, want := range tt.wantContain {
 				assert.Contains(t, got, want)
@@ -548,19 +592,19 @@ func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 // the scrollback instead of being overwritten by the next stage.
 func TestPGPushProgressPrinterKeepsCompletedStages(t *testing.T) {
 	out := captureStdout(t, func() {
-		print := newPGPushProgressPrinter()
-		print(postgres.PushProgress{Phase: "preparing"})
-		print(postgres.PushProgress{Phase: "preparing"})
-		print(postgres.PushProgress{
+		writeProgress := newReplicaPushProgressPrinter()
+		writeProgress(storage.PushProgress{Phase: "preparing"})
+		writeProgress(storage.PushProgress{Phase: "preparing"})
+		writeProgress(storage.PushProgress{
 			Phase: "preparing", SessionsDone: 500, SessionsTotal: 1000,
 		})
-		print(postgres.PushProgress{
+		writeProgress(storage.PushProgress{
 			Phase: "preparing", SessionsDone: 1000, SessionsTotal: 1000,
 		})
-		print(postgres.PushProgress{
+		writeProgress(storage.PushProgress{
 			SessionsDone: 1, SessionsTotal: 9, MessagesDone: 5,
 		})
-		print(postgres.PushProgress{
+		writeProgress(storage.PushProgress{
 			Phase: "vectors", VectorSessionsDone: 1,
 			VectorSessionsTotal: 2, VectorChunksPushed: 3,
 		})

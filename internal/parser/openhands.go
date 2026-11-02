@@ -1,9 +1,10 @@
 package parser
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -110,6 +111,7 @@ func OpenHandsSnapshot(path string) (FileInfo, error) {
 // parseSession parses a single OpenHands CLI conversation
 // directory into a session and messages.
 func (p *openHandsProvider) parseSession(
+	ctx context.Context,
 	path, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
 	sessionDir, err := normalizeOpenHandsSessionPath(path)
@@ -239,7 +241,7 @@ func (p *openHandsProvider) parseSession(
 
 	project := ""
 	if cwd != "" {
-		project = ExtractProjectFromCwd(cwd)
+		project = ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
 	}
 	if project == "" {
 		project = "openhands"
@@ -273,10 +275,10 @@ func parseOpenHandsMessageEvent(
 		return ParsedMessage{}, false, ""
 	}
 
-	content, _, _, _, toolCalls, toolResults :=
-		ExtractTextContent(llmMessage.Get("content"))
+	content, thinking, dialogue, blockThinking, _, toolCalls, toolResults := ExtractTextContent(context.Background(), llmMessage.Get("content"))
+	eventThinking := openHandsThinkingText(ev)
 	content, hasThinking := openHandsAppendThinking(
-		content, ev,
+		content, eventThinking,
 	)
 	content = strings.TrimSpace(content)
 	if content == "" &&
@@ -289,8 +291,10 @@ func parseOpenHandsMessageEvent(
 		Ordinal:       ordinal,
 		Role:          role,
 		Content:       content,
+		DialogueText:  new(strings.TrimSpace(dialogue)),
+		ThinkingText:  joinNonEmpty(thinking, eventThinking),
 		Timestamp:     ts,
-		HasThinking:   hasThinking,
+		HasThinking:   hasThinking || blockThinking,
 		HasToolUse:    len(toolCalls) > 0,
 		ContentLength: len(content),
 		ToolCalls:     toolCalls,
@@ -324,15 +328,14 @@ func parseOpenHandsActionEvent(
 		inputJSON = action.Raw
 	}
 
-	content := openHandsText(ev.Get("thought"))
-	content = joinOpenHandsParts(
-		content,
-		formatOpenHandsAction(
-			toolName, action, ev.Get("summary").Str,
-		),
+	content, thinking, dialogue, blockThinking, _, _, _ := ExtractTextContent(context.Background(), ev.Get("thought"))
+	rendering := formatOpenHandsAction(
+		toolName, action, ev.Get("summary").Str,
 	)
+	content = joinOpenHandsParts(content, rendering)
+	eventThinking := openHandsThinkingText(ev)
 	content, hasThinking := openHandsAppendThinking(
-		content, ev,
+		content, eventThinking,
 	)
 	content = strings.TrimSpace(content)
 	if content == "" {
@@ -343,8 +346,10 @@ func parseOpenHandsActionEvent(
 		Ordinal:       ordinal,
 		Role:          RoleAssistant,
 		Content:       content,
+		DialogueText:  new(strings.TrimSpace(dialogue)),
+		ThinkingText:  joinNonEmpty(thinking, eventThinking),
 		Timestamp:     ts,
-		HasThinking:   hasThinking,
+		HasThinking:   hasThinking || blockThinking,
 		HasToolUse:    true,
 		ContentLength: len(content),
 		Model:         model,
@@ -353,6 +358,7 @@ func parseOpenHandsActionEvent(
 			ToolName:  toolName,
 			Category:  openHandsToolCategory(toolName, action),
 			InputJSON: inputJSON,
+			Rendering: strings.TrimSpace(rendering),
 		}},
 	}
 	return msg, true, openHandsActionCwd(toolName, action)
@@ -381,6 +387,7 @@ func parseOpenHandsObservationEvent(
 			Ordinal:       ordinal,
 			Role:          RoleUser,
 			Content:       display,
+			SourceSubtype: SourceSubtypeToolResult,
 			Timestamp:     ts,
 			ContentLength: len(display),
 		}, true, workingDir
@@ -428,15 +435,9 @@ func openHandsBaseStateCwd(base gjson.Result) string {
 	return ""
 }
 
-func openHandsText(content gjson.Result) string {
-	text, _, _, _, _, _ := ExtractTextContent(content)
-	return strings.TrimSpace(text)
-}
-
 func openHandsAppendThinking(
-	content string, ev gjson.Result,
+	content, thinking string,
 ) (string, bool) {
-	thinking := openHandsThinkingText(ev)
 	if thinking == "" {
 		return content, false
 	}
@@ -501,7 +502,7 @@ func formatOpenHandsAction(
 				"[Bash: %s]\n$ %s", summary, cmd,
 			)
 		}
-		return fmt.Sprintf("[Bash]\n$ %s", cmd)
+		return "[Bash]\n$ " + cmd
 	case "file_editor":
 		path := action.Get("path").Str
 		switch action.Get("command").Str {

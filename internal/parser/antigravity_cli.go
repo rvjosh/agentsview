@@ -2,13 +2,18 @@ package parser
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
-	"database/sql"
-	"encoding/json"
+	"encoding/hex"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -79,7 +84,7 @@ type AntigravityCLIParseStatus struct {
 // package-level ParseAntigravityCLISessionWithStatus entrypoint was folded onto
 // the provider.
 func (p *antigravityCLIProvider) parseSessionWithStatus(
-	path, project, machine string,
+	ctx context.Context, path, project, cwd, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, AntigravityCLIParseStatus, error) {
 	var status AntigravityCLIParseStatus
 	info, err := os.Stat(path)
@@ -118,8 +123,37 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	// stays empty for legacy .pb and sidecar-only sessions where no schema
 	// is available, so SourceVersion is never fabricated.
 	var sourceVersion string
+	brainTranscriptSteps, brainTranscriptErr := collectAntigravityBrainTranscriptSteps(
+		antigravityBrainTranscriptPath(root, id),
+	)
+	if brainTranscriptErr != nil && !os.IsNotExist(brainTranscriptErr) {
+		return nil, nil, nil, status, brainTranscriptErr
+	}
+	historyMsgs := collectAntigravityHistoryMessages(
+		filepath.Join(root, "history.jsonl"), id,
+	)
+	historyPrompts := make(map[string]struct{}, len(historyMsgs))
+	for _, msg := range historyMsgs {
+		// SQLite decoding trims outer whitespace before normalization.
+		historyPrompts[strings.TrimSpace(msg.Content)] = struct{}{}
+	}
+	brainTranscriptMsgs := make([]ParsedMessage, len(brainTranscriptSteps))
+	for i := range brainTranscriptSteps {
+		msg := &brainTranscriptSteps[i].msg
+		normalizeAntigravityCLIUserMessage(msg, historyPrompts)
+		brainTranscriptMsgs[i] = *msg
+	}
+	brainTranscriptOK := hasDisplayableAntigravityCLITrajectoryMessage(
+		brainTranscriptMsgs,
+	)
+
+	var dbErr error
 	if ext == ".db" {
-		dbResult, dbErr := loadAntigravityCLIDBSteps(path)
+		var dbResult antigravityStepLoadResult
+		dbResult, dbErr = loadAntigravityCLIDBSteps(ctx, path)
+		for i := range dbResult.messages {
+			normalizeAntigravityCLIUserMessage(&dbResult.messages[i], historyPrompts)
+		}
 		sourceVersion = dbResult.sourceVersion
 		hasGenMetadata = dbResult.hasGenMetadata
 		// gen_metadata token usage describes the session's actual
@@ -129,6 +163,11 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		// (unreadable DB or missing gen_metadata table) so the same
 		// generation is never counted twice.
 		usageEvents = dbResult.usageEvents
+		if brainTranscriptOK && dbErr == nil {
+			brainTranscriptMsgs, usageEvents = applyAntigravityBrainStepMetadata(
+				brainTranscriptSteps, dbResult,
+			)
+		}
 		dbOK := dbErr == nil &&
 			hasDisplayableAntigravityCLITrajectoryMessage(dbResult.messages)
 
@@ -142,7 +181,12 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		// heuristic cannot decode -- so a partial sidecar is never persisted
 		// as a current transcript.
 		sidecarPath := strings.TrimSuffix(path, ".db") + ".trajectory.json"
-		tRes, tErr := parseAntigravityCLITrajectory(sidecarPath)
+		tRes, tErr := parseAntigravityCLITrajectory(
+			sidecarPath, dbResult.executors,
+		)
+		for i := range tRes.messages {
+			normalizeAntigravityCLIUserMessage(&tRes.messages[i], historyPrompts)
+		}
 		if tErr == nil {
 			parentCascadeID = tRes.parentCascadeID
 		}
@@ -150,17 +194,25 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			hasDisplayableAntigravityCLITrajectoryMessage(tRes.messages)
 		sidecarCovers := dbErr != nil || dbResult.rawStepCount == 0 ||
 			tRes.rawSteps >= dbResult.rawStepCount
+		brainTranscriptCovers := dbErr == nil &&
+			antigravityBrainTranscriptCoversDB(brainTranscriptSteps, dbResult.steps)
 		switch {
 		case sidecarOK && sidecarCovers:
 			messages = tRes.messages
 			hasTrajectory = true
 			transcriptFidelity = TranscriptFidelityFull
+		case brainTranscriptOK && brainTranscriptCovers:
+			// Coverage checks SQLite steps only. A prompt that neither
+			// SQLite nor the brain log has written yet is still in
+			// history.jsonl.
+			messages = appendMissingAntigravityHistoryMessages(
+				brainTranscriptMsgs, historyMsgs,
+			)
+			hasTrajectory = true
+			transcriptFidelity = TranscriptFidelityFull
 		case dbOK:
 			messages = mergeAntigravityDBHistoryMessages(
-				dbResult.messages,
-				collectAntigravityHistoryMessages(
-					filepath.Join(root, "history.jsonl"), id,
-				),
+				dbResult.messages, historyMsgs,
 			)
 			hasTrajectory = true
 		case sidecarOK:
@@ -168,6 +220,14 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 			// available transcript but leave the row stale so the next
 			// pass re-parses once agy-reader catches up.
 			messages = tRes.messages
+			hasTrajectory = true
+			status.NeedsRetry = true
+		case dbErr == nil && brainTranscriptOK:
+			// A partial brain log can miss user turns that history.jsonl
+			// recorded, so fold those back in.
+			messages = appendMissingAntigravityHistoryMessages(
+				brainTranscriptMsgs, historyMsgs,
+			)
 			hasTrajectory = true
 			status.NeedsRetry = true
 		case dbErr != nil || dbResult.rawStepCount > 0:
@@ -190,7 +250,12 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		// .pb files are no longer produced, so their sidecars are final,
 		// and even a sidecar older than the .pb beats the fallbacks.
 		sidecarPath := strings.TrimSuffix(path, ".pb") + ".trajectory.json"
-		if tRes, err := parseAntigravityCLITrajectory(sidecarPath); err == nil {
+		if tRes, err := parseAntigravityCLITrajectory(
+			sidecarPath, nil,
+		); err == nil {
+			for i := range tRes.messages {
+				normalizeAntigravityCLIUserMessage(&tRes.messages[i], historyPrompts)
+			}
 			parentCascadeID = tRes.parentCascadeID
 			// Usage events flow whenever the sidecar parses, even when
 			// no message is displayable, matching the message-less
@@ -208,14 +273,22 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 				transcriptFidelity = TranscriptFidelityFull
 			}
 		}
+		if !hasTrajectory && brainTranscriptOK {
+			// .pb sessions have no step rows to prove coverage, so history
+			// prompts the brain log missed are folded back in.
+			messages = appendMissingAntigravityHistoryMessages(
+				brainTranscriptMsgs, historyMsgs,
+			)
+			hasTrajectory = true
+			transcriptFidelity = TranscriptFidelityFull
+		}
 	}
 
 	if !hasTrajectory {
-		messages = collectAntigravityHistoryMessages(
-			filepath.Join(root, "history.jsonl"), id,
-		)
+		messages = historyMsgs
 	}
-	messages = append(messages,
+	messages = append(
+		messages,
 		collectAntigravityBrainMessages(
 			filepath.Join(root, "brain", id),
 		)...,
@@ -230,6 +303,16 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		}
 	}
 
+	if ext == ".db" && dbErr != nil && !hasTrajectory {
+		// Fail closed when the SQLite database could not be read and no
+		// trajectory sidecar supplied the transcript. This provider
+		// force-replaces stored messages, so a brain transcript, history
+		// prompts, or an empty session would delete archived replies. The
+		// parse error keeps the stored session, and sync retries failed
+		// files.
+		return nil, nil, nil, status, dbErr
+	}
+
 	sort.SliceStable(messages, func(i, j int) bool {
 		return messages[i].Timestamp.Before(messages[j].Timestamp)
 	})
@@ -237,14 +320,40 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 		messages[i].Ordinal = i
 	}
 
-	if project == "" {
-		project = inferAntigravityProject(
-			filepath.Join(root, "history.jsonl"), id,
-		)
-		if project == "" {
-			project = inferAntigravityProjectFromHistoryFallback(
-				filepath.Join(root, "history.jsonl"), messages, info.ModTime(),
+	historyPath := filepath.Join(root, "history.jsonl")
+	if cwd == "" {
+		workspace := buildAntigravityCLIProjectMap(root)[id]
+		if workspace == "" {
+			workspace = inferAntigravityProjectFromHistoryFallback(
+				historyPath, messages, info.ModTime(),
 			)
+		}
+		cwd = normalizeAntigravityCLIWorkspace(workspace)
+		if project == "" {
+			project = workspace
+		}
+	}
+	if project == "" {
+		project = cwd
+	}
+	// project is the raw workspace filesystem path recorded by history.jsonl.
+	// Keep an absolute workspace unchanged as Cwd, but run the project through
+	// the shared cwd normalizer so sessions from different
+	// git worktrees of the same repo resolve to one project, matching how
+	// the Codex and Claude providers normalize their own cwd hints. A
+	// path-rewritten parse (remote sync) describes another machine's
+	// filesystem, so it keeps the lexical rules but skips local git-root
+	// discovery: the remote workspace path could name an unrelated
+	// repository that happens to exist on the importing host.
+	if project != "" {
+		projectCtx := ctx
+		if p.Config.PathRewriter != nil {
+			projectCtx = WithoutFilesystemProjectDiscovery(projectCtx)
+		}
+		if normalized := ExtractProjectFromCwdWithBranchContext(
+			projectCtx, project, "",
+		); normalized != "" {
+			project = normalized
 		}
 	}
 
@@ -291,6 +400,7 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	sess := &ParsedSession{
 		ID:                 antigravityCLIIDPrefix + storageID,
 		Project:            project,
+		Cwd:                cwd,
 		Machine:            machine,
 		Agent:              AgentAntigravityCLI,
 		FirstMessage:       firstMessage,
@@ -328,11 +438,51 @@ func (p *antigravityCLIProvider) parseSessionWithStatus(
 	return sess, messages, usageEvents, status, nil
 }
 
-func loadAntigravityCLIDBSteps(
+func normalizeAntigravityCLIWorkspace(workspace string) string {
+	workspace = strings.TrimSpace(workspace)
+	if workspace == "" {
+		return ""
+	}
+	if strings.HasPrefix(workspace, "/") || strings.HasPrefix(workspace, `\\`) {
+		return workspace
+	}
+	if len(workspace) >= 3 && workspace[1] == ':' &&
+		(workspace[2] == '/' || workspace[2] == '\\') {
+		letter := workspace[0]
+		if letter >= 'A' && letter <= 'Z' || letter >= 'a' && letter <= 'z' {
+			return workspace
+		}
+	}
+	return ""
+}
+
+func loadAntigravityCLIDBSteps(ctx context.Context,
 	path string,
 ) (antigravityStepLoadResult, error) {
-	dsn := "file:" + sqliteURIPath(path) + "?mode=ro&immutable=0"
-	db, err := sql.Open("sqlite3", dsn)
+	result, err := loadAntigravityCLIDBStepsWithOptions(
+		ctx, path, sqliteReadOptions{},
+	)
+	if err != nil && !sqliteWALHasFrames(path+"-wal") {
+		// When a WAL database has been cleanly checkpointed and closed by
+		// agy (unlinking .db-shm) on a read-only filesystem mount, SQLite
+		// cannot create the shared-memory index in mode=ro and fails with
+		// SQLITE_CANTOPEN. When no data-bearing -wal sidecar is present,
+		// retry once with immutable=1 (stableSnapshot).
+		if retry, retryErr := loadAntigravityCLIDBStepsWithOptions(
+			ctx, path, sqliteReadOptions{stableSnapshot: true},
+		); retryErr == nil {
+			return retry, nil
+		}
+	}
+	return result, err
+}
+
+func loadAntigravityCLIDBStepsWithOptions(
+	ctx context.Context,
+	path string,
+	opts sqliteReadOptions,
+) (antigravityStepLoadResult, error) {
+	db, err := openSQLiteReadOnly(path, opts)
 	if err != nil {
 		return antigravityStepLoadResult{}, fmt.Errorf(
 			"open antigravity cli db %s: %w", path, err,
@@ -345,13 +495,93 @@ func loadAntigravityCLIDBSteps(
 	// agy-schema marker even when the step query fails and the parser falls
 	// back to the trajectory sidecar (antigravitySourceVersion returns "" when
 	// the schema itself is unreadable, so an undecodable .db is never labeled).
-	sourceVersion := antigravitySourceVersion(db)
-	result, err := loadAntigravityStepsWithRawCount(db)
+	sourceVersion := antigravitySourceVersion(ctx, db)
+	result, err := loadAntigravityStepsWithRawCount(ctx, db)
 	result.sourceVersion = sourceVersion
 	if err != nil {
 		return result, err
 	}
 	return result, nil
+}
+
+// antigravityBrainTranscriptCoversDB reports whether the brain transcript
+// accounts for every SQLite step. Each step needs a transcript line at the
+// same index. A decoded step and any user or planner step need a
+// displayable line; for other undecodable steps, an empty line shows the
+// step logged nothing. A missing line proves nothing, so it fails coverage.
+func antigravityBrainTranscriptCoversDB(
+	brainSteps []antigravityBrainTranscriptStep,
+	dbSteps []antigravityLoadedStep,
+) bool {
+	displayable := make(map[int]bool, len(brainSteps))
+	for _, bs := range brainSteps {
+		displayable[bs.stepIndex] = displayable[bs.stepIndex] ||
+			hasDisplayableAntigravityCLITrajectoryMessage(
+				[]ParsedMessage{bs.msg},
+			)
+	}
+	for _, step := range dbSteps {
+		hasContent, logged := displayable[step.idx]
+		if !logged {
+			return false
+		}
+		needsContent := step.decoded ||
+			step.kind == antigravityStepKindUserInput ||
+			step.kind == antigravityStepKindPlannerResponse
+		if needsContent && !hasContent {
+			return false
+		}
+	}
+	return true
+}
+
+func applyAntigravityBrainStepMetadata(
+	brainSteps []antigravityBrainTranscriptStep,
+	dbResult antigravityStepLoadResult,
+) ([]ParsedMessage, []ParsedUsageEvent) {
+	dbStepByIdx := make(map[int]ParsedMessage,
+		len(dbResult.steps)+len(dbResult.metadataSteps))
+	for _, s := range slices.Concat(dbResult.steps, dbResult.metadataSteps) {
+		dbStepByIdx[s.idx] = s.msg
+	}
+	// Generation metadata describes model output, so only the model's own
+	// entries take its model, tokens, and timestamp.
+	brainTimeByIdx := make(map[int]time.Time, len(brainSteps))
+	msgs := make([]ParsedMessage, len(brainSteps))
+	for i, bs := range brainSteps {
+		msg := bs.msg
+		msgs[i] = msg
+		if msg.Role != RoleAssistant {
+			continue
+		}
+		if !msg.Timestamp.IsZero() {
+			brainTimeByIdx[bs.stepIndex] = msg.Timestamp
+		}
+		if dbMsg, ok := dbStepByIdx[bs.stepIndex]; ok {
+			if msg.Model == "" && dbMsg.Model != "" {
+				msg.Model = dbMsg.Model
+			}
+			if !msg.HasContextTokens && dbMsg.HasContextTokens {
+				msg.ContextTokens = dbMsg.ContextTokens
+				msg.HasContextTokens = true
+			}
+			if !msg.HasOutputTokens && dbMsg.HasOutputTokens {
+				msg.OutputTokens = dbMsg.OutputTokens
+				msg.HasOutputTokens = true
+			}
+		}
+		msgs[i] = msg
+	}
+	usageEvents := slices.Clone(dbResult.usageEvents)
+	for i := range usageEvents {
+		if usageEvents[i].OccurredAt != "" || i >= len(dbResult.usageEventStepIndices) {
+			continue
+		}
+		if ts, ok := brainTimeByIdx[dbResult.usageEventStepIndices[i]]; ok && !ts.IsZero() {
+			usageEvents[i].OccurredAt = ts.Format(time.RFC3339Nano)
+		}
+	}
+	return msgs, usageEvents
 }
 
 func mergeAntigravityDBHistoryMessages(
@@ -395,35 +625,106 @@ func mergeAntigravityDBHistoryMessages(
 	return dbMessages
 }
 
+// appendMissingAntigravityHistoryMessages appends history prompts that no
+// existing user turn accounts for. Repeated prompts are matched one to one:
+// first by exact timestamp, then by the same second (for sources that record
+// whole seconds), then by text alone, so each history row keeps its own turn.
 func appendMissingAntigravityHistoryMessages(
 	dbMessages []ParsedMessage, history []ParsedMessage,
 ) []ParsedMessage {
-	seen := make(map[string]struct{})
+	type existingUserTurn struct {
+		key  string
+		ts   time.Time
+		used bool
+	}
+	var existing []existingUserTurn
 	for _, msg := range dbMessages {
 		if msg.Role != RoleUser {
 			continue
 		}
 		if key := normalizedAntigravityPrompt(msg.Content); key != "" {
-			seen[key] = struct{}{}
+			existing = append(existing, existingUserTurn{
+				key: key, ts: msg.Timestamp,
+			})
+		}
+	}
+	matchers := []func(existing, want time.Time) bool{
+		func(existing, want time.Time) bool {
+			return !existing.IsZero() && !want.IsZero() && existing.Equal(want)
+		},
+		func(existing, want time.Time) bool {
+			return !existing.IsZero() && !want.IsZero() &&
+				existing.Unix() == want.Unix()
+		},
+		func(time.Time, time.Time) bool { return true },
+	}
+	keys := make([]string, len(history))
+	matched := make([]bool, len(history))
+	for hIdx, msg := range history {
+		keys[hIdx] = normalizedAntigravityPrompt(msg.Content)
+		matched[hIdx] = keys[hIdx] == ""
+	}
+	for _, sameTurn := range matchers {
+		for hIdx, msg := range history {
+			if matched[hIdx] {
+				continue
+			}
+			for i := range existing {
+				if !existing[i].used && existing[i].key == keys[hIdx] &&
+					sameTurn(existing[i].ts, msg.Timestamp) {
+					existing[i].used = true
+					matched[hIdx] = true
+					break
+				}
+			}
 		}
 	}
 	out := dbMessages
-	for _, msg := range history {
-		key := normalizedAntigravityPrompt(msg.Content)
-		if key == "" {
-			continue
+	for hIdx, msg := range history {
+		if !matched[hIdx] {
+			out = append(out, msg)
 		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		out = append(out, msg)
-		seen[key] = struct{}{}
 	}
 	return out
 }
 
 func normalizedAntigravityPrompt(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+func normalizeAntigravityCLIUserMessage(msg *ParsedMessage, history map[string]struct{}) {
+	if msg.Role != RoleUser || msg.IsSystem {
+		return
+	}
+	if _, authored := history[strings.TrimSpace(msg.Content)]; authored {
+		return
+	}
+	msg.Content = extractAntigravityCLIUserRequest(msg.Content)
+	msg.ContentLength = len(msg.Content)
+}
+
+var antigravityCLIUserRequestRegex = regexp.MustCompile(
+	`(?s)^<USER_REQUEST>(.*)</USER_REQUEST>\s*<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>\s*(?:<USER_SETTINGS_CHANGE>.*?</USER_SETTINGS_CHANGE>\s*)?$`,
+)
+
+// extractAntigravityCLIUserRequest recognizes the complete injected metadata tail.
+// Literal tags, incomplete envelopes, and empty requests retain their source text.
+func extractAntigravityCLIUserRequest(s string) string {
+	if match := antigravityCLIUserRequestRegex.FindStringSubmatch(strings.TrimSpace(s)); match != nil {
+		// Remove only the envelope's framing newlines, preserving prompt spacing.
+		request, ok := strings.CutPrefix(match[1], "\r\n")
+		if !ok {
+			request = strings.TrimPrefix(request, "\n")
+		}
+		request, ok = strings.CutSuffix(request, "\r\n")
+		if !ok {
+			request = strings.TrimSuffix(request, "\n")
+		}
+		if strings.TrimSpace(request) != "" {
+			return request
+		}
+	}
+	return s
 }
 
 func nonEmptyAntigravityHistoryMessages(
@@ -457,6 +758,41 @@ func hasDisplayableAntigravityCLITrajectoryMessage(
 // often it runs.
 var buildAntigravityProjectMap = antigravityProjectMapFromHistory
 
+func buildAntigravityCLIProjectMap(root string) map[string]string {
+	out := buildAntigravityProjectMap(filepath.Join(root, "history.jsonl"))
+	// The current cache is newer than history and wins for matching IDs.
+	maps.Copy(out, antigravityProjectMapFromLastConversations(
+		filepath.Join(root, "cache", "last_conversations.json"),
+	))
+	return out
+}
+
+// antigravityProjectMapFromLastConversations reverses the current CLI cache's
+// workspace -> conversationId object into the provider's
+// conversationId -> workspace lookup shape.
+func antigravityProjectMapFromLastConversations(path string) map[string]string {
+	out := make(map[string]string)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	root := gjson.ParseBytes(raw)
+	if !root.IsObject() {
+		return out
+	}
+	root.ForEach(func(workspace, conversationID gjson.Result) bool {
+		id := strings.TrimSpace(conversationID.String())
+		path := strings.TrimSpace(workspace.String())
+		if id != "" && path != "" {
+			if _, exists := out[id]; !exists {
+				out[id] = path
+			}
+		}
+		return true
+	})
+	return out
+}
+
 // antigravityProjectMapFromHistory reads history.jsonl and returns a
 // map of conversationId -> workspace path.
 func antigravityProjectMapFromHistory(path string) map[string]string {
@@ -480,11 +816,6 @@ func antigravityProjectMapFromHistory(path string) map[string]string {
 		}
 	}
 	return out
-}
-
-func inferAntigravityProject(path, id string) string {
-	m := buildAntigravityProjectMap(path)
-	return m[id]
 }
 
 func inferAntigravityProjectFromHistoryFallback(
@@ -718,18 +1049,24 @@ func decryptAntigravityCLITranscript(
 
 // AntigravityCLIFileInfo returns a fake os.FileInfo whose size and
 // mtime combine the session file with everything else the parser
-// renders: SQLite WAL/SHM siblings, the .trajectory.json sidecar,
-// history.jsonl, and the brain/<id> artifacts. History stays here while
-// legacy sync skip checks use this effective file info; provider hashes
-// additionally scope tagged history rows by conversation ID.
+// renders: the SQLite WAL sibling, the .trajectory.json sidecar,
+// history.jsonl, cache/last_conversations.json, and the brain/<id> artifacts.
+// History and the workspace cache stay here while legacy sync skip checks use
+// this effective file info; provider hashes additionally scope tagged history
+// rows and workspace values by conversation ID.
 func AntigravityCLIFileInfo(path string) (os.FileInfo, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
+	root := filepath.Dir(filepath.Dir(path))
+	companions := append(
+		antigravityCLICompanionPaths(path),
+		filepath.Join(root, "cache", "last_conversations.json"),
+	)
 	return antigravityCLICombinedFileInfo(
 		info,
-		antigravityCLICompanionPaths(path)...,
+		companions...,
 	), nil
 }
 
@@ -737,17 +1074,20 @@ func antigravityCLICompanionPaths(path string) []string {
 	root := filepath.Dir(filepath.Dir(path))
 	historyPath := filepath.Join(root, "history.jsonl")
 	if base, ok := strings.CutSuffix(path, ".db"); ok {
-		// The trajectory sidecar is a transcript source for .db sessions
-		// too, so an agy-reader sync must change the fingerprint even when
-		// the database files themselves are untouched.
+		id := filepath.Base(base)
+		// The trajectory sidecar and brain transcript are transcript sources
+		// for .db sessions too, so their updates must change the fingerprint
+		// even when the database files themselves are untouched. The -shm
+		// index is left out because the parse's own read-only open rewrites
+		// it; see sqliteDBJournalSuffixes.
 		companions := []string{
 			historyPath,
 			path + "-wal",
-			path + "-shm",
 			base + ".trajectory.json",
+			antigravityBrainTranscriptPath(root, id),
 		}
 		return append(companions, antigravityBrainCompanions(
-			filepath.Join(root, "brain", filepath.Base(base)),
+			filepath.Join(root, "brain", id),
 		)...)
 	}
 
@@ -755,6 +1095,7 @@ func antigravityCLICompanionPaths(path string) []string {
 	companions := []string{
 		historyPath,
 		strings.TrimSuffix(path, ".pb") + ".trajectory.json",
+		antigravityBrainTranscriptPath(root, id),
 	}
 	return append(companions, antigravityBrainCompanions(
 		filepath.Join(root, "brain", id),
@@ -792,7 +1133,7 @@ func antigravityCLICombinedFileInfo(
 	mtime := base.ModTime().UnixNano()
 	for _, p := range companions {
 		info, err := os.Stat(p)
-		if err != nil {
+		if err != nil || !antigravityCompanionCounts(p, info) {
 			continue
 		}
 		size += info.Size()
@@ -805,6 +1146,12 @@ func antigravityCLICombinedFileInfo(
 		size:  size,
 		mtime: mtime,
 	}
+}
+
+// antigravityCompanionCounts drops a frame-less WAL companion: reading the
+// database creates and deletes one, which must not look like a change.
+func antigravityCompanionCounts(path string, info os.FileInfo) bool {
+	return !strings.HasSuffix(path, "-wal") || SQLiteWALInfoHasFrames(info)
 }
 
 func antigravityCompositeHash(path string, companions ...string) (string, error) {
@@ -837,7 +1184,8 @@ func antigravityCompositeHashWithExtra(
 		}
 		prev = companion
 		info, err := os.Stat(companion)
-		if err != nil || info.IsDir() {
+		if err != nil || info.IsDir() ||
+			!antigravityCompanionCounts(companion, info) {
 			continue
 		}
 		if err := addAntigravityFingerprintPart(
@@ -854,19 +1202,32 @@ func antigravityCompositeHashWithExtra(
 			return "", err
 		}
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func antigravityCLICompositeHash(path, id string) (string, error) {
+func antigravityCLICompositeHash(path, id, workspace string) (string, error) {
 	return antigravityCompositeHashWithExtra(
 		path,
 		antigravityCLIProviderCompanionPaths(path),
 		func(h interface{ Write([]byte) (int, error) }) error {
-			return addAntigravityCLIHistoryFingerprintPart(
+			if err := addAntigravityCLIHistoryFingerprintPart(
 				h,
 				filepath.Join(filepath.Dir(filepath.Dir(path)), "history.jsonl"),
 				strings.TrimPrefix(id, antigravityImplicitTag),
-			)
+			); err != nil {
+				return err
+			}
+			if workspace == "" {
+				return nil
+			}
+			if _, err := fmt.Fprintf(h, "workspace\x00%d\x00", len(workspace)); err != nil {
+				return err
+			}
+			if _, err := h.Write([]byte(workspace)); err != nil {
+				return err
+			}
+			_, err := h.Write([]byte{0})
+			return err
 		},
 	)
 }
@@ -989,7 +1350,7 @@ type agyTrajectory struct {
 	CascadeID         string                 `json:"cascadeId"`
 	Steps             []agyStep              `json:"steps"`
 	GeneratorMetadata []agyGeneratorMetadata `json:"generatorMetadata"`
-	AgyReader         json.RawMessage        `json:"agyReader"`
+	AgyReader         jsontext.Value         `json:"agyReader"`
 }
 
 type agyReaderMetadata struct {
@@ -1053,7 +1414,7 @@ func (c *agyTokenCount) UnmarshalJSON(data []byte) error {
 	if err != nil || n < 0 {
 		// Negative counts are garbage too: emitting them would
 		// subtract from session and daily usage totals.
-		return nil
+		return nil //nolint:nilerr // Malformed optional token counts do not invalidate the transcript.
 	}
 	*c = agyTokenCount(n)
 	return nil
@@ -1098,11 +1459,11 @@ type agyToolCall struct {
 }
 
 type agyRunCommand struct {
-	CommandLine         string          `json:"commandLine"`
-	ProposedCommandLine string          `json:"proposedCommandLine"`
-	Cwd                 string          `json:"cwd"`
-	ExitCode            *int            `json:"exitCode"`
-	CombinedOutput      json.RawMessage `json:"combinedOutput"`
+	CommandLine         string         `json:"commandLine"`
+	ProposedCommandLine string         `json:"proposedCommandLine"`
+	Cwd                 string         `json:"cwd"`
+	ExitCode            *int           `json:"exitCode"`
+	CombinedOutput      jsontext.Value `json:"combinedOutput"`
 }
 
 func (rc *agyRunCommand) CombinedOutputString() string {
@@ -1113,7 +1474,7 @@ func (rc *agyRunCommand) CombinedOutputString() string {
 	if err := json.Unmarshal(rc.CombinedOutput, &s); err == nil {
 		return s
 	}
-	var obj map[string]json.RawMessage
+	var obj map[string]jsontext.Value
 	if err := json.Unmarshal(rc.CombinedOutput, &obj); err == nil {
 		parts := make([]string, 0, 4)
 		for _, key := range []string{"stdout", "stderr", "output", "text", "full"} {
@@ -1139,9 +1500,9 @@ type agyViewFile struct {
 }
 
 type agyCodeAction struct {
-	Description  string          `json:"description"`
-	ActionSpec   json.RawMessage `json:"actionSpec"`
-	ActionResult json.RawMessage `json:"actionResult"`
+	Description  string         `json:"description"`
+	ActionSpec   jsontext.Value `json:"actionSpec"`
+	ActionResult jsontext.Value `json:"actionResult"`
 }
 
 type agyCodeActionResult struct {
@@ -1241,7 +1602,7 @@ func agyToolDetail(name, inputJSON string) string {
 	if !strings.HasPrefix(strings.TrimSpace(inputJSON), "{") {
 		return name
 	}
-	var input map[string]json.RawMessage
+	var input map[string]jsontext.Value
 	if err := json.Unmarshal([]byte(inputJSON), &input); err != nil {
 		return name
 	}
@@ -1321,7 +1682,7 @@ type agyTrajectoryParseResult struct {
 	parentCascadeID string
 }
 
-func parseAgyReaderParentCascadeID(raw json.RawMessage) string {
+func parseAgyReaderParentCascadeID(raw jsontext.Value) string {
 	if len(raw) == 0 {
 		return ""
 	}
@@ -1355,7 +1716,9 @@ func canonicalAgyCascadeID(value string) string {
 
 // parseAntigravityCLITrajectory reads a <uuid>.trajectory.json sidecar
 // produced out-of-process by agy-reader and returns the decoded
-// transcript as ParsedMessages.
+// transcript as ParsedMessages. When the source database supplied executor
+// ranges, they qualify sidecar generation models using the same rules as the
+// SQLite gen_metadata path.
 //
 // Trust posture (see SECURITY.md, "Imports and new readers" row of the
 // Trust boundaries table): the sidecar is treated as untrusted
@@ -1365,6 +1728,7 @@ func canonicalAgyCascadeID(value string) string {
 // is executed or echoed back over any outbound channel.
 func parseAntigravityCLITrajectory(
 	trajectoryPath string,
+	executors []antigravityExecutorMetadata,
 ) (agyTrajectoryParseResult, error) {
 	f, err := os.Open(trajectoryPath)
 	if err != nil {
@@ -1456,6 +1820,9 @@ func parseAntigravityCLITrajectory(
 			content := pr.Response
 			if content == "" && len(toolHeaders) > 0 {
 				content = strings.Join(toolHeaders, "\n")
+				for i := range toolCalls {
+					toolCalls[i].Rendering = toolHeaders[i]
+				}
 			}
 
 			msg := ParsedMessage{
@@ -1517,7 +1884,7 @@ func parseAntigravityCLITrajectory(
 				}
 			case "CORTEX_STEP_TYPE_LIST_DIRECTORY":
 				if step.ListDirectory != nil {
-					resultText = fmt.Sprintf("List directory: %s", step.ListDirectory.DirectoryPathURI)
+					resultText = "List directory: " + step.ListDirectory.DirectoryPathURI
 				}
 			case "CORTEX_STEP_TYPE_ERROR_MESSAGE":
 				if step.ErrorMessage != nil {
@@ -1565,7 +1932,7 @@ func parseAntigravityCLITrajectory(
 			cp := step.Checkpoint
 			var parts []string
 			if len(cp.UserRequests) > 0 {
-				parts = append(parts, fmt.Sprintf("User Requests: %s", strings.Join(cp.UserRequests, ", ")))
+				parts = append(parts, "User Requests: "+strings.Join(cp.UserRequests, ", "))
 			}
 			if cp.SessionSummary != "" {
 				parts = append(parts, cp.SessionSummary)
@@ -1585,9 +1952,11 @@ func parseAntigravityCLITrajectory(
 
 	flushPendingResults()
 	return agyTrajectoryParseResult{
-		messages:        msgs,
-		rawSteps:        len(traj.Steps),
-		usageEvents:     extractAgyGeneratorUsage(traj, plannerMsgIdx, msgs),
+		messages: msgs,
+		rawSteps: len(traj.Steps),
+		usageEvents: extractAgyGeneratorUsage(
+			traj, plannerMsgIdx, msgs, executors,
+		),
 		parentCascadeID: parseAgyReaderParentCascadeID(traj.AgyReader),
 	}, nil
 }
@@ -1608,12 +1977,14 @@ func parseAntigravityCLITrajectory(
 // MessageOrdinal is left nil: ordinals are reassigned after the
 // timestamp re-sort and brain-doc merge in
 // ParseAntigravityCLISessionWithStatus, so any ordinal computed here
-// would be wrong. Cost fields stay zero/empty - MODEL_PLACEHOLDER_*
-// models are unpriced.
+// would be wrong. A generation's maximum step index selects the covering
+// executor range, matching SQLite gen_metadata attribution. Cost fields stay
+// zero/empty - MODEL_PLACEHOLDER_* models are unpriced.
 func extractAgyGeneratorUsage(
 	traj agyTrajectory,
 	plannerMsgIdx map[int]int,
 	msgs []ParsedMessage,
+	executors []antigravityExecutorMetadata,
 ) []ParsedUsageEvent {
 	var events []ParsedUsageEvent
 	for _, gen := range traj.GeneratorMetadata {
@@ -1638,6 +2009,11 @@ func extractAgyGeneratorUsage(
 		if model == "" {
 			model = usage.Model
 		}
+		executorModel := ""
+		if stepIndex, ok := maxAntigravityStepIndex(gen.StepIndices); ok {
+			executorModel = executorModelForStep(executors, stepIndex)
+		}
+		model = resolveAntigravityModelName(model, executorModel, false)
 
 		// Find the planner message this generation produced.
 		var targetMsg *ParsedMessage

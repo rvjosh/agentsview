@@ -10,12 +10,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	docsqlite "go.kenn.io/docbank/pkg/sqlite"
-	"go.kenn.io/docbank/pkg/sqlite/mattn"
-	"go.kenn.io/docbank/pkg/sqlite/modernc"
+	docsqlite "go.kenn.io/docbank/sqlite"
+	"go.kenn.io/docbank/sqlite/mattn"
+	"go.kenn.io/docbank/sqlite/modernc"
 )
 
 func TestOpenRepositoryOwnsCompressedDocbankContent(t *testing.T) {
+	t.Parallel()
+
 	dataDir := t.TempDir()
 	repository, err := OpenRepository(t.Context(), dataDir)
 	require.NoError(t, err)
@@ -30,8 +32,11 @@ func TestOpenRepositoryOwnsCompressedDocbankContent(t *testing.T) {
 }
 
 func TestOpenRepositorySupportsDocbankSQLiteDrivers(t *testing.T) {
+	t.Parallel()
+
 	for _, driver := range []docsqlite.Driver{mattn.Driver{}, modernc.Driver{}} {
 		t.Run(driver.Name(), func(t *testing.T) {
+			t.Parallel()
 			repository, err := openRepository(t.Context(), t.TempDir(), driver)
 			require.NoError(t, err)
 			result := createCheckpointBody(t, repository.Content(), 1, []byte("driver parity"))
@@ -42,6 +47,8 @@ func TestOpenRepositorySupportsDocbankSQLiteDrivers(t *testing.T) {
 }
 
 func TestOpenRepositoryRejectsLegacyLooseLayoutWithoutMutation(t *testing.T) {
+	t.Parallel()
+
 	dataDir := t.TempDir()
 	artifactDir := filepath.Join(dataDir, "artifacts")
 	legacy := filepath.Join(artifactDir, contractOrigin, string(KindCheckpoints), "cp-0000000001.json")
@@ -51,7 +58,7 @@ func TestOpenRepositoryRejectsLegacyLooseLayoutWithoutMutation(t *testing.T) {
 
 	repository, err := OpenRepository(t.Context(), dataDir)
 	assert.Nil(t, repository)
-	assert.ErrorContains(t, err, "old loose artifact layout")
+	require.ErrorContains(t, err, "old loose artifact layout")
 	got, readErr := os.ReadFile(legacy)
 	require.NoError(t, readErr)
 	assert.Equal(t, original, got)
@@ -59,6 +66,8 @@ func TestOpenRepositoryRejectsLegacyLooseLayoutWithoutMutation(t *testing.T) {
 }
 
 func TestOpenRepositoryUsesDocbankHierarchyLock(t *testing.T) {
+	t.Parallel()
+
 	dataDir := t.TempDir()
 	repository, err := OpenRepository(t.Context(), dataDir)
 	require.NoError(t, err)
@@ -66,7 +75,7 @@ func TestOpenRepositoryUsesDocbankHierarchyLock(t *testing.T) {
 
 	second, err := OpenRepository(t.Context(), dataDir)
 	assert.Nil(t, second)
-	assert.ErrorContains(t, err, "vault is locked")
+	require.ErrorContains(t, err, "vault is locked")
 
 	overlapping, err := OpenRepository(t.Context(), filepath.Join(dataDir, "artifacts"))
 	assert.Nil(t, overlapping)
@@ -74,6 +83,8 @@ func TestOpenRepositoryUsesDocbankHierarchyLock(t *testing.T) {
 }
 
 func TestOpenRepositoryFollowsFinalRootSymlink(t *testing.T) {
+	t.Parallel()
+
 	realDataDir := t.TempDir()
 	realRoot := filepath.Join(realDataDir, "artifacts")
 	realRepository, err := openRepository(t.Context(), realDataDir, modernc.Driver{})
@@ -91,6 +102,7 @@ func TestOpenRepositoryFollowsFinalRootSymlink(t *testing.T) {
 }
 
 func TestOpenRepositoryRetainsAbsoluteCanonicalRoot(t *testing.T) {
+	// Serial: Chdir changes the process-wide working directory.
 	dataDir := t.TempDir()
 	// Chdir to the temp dir's parent so the relative path stays on one
 	// volume; on Windows CI the checkout and temp dirs are on different
@@ -107,6 +119,8 @@ func TestOpenRepositoryRetainsAbsoluteCanonicalRoot(t *testing.T) {
 }
 
 func TestRepositoryCloseWaitsForReaderAndIsIdempotent(t *testing.T) {
+	t.Parallel()
+
 	repository, err := OpenRepository(t.Context(), t.TempDir())
 	require.NoError(t, err)
 	ref := requireContractRef(t, contractOrigin, KindCheckpoints, "cp-0000000001.json")
@@ -122,7 +136,7 @@ func TestRepositoryCloseWaitsForReaderAndIsIdempotent(t *testing.T) {
 	select {
 	case err := <-closeResult:
 		require.Fail(t, "repository close returned before reader close", "error: %v", err)
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check; the open reader keeps Close waiting
 	}
 
 	_, err = io.Copy(io.Discard, reader)

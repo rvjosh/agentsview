@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -56,7 +57,7 @@ type ProjectIdentityObservationKey struct {
 }
 
 // SessionProjectIdentitySnapshotKey identifies one immutable snapshot that a
-// downstream publication must remove. Project is retained to apply filters.
+// downstream publication must remove.
 type SessionProjectIdentitySnapshotKey struct {
 	SessionID string
 	Project   string
@@ -72,8 +73,11 @@ type ProjectIdentityPublicationDelta struct {
 }
 
 // LoadProjectIdentityPublicationDelta returns the compact identity changes in
-// (afterRevision, throughRevision]. Project filters are applied to both current
-// rows and tombstones so filtered targets can maintain independent cursors.
+// (afterRevision, throughRevision]. Project filters apply to current rows and
+// aggregate-observation tombstones. Snapshot tombstones remain unfiltered
+// because current rows are scoped by the owning session project while their
+// deletion journal retains the immutable snapshot project. Destinations decide
+// whether a tombstone applies from their resident rows or publication owners.
 func (db *DB) LoadProjectIdentityPublicationDelta(
 	ctx context.Context,
 	afterRevision, throughRevision int64,
@@ -94,7 +98,8 @@ func (db *DB) LoadProjectIdentityPublicationDelta(
 	}
 
 	where, args := projectIdentityPublicationChangeWhere(
-		"c", afterRevision, throughRevision, projects, excludeProjects,
+		"c", "c.project", afterRevision, throughRevision,
+		projects, excludeProjects,
 	)
 	rows, err := db.getReader().QueryContext(ctx, `
 		SELECT o.source_archive_id, o.source_archive_salt,
@@ -112,6 +117,7 @@ func (db *DB) LoadProjectIdentityPublicationDelta(
 	if err != nil {
 		return delta, fmt.Errorf("listing changed project identity observations: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var obs export.ProjectIdentityObservation
 		var observedAt string
@@ -149,6 +155,7 @@ func (db *DB) LoadProjectIdentityPublicationDelta(
 	if err != nil {
 		return delta, fmt.Errorf("listing project identity observation tombstones: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var key ProjectIdentityObservationKey
 		if err := rows.Scan(
@@ -167,6 +174,10 @@ func (db *DB) LoadProjectIdentityPublicationDelta(
 		return delta, fmt.Errorf("closing project identity observation tombstones: %w", err)
 	}
 
+	snapshotWhere, snapshotArgs := projectIdentityPublicationChangeWhere(
+		"c", "owner.project", afterRevision, throughRevision,
+		projects, excludeProjects,
+	)
 	rows, err = db.getReader().QueryContext(ctx, `
 		SELECT s.session_id, s.project, s.machine, s.root_path, s.git_remote,
 			s.git_remote_name, s.repository_path, s.worktree_name,
@@ -176,11 +187,15 @@ func (db *DB) LoadProjectIdentityPublicationDelta(
 		FROM session_project_identity_snapshot_changes c
 		JOIN session_project_identity_snapshots s
 		  ON s.session_id = c.session_id AND s.project = c.project
-		`+where+` AND c.deleted = 0
-		ORDER BY c.session_id, c.project`, args...)
+		JOIN sessions owner
+		  ON owner.id = s.session_id AND owner.deleted_at IS NULL
+		`+snapshotWhere+` AND c.deleted = 0
+		  AND (TRIM(s.key_source) != '' OR TRIM(s.worktree_root_path) != '')
+		ORDER BY c.session_id, c.project`, snapshotArgs...)
 	if err != nil {
 		return delta, fmt.Errorf("listing changed session project identity snapshots: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var snapshot export.ProjectIdentityObservation
 		var observedAt string
@@ -212,11 +227,15 @@ func (db *DB) LoadProjectIdentityPublicationDelta(
 		return delta, fmt.Errorf("closing changed session project identity snapshots: %w", err)
 	}
 
+	tombstoneWhere, tombstoneArgs := projectIdentityPublicationChangeWhere(
+		"c", "c.project", afterRevision, throughRevision,
+		nil, nil,
+	)
 	rows, err = db.getReader().QueryContext(ctx, `
 		SELECT c.session_id, c.project
 		FROM session_project_identity_snapshot_changes c
-		`+where+` AND c.deleted = 1
-		ORDER BY c.session_id, c.project`, args...)
+		`+tombstoneWhere+` AND c.deleted = 1
+		ORDER BY c.session_id, c.project`, tombstoneArgs...)
 	if err != nil {
 		return delta, fmt.Errorf("listing session project identity snapshot tombstones: %w", err)
 	}
@@ -235,11 +254,13 @@ func (db *DB) LoadProjectIdentityPublicationDelta(
 }
 
 func projectIdentityPublicationChangeWhere(
-	alias string,
+	revisionAlias string,
+	projectExpression string,
 	afterRevision, throughRevision int64,
 	projects, excludeProjects []string,
 ) (string, []any) {
-	where := "WHERE " + alias + ".revision > ? AND " + alias + ".revision <= ?"
+	where := "WHERE " + revisionAlias + ".revision > ? AND " +
+		revisionAlias + ".revision <= ?"
 	args := []any{afterRevision, throughRevision}
 	appendProjects := func(values []string, negate bool) {
 		if len(values) == 0 {
@@ -254,7 +275,7 @@ func projectIdentityPublicationChangeWhere(
 		if negate {
 			op = " NOT IN "
 		}
-		where += " AND " + alias + ".project" + op +
+		where += " AND " + projectExpression + op +
 			"(" + strings.Join(placeholders, ",") + ")"
 	}
 	appendProjects(projects, false)
@@ -262,10 +283,12 @@ func projectIdentityPublicationChangeWhere(
 	return where, args
 }
 
-var ErrDatabaseIDMissing = errors.New("database id is missing")
-var ErrArchiveIDMissing = errors.New("archive id is missing")
-var ErrArchiveSaltMissing = errors.New("archive salt is missing")
-var ErrArchiveSaltInvalid = errors.New("archive salt is invalid")
+var (
+	ErrDatabaseIDMissing  = errors.New("database id is missing")
+	ErrArchiveIDMissing   = errors.New("archive id is missing")
+	ErrArchiveSaltMissing = errors.New("archive salt is missing")
+	ErrArchiveSaltInvalid = errors.New("archive salt is invalid")
+)
 
 func validateArchiveSalt(salt string) (string, error) {
 	salt = strings.TrimSpace(salt)
@@ -305,16 +328,18 @@ func (db *DB) CopyArchiveIdentityFrom(sourcePath string) error {
 		createdAt string
 		updatedAt string
 	}
-	metadata := make(map[string]metadataRow, 2)
+	metadata := make(map[string]metadataRow, 3)
+	// A rebuilt archive stays as cold or active as the archive it replaces.
 	rows, err := conn.QueryContext(ctx, `
 		SELECT key, value, created_at, updated_at
 		FROM identity_source.archive_metadata
-		WHERE key IN (?, ?)`,
-		archiveMetadataArchiveIDKey, archiveMetadataArchiveSaltKey,
+		WHERE key IN (?, ?, ?)`,
+		archiveMetadataArchiveIDKey, archiveMetadataArchiveSaltKey, conversationExportInitializedKey,
 	)
 	if err != nil {
 		return fmt.Errorf("reading archive identity source: %w", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var key string
 		var row metadataRow
@@ -348,8 +373,12 @@ func (db *DB) CopyArchiveIdentityFrom(sourcePath string) error {
 	for _, key := range []string{
 		archiveMetadataArchiveIDKey,
 		archiveMetadataArchiveSaltKey,
+		conversationExportInitializedKey,
 	} {
-		row := metadata[key]
+		row, ok := metadata[key]
+		if !ok {
+			continue
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO archive_metadata (key, value, created_at, updated_at)
 			VALUES (?, ?, ?, ?)
@@ -606,7 +635,7 @@ func (db *DB) SetDatabaseIDForTest(ctx context.Context, id string) error {
 	}
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return fmt.Errorf("database id is required")
+		return errors.New("database id is required")
 	}
 
 	db.mu.Lock()
@@ -635,7 +664,7 @@ func (db *DB) SetArchiveIdentityForTest(ctx context.Context, id, salt string) er
 	id = strings.TrimSpace(id)
 	salt = strings.TrimSpace(salt)
 	if id == "" || salt == "" {
-		return fmt.Errorf("archive id and salt are required")
+		return errors.New("archive id and salt are required")
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -659,6 +688,33 @@ func (db *DB) UpsertProjectIdentityObservation(
 	ctx context.Context,
 	obs export.ProjectIdentityObservation,
 ) error {
+	return db.upsertProjectIdentityObservationWithSnapshotProject(
+		ctx, obs, obs.Project, false,
+	)
+}
+
+// UpsertProjectIdentityObservationWithSnapshotProject publishes current
+// aggregate evidence while preserving a separately labelled parser-time
+// snapshot. Only the project label may differ, so both rows retain identical
+// source evidence. An empty snapshot project preserves the aggregate and
+// leaves any snapshot unchanged; session insertion paths use the state-aware
+// variant below to remove only their newly created trigger fallback.
+func (db *DB) UpsertProjectIdentityObservationWithSnapshotProject(
+	ctx context.Context,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+) error {
+	return db.upsertProjectIdentityObservationWithSnapshotProject(
+		ctx, obs, snapshotProject, true,
+	)
+}
+
+func (db *DB) upsertProjectIdentityObservationWithSnapshotProject(
+	ctx context.Context,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+	allowSnapshotProjectCorrection bool,
+) error {
 	if err := db.requireWritable(); err != nil {
 		return err
 	}
@@ -677,7 +733,22 @@ func (db *DB) UpsertProjectIdentityObservation(
 		return fmt.Errorf("beginning project identity observation upsert: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := upsertProjectIdentityObservationTx(tx, obs); err != nil {
+	if err := upsertProjectIdentityObservationExec(
+		ctx, tx,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
+		},
+		obs,
+	); err != nil {
+		return err
+	}
+	if err := writeSessionProjectIdentitySnapshotExec(
+		ctx, tx,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
+		},
+		obs, snapshotProject, false, allowSnapshotProjectCorrection,
+	); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -686,16 +757,161 @@ func (db *DB) UpsertProjectIdentityObservation(
 	return nil
 }
 
+// UpsertSessionWithProjectIdentity atomically writes the current session and
+// aggregate identity while preserving parser-time snapshot evidence. The
+// transaction-local insert result permits removal of only the fallback created
+// by this session write.
+func (db *DB) UpsertSessionWithProjectIdentity(ctx context.Context,
+	s Session,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+) error {
+	_, err := db.upsertSessionWithProjectIdentity(ctx,
+		s, obs, snapshotProject, true,
+	)
+	return err
+}
+
+// UpsertSessionPendingContentWithProjectIdentity atomically updates a session
+// and its parser-time project identity without reviving a source-missing
+// tombstone. The returned bool reports whether retained content must be
+// replaced before the caller makes the session visible again.
+func (db *DB) UpsertSessionPendingContentWithProjectIdentity(ctx context.Context,
+	s Session,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+) (bool, error) {
+	result, err := db.upsertSessionWithProjectIdentity(ctx,
+		s, obs, snapshotProject, false,
+	)
+	return result.sourceMissing, err
+}
+
+func (db *DB) upsertSessionWithProjectIdentity(ctx context.Context,
+	s Session,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+	reviveSourceMissing bool,
+) (sessionUpsertResult, error) {
+	s = db.sessionForStorage(s)
+	if err := db.requireWritable(); err != nil {
+		return sessionUpsertResult{}, err
+	}
+	if strings.TrimSpace(s.ID) == "" {
+		return sessionUpsertResult{}, errors.New("session id is required")
+	}
+	normalized, err := normalizeProjectIdentityObservation(obs)
+	if err != nil {
+		return sessionUpsertResult{}, err
+	}
+	if normalized.SessionID == "" {
+		return sessionUpsertResult{},
+			errors.New("identity observation session id is required")
+	}
+	if normalized.SessionID != s.ID {
+		return sessionUpsertResult{}, fmt.Errorf(
+			"identity observation session id %q does not match session id %q",
+			normalized.SessionID, s.ID,
+		)
+	}
+	obs = normalized
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().Begin(ctx)
+	if err != nil {
+		return sessionUpsertResult{},
+			fmt.Errorf("beginning session identity upsert: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := db.checkArchiveSessionProvenanceTx(ctx, tx, SessionBatchWrite{Session: s}); err != nil {
+		return sessionUpsertResult{}, err
+	}
+
+	result, err := upsertSessionExec(
+		ctx,
+		tx.ExecContext,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
+		},
+		s,
+		reviveSourceMissing,
+	)
+	if err != nil {
+		return sessionUpsertResult{}, err
+	}
+	if db.usageOnlyStorage() {
+		if err := settleUsageOnlySessionTx(tx, s.ID); err != nil {
+			return sessionUpsertResult{}, err
+		}
+	}
+	if obs.Project != "" {
+		if err := upsertProjectIdentityObservationWithSnapshotProjectTx(
+			tx, obs, snapshotProject, result.inserted, true,
+		); err != nil {
+			return sessionUpsertResult{}, err
+		}
+	}
+	if !result.inserted && result.previousProject != result.currentProject {
+		if err := reconcileSessionProjectIdentityAggregatesTx(
+			context.Background(), tx, s.ID,
+			[]string{result.previousProject, result.currentProject},
+		); err != nil {
+			return sessionUpsertResult{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return sessionUpsertResult{},
+			fmt.Errorf("committing session identity upsert: %w", err)
+	}
+	return result, nil
+}
+
 func upsertProjectIdentityObservationTx(
 	tx *sql.Tx,
 	obs export.ProjectIdentityObservation,
+) error {
+	return upsertProjectIdentityObservationTxContext(
+		context.Background(), tx, obs,
+	)
+}
+
+func upsertProjectIdentityObservationTxContext(
+	ctx context.Context,
+	tx *sql.Tx,
+	obs export.ProjectIdentityObservation,
+) error {
+	return upsertProjectIdentityObservationWithSnapshotProjectTxContext(
+		ctx, tx, obs, obs.Project, false, false,
+	)
+}
+
+func upsertProjectIdentityObservationWithSnapshotProjectTx(
+	tx *sql.Tx,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+	sessionInserted bool,
+	allowSnapshotProjectCorrection bool,
+) error {
+	return upsertProjectIdentityObservationWithSnapshotProjectTxContext(
+		context.Background(), tx, obs, snapshotProject, sessionInserted,
+		allowSnapshotProjectCorrection,
+	)
+}
+
+func upsertProjectIdentityObservationWithSnapshotProjectTxContext(
+	ctx context.Context,
+	tx *sql.Tx,
+	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+	sessionInserted bool,
+	allowSnapshotProjectCorrection bool,
 ) error {
 	normalized, err := normalizeProjectIdentityObservation(obs)
 	if err != nil {
 		return err
 	}
 	if err := upsertProjectIdentityObservationExec(
-		context.Background(), tx,
+		ctx, tx,
 		func(ctx context.Context, query string, args ...any) rowScanner {
 			return tx.QueryRowContext(ctx, query, args...)
 		},
@@ -703,30 +919,285 @@ func upsertProjectIdentityObservationTx(
 	); err != nil {
 		return err
 	}
-	if err := upsertSessionProjectIdentitySnapshotExec(
-		context.Background(), tx,
+	if err := writeSessionProjectIdentitySnapshotExec(
+		ctx, tx,
 		func(ctx context.Context, query string, args ...any) rowScanner {
 			return tx.QueryRowContext(ctx, query, args...)
 		},
-		normalized,
+		normalized, snapshotProject, sessionInserted,
+		allowSnapshotProjectCorrection,
 	); err != nil {
 		return err
 	}
 	return nil
 }
 
-func upsertSessionProjectIdentitySnapshotExec(
+func writeSessionProjectIdentitySnapshotExec(
 	ctx context.Context,
-	exec contextExecer,
+	exec sqlContextExecer,
 	queryRow contextQueryRow,
 	obs export.ProjectIdentityObservation,
+	snapshotProject string,
+	sessionInserted bool,
+	allowProjectCorrection bool,
+) error {
+	snapshotProject = strings.TrimSpace(snapshotProject)
+	if snapshotProject == "" {
+		if !sessionInserted {
+			return nil
+		}
+		sessionID := strings.TrimSpace(obs.SessionID)
+		if sessionID == "" {
+			return nil
+		}
+		if _, err := exec.ExecContext(ctx, `
+			DELETE FROM session_project_identity_snapshots
+			WHERE session_id = ?`, sessionID); err != nil {
+			return fmt.Errorf("deleting session project identity snapshot: %w", err)
+		}
+		return nil
+	}
+	snapshot := obs
+	snapshot.Project = snapshotProject
+	snapshot, err := normalizeProjectIdentityObservation(snapshot)
+	if err != nil {
+		return err
+	}
+	return upsertSessionProjectIdentitySnapshotExec(
+		ctx, exec, queryRow, snapshot, allowProjectCorrection,
+	)
+}
+
+// RestoreSessionProjectsFromIdentitySnapshots resets current project labels to
+// resolved Git-backed parser-source snapshots. Full resync calls this after
+// copying snapshots from the old archive and before reapplying active worktree
+// mappings, so a missing checkout cannot replace resolved historical identity
+// with a basename fallback.
+func (db *DB) RestoreSessionProjectsFromIdentitySnapshots(
+	ctx context.Context,
+) (int, error) {
+	if err := db.requireWritable(); err != nil {
+		return 0, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"beginning session project identity restore: %w", err,
+		)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	type projectRestore struct {
+		sessionID       string
+		previousProject string
+		currentProject  string
+	}
+	var restores []projectRestore
+	rows, err := tx.QueryContext(ctx, `
+		SELECT s.id, s.project, snap.project
+		FROM sessions s
+		JOIN session_project_identity_snapshots snap
+		  ON snap.session_id = s.id
+		WHERE snap.project != ''
+		  AND snap.remote_resolution = 'resolved'
+		  AND snap.git_remote != ''
+		  AND s.deleted_at IS NULL
+		  AND s.project != snap.project`)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"listing session project identity restores: %w", err,
+		)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var restore projectRestore
+		if err := rows.Scan(
+			&restore.sessionID,
+			&restore.previousProject,
+			&restore.currentProject,
+		); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf(
+				"scanning session project identity restore: %w", err,
+			)
+		}
+		restores = append(restores, restore)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf(
+			"iterating session project identity restores: %w", err,
+		)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf(
+			"closing session project identity restores: %w", err,
+		)
+	}
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE sessions
+		SET project = (
+			SELECT snap.project
+			FROM session_project_identity_snapshots snap
+			WHERE snap.session_id = sessions.id
+		)
+		WHERE sessions.deleted_at IS NULL
+		  AND EXISTS (
+			SELECT 1
+			FROM session_project_identity_snapshots snap
+			WHERE snap.session_id = sessions.id
+			  AND snap.project != ''
+			  AND snap.remote_resolution = 'resolved'
+			  AND snap.git_remote != ''
+			  AND snap.project != sessions.project
+		)`)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"restoring session projects from identity snapshots: %w", err,
+		)
+	}
+	restored, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf(
+			"counting restored session projects: %w", err,
+		)
+	}
+	for _, restore := range restores {
+		if err := reconcileSessionProjectIdentityAggregatesTx(
+			ctx, tx, restore.sessionID,
+			[]string{restore.previousProject, restore.currentProject},
+		); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf(
+			"committing session project identity restore: %w", err,
+		)
+	}
+	return int(restored), nil
+}
+
+// reconcileSessionProjectIdentityAggregatesTx republishes only the immutable
+// evidence key carried by sessionID under the supplied current project labels.
+// Aggregate-only legacy evidence has no session snapshot and remains untouched.
+func reconcileSessionProjectIdentityAggregatesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	sessionID string,
+	projects []string,
+) error {
+	var machine, rootPath, gitRemote string
+	err := tx.QueryRowContext(ctx, `
+		SELECT machine, root_path, git_remote
+		FROM session_project_identity_snapshots
+		WHERE session_id = ?`, sessionID,
+	).Scan(&machine, &rootPath, &gitRemote)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading session project identity key: %w", err)
+	}
+	return reconcileProjectIdentityAggregateKeyExec(
+		ctx, tx, machine, rootPath, gitRemote, projects,
+	)
+}
+
+func reconcileProjectIdentityAggregateKeyExec(
+	ctx context.Context,
+	exec sqlContextExecer,
+	machine, rootPath, gitRemote string,
+	projects []string,
+) error {
+	seen := make(map[string]struct{}, len(projects))
+	for _, project := range projects {
+		project = strings.TrimSpace(project)
+		if project == "" {
+			continue
+		}
+		if _, ok := seen[project]; ok {
+			continue
+		}
+		seen[project] = struct{}{}
+
+		if _, err := exec.ExecContext(ctx, `
+			DELETE FROM project_identity_observations
+			WHERE project = ? AND machine = ?
+			  AND root_path = ? AND git_remote = ?`,
+			project, machine, rootPath, gitRemote,
+		); err != nil {
+			return fmt.Errorf(
+				"removing stale project identity aggregate key: %w", err,
+			)
+		}
+
+		_, err := exec.ExecContext(ctx, `
+			INSERT INTO project_identity_observations (
+				source_archive_id, source_archive_salt, project, machine,
+				root_path, git_remote, git_remote_name, repository_path,
+				worktree_name, worktree_root_path, worktree_relationship,
+				checkout_state, git_branch, remote_resolution,
+				remote_candidate_count, observed_at, normalized_remote,
+				key_source, key
+			)
+			SELECT '', '', ?, snap.machine,
+				snap.root_path, snap.git_remote, snap.git_remote_name,
+				snap.repository_path, snap.worktree_name,
+				snap.worktree_root_path, snap.worktree_relationship,
+				snap.checkout_state, snap.git_branch,
+				snap.remote_resolution, snap.remote_candidate_count,
+				snap.observed_at, snap.normalized_remote,
+				snap.key_source, snap.key
+			FROM session_project_identity_snapshots snap
+				INDEXED BY idx_session_project_identity_snapshots_evidence
+			WHERE snap.machine = ? AND snap.root_path = ?
+			  AND snap.git_remote = ?
+			  AND EXISTS (
+				SELECT 1 FROM sessions s
+				WHERE s.id = snap.session_id AND s.deleted_at IS NULL
+				  AND s.machine = ? AND s.project = ?
+			  )
+			  AND (snap.git_remote != '' OR snap.remote_resolution = 'ambiguous'
+			    OR NOT EXISTS (
+				SELECT 1 FROM project_identity_observations remote
+				WHERE remote.project = ? AND remote.machine = snap.machine
+				  AND remote.root_path = snap.root_path AND remote.git_remote != ''
+			    ))
+			ORDER BY (snap.remote_resolution = 'ambiguous') DESC,
+				snap.observed_at DESC, snap.session_id
+			LIMIT 1`,
+			project, machine, rootPath, gitRemote, machine, project, project,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"reconciling project identity aggregate key: %w", err,
+			)
+		}
+	}
+	return nil
+}
+
+func upsertSessionProjectIdentitySnapshotExec(
+	ctx context.Context,
+	exec sqlContextExecer,
+	queryRow contextQueryRow,
+	obs export.ProjectIdentityObservation,
+	allowProjectCorrection bool,
 ) error {
 	if obs.SessionID == "" {
 		return nil
 	}
-	var sessionExists int
-	if err := queryRow(ctx, `SELECT 1 FROM sessions WHERE id = ?`,
-		obs.SessionID).Scan(&sessionExists); err != nil {
+	var sessionProject string
+	if err := queryRow(ctx, `SELECT project FROM sessions WHERE id = ?`,
+		obs.SessionID).Scan(&sessionProject); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -734,35 +1205,73 @@ func upsertSessionProjectIdentitySnapshotExec(
 	}
 	var existing export.ProjectResolution
 	var existingKey string
+	var existingProject string
+	var existingRemote string
+	var existingMachine, existingRoot string
 	err := queryRow(ctx, `
-		SELECT remote_resolution, key
+		SELECT remote_resolution, key, project, git_remote, machine, root_path
 		FROM session_project_identity_snapshots
-		WHERE session_id = ?`, obs.SessionID).Scan(&existing, &existingKey)
+		WHERE session_id = ?`, obs.SessionID).Scan(
+		&existing, &existingKey, &existingProject, &existingRemote, &existingMachine, &existingRoot,
+	)
 	if err == nil {
-		if existing == export.ProjectResolutionResolved ||
-			existing == export.ProjectResolutionAmbiguous ||
-			(obs.RemoteResolution == export.ProjectResolutionUnknown &&
-				(obs.Key == "" || strings.TrimSpace(existingKey) != "")) {
+		// A source-recorded repository URL repairs a checkout-derived
+		// snapshot that never had a remote, but never replaces one that did.
+		recordedRepair := obs.SourceRecorded && obs.GitRemote != "" &&
+			(existing == export.ProjectResolutionAmbiguous ||
+				(existing == export.ProjectResolutionResolved &&
+					strings.TrimSpace(existingRemote) == ""))
+		preserveExisting := !recordedRepair &&
+			(existing == export.ProjectResolutionResolved ||
+				existing == export.ProjectResolutionAmbiguous ||
+				(obs.RemoteResolution == export.ProjectResolutionUnknown &&
+					(obs.Key == "" || strings.TrimSpace(existingKey) != "")))
+		if preserveExisting {
+			// Keep parser evidence even when the historical identity wins.
+			if obs.SourceRecorded {
+				if _, err := exec.ExecContext(ctx, `
+					UPDATE session_project_identity_snapshots
+					SET recorded_git_remote = ? WHERE session_id = ?`,
+					obs.GitRemote, obs.SessionID); err != nil {
+					return fmt.Errorf("saving recorded repository URL: %w", err)
+				}
+			}
+			if allowProjectCorrection && existingProject != obs.Project {
+				if _, err := exec.ExecContext(ctx, `
+					UPDATE session_project_identity_snapshots
+					SET project = ?
+					WHERE session_id = ?`, obs.Project, obs.SessionID); err != nil {
+					return fmt.Errorf(
+						"correcting session project identity snapshot label: %w", err,
+					)
+				}
+			}
 			return nil
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("checking session project identity snapshot: %w", err)
 	}
 
+	recordedRemote := ""
+	if obs.SourceRecorded {
+		recordedRemote = obs.GitRemote
+	}
 	_, err = exec.ExecContext(ctx, `
 		INSERT INTO session_project_identity_snapshots (
 			session_id, project, machine, root_path, git_remote,
-			git_remote_name, repository_path, worktree_name,
+			git_remote_name, recorded_git_remote, repository_path, worktree_name,
 			worktree_root_path, worktree_relationship, checkout_state,
 			git_branch, remote_resolution, remote_candidate_count,
 			observed_at, normalized_remote, key_source, key
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(session_id) DO UPDATE SET
 			project = excluded.project,
 			machine = excluded.machine,
 			root_path = excluded.root_path,
 			git_remote = excluded.git_remote,
 			git_remote_name = excluded.git_remote_name,
+			recorded_git_remote = COALESCE(NULLIF(excluded.recorded_git_remote, ''),
+				session_project_identity_snapshots.recorded_git_remote),
 			repository_path = excluded.repository_path,
 			worktree_name = excluded.worktree_name,
 			worktree_root_path = excluded.worktree_root_path,
@@ -776,7 +1285,7 @@ func upsertSessionProjectIdentitySnapshotExec(
 			key_source = excluded.key_source,
 			key = excluded.key`,
 		obs.SessionID, obs.Project, obs.Machine, obs.RootPath,
-		obs.GitRemote, obs.GitRemoteName, obs.RepositoryPath,
+		obs.GitRemote, obs.GitRemoteName, recordedRemote, obs.RepositoryPath,
 		obs.WorktreeName, obs.WorktreeRootPath, obs.WorktreeRelationship,
 		obs.CheckoutState, obs.GitBranch, obs.RemoteResolution,
 		obs.RemoteCandidateCount, obs.ObservedAt.UTC().Format(time.RFC3339Nano),
@@ -785,18 +1294,24 @@ func upsertSessionProjectIdentitySnapshotExec(
 	if err != nil {
 		return fmt.Errorf("upserting session project identity snapshot: %w", err)
 	}
+	if existingMachine != "" && existingRemote == "" && obs.SourceRecorded {
+		// Reconcile the old evidence key across source and effective labels,
+		// even if the checkout disappeared and discovery now returns cwd.
+		if err := reconcileProjectIdentityAggregateKeyExec(
+			ctx, exec, existingMachine, existingRoot, "",
+			[]string{existingProject, obs.Project, sessionProject},
+		); err != nil {
+			return fmt.Errorf("reconciling recovered project identity root: %w", err)
+		}
+	}
 	return nil
-}
-
-type contextExecer interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
 type contextQueryRow func(context.Context, string, ...any) rowScanner
 
 func upsertProjectIdentityObservationExec(
 	ctx context.Context,
-	exec contextExecer,
+	exec sqlContextExecer,
 	queryRow contextQueryRow,
 	obs export.ProjectIdentityObservation,
 ) error {
@@ -806,7 +1321,7 @@ func upsertProjectIdentityObservationExec(
 
 func upsertProjectIdentityObservationExecExcludingRemote(
 	ctx context.Context,
-	exec contextExecer,
+	exec sqlContextExecer,
 	queryRow contextQueryRow,
 	obs export.ProjectIdentityObservation,
 	excludeRemote string,
@@ -901,10 +1416,10 @@ func normalizeProjectIdentityObservation(
 	obs.WorktreeRootPath = strings.TrimSpace(obs.WorktreeRootPath)
 	obs.GitBranch = strings.TrimSpace(obs.GitBranch)
 	if obs.Project == "" {
-		return obs, fmt.Errorf("project is required")
+		return obs, errors.New("project is required")
 	}
 	if obs.Machine == "" {
-		return obs, fmt.Errorf("machine is required")
+		return obs, errors.New("machine is required")
 	}
 	if obs.ObservedAt.IsZero() {
 		obs.ObservedAt = time.Now().UTC()
@@ -962,6 +1477,7 @@ func scrubProjectIdentityGitRemoteCredentialsTx(
 	if err != nil {
 		return fmt.Errorf("listing project identity remotes for scrub: %w", err)
 	}
+	defer rows.Close()
 
 	type pendingScrub struct {
 		obs       export.ProjectIdentityObservation
@@ -1039,6 +1555,16 @@ func scrubProjectIdentityGitRemoteCredentialsTx(
 	return nil
 }
 
+// ListProjectIdentityObservations returns the aggregate identity
+// observations for the given raw project labels, or every stored
+// observation when labels is nil. Rows are ordered by (project, machine,
+// root_path, git_remote). Label lists of any size are supported: labels
+// are sorted, deduplicated, and split into maxSQLVars-sized chunks so the
+// IN list never exceeds SQLite's bind-variable limit. Because project is
+// the leading ORDER BY key, the chunks partition the sorted label list
+// into disjoint ranges, and SQLite's default BINARY collation matches
+// Go's byte-wise string order, concatenating per-chunk results preserves
+// the single-query global ordering.
 func (db *DB) ListProjectIdentityObservations(
 	ctx context.Context,
 	labels []string,
@@ -1054,9 +1580,38 @@ func (db *DB) listProjectIdentityObservationsFrom(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if labels != nil && len(labels) == 0 {
+	if labels == nil {
+		return listProjectIdentityObservationsChunk(ctx, q, nil)
+	}
+	if len(labels) == 0 {
 		return []export.ProjectIdentityObservation{}, nil
 	}
+	sorted := slices.Clone(labels)
+	slices.Sort(sorted)
+	sorted = slices.Compact(sorted)
+	var out []export.ProjectIdentityObservation
+	err := queryChunked(sorted, func(chunk []string) error {
+		part, err := listProjectIdentityObservationsChunk(ctx, q, chunk)
+		if err != nil {
+			return err
+		}
+		out = append(out, part...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// listProjectIdentityObservationsChunk runs one observation query for a
+// single label chunk (nil means "all rows"); the chunk must already be
+// within SQLite's bind-variable budget.
+func listProjectIdentityObservationsChunk(
+	ctx context.Context,
+	q sessionExportQuerier,
+	labels []string,
+) ([]export.ProjectIdentityObservation, error) {
 	query := `SELECT source_archive_id, source_archive_salt,
 		project, machine, root_path, git_remote, git_remote_name,
 		repository_path, worktree_name, worktree_root_path,
@@ -1125,6 +1680,16 @@ func (db *DB) listSessionProjectIdentitySnapshots(
 ) (map[string]export.ProjectIdentityObservation, error) {
 	return db.listSessionProjectIdentitySnapshotsFrom(
 		ctx, db.getReader(), sessionIDs)
+}
+
+// ListSessionProjectIdentitySnapshotsByID returns the durable source identity
+// for the requested sessions. The result is keyed by session ID and omits IDs
+// without a snapshot.
+func (db *DB) ListSessionProjectIdentitySnapshotsByID(
+	ctx context.Context,
+	sessionIDs []string,
+) (map[string]export.ProjectIdentityObservation, error) {
+	return db.listSessionProjectIdentitySnapshots(ctx, sessionIDs)
 }
 
 func (db *DB) listSessionProjectIdentitySnapshotsFrom(
@@ -1225,6 +1790,120 @@ func (db *DB) ListSessionProjectIdentitySnapshots(
 		return nil, fmt.Errorf("iterating session project identity snapshots: %w", err)
 	}
 	return out, nil
+}
+
+// ListPublishableSessionProjectIdentitySnapshots returns authoritative source
+// snapshots owned by sessions in the current project scope. sessionIDs limits
+// the result when non-nil; an empty non-nil slice returns no rows. Placeholder
+// snapshots created before a session is inspected are deliberately excluded.
+func (db *DB) ListPublishableSessionProjectIdentitySnapshots(
+	ctx context.Context,
+	sessionIDs, projects, excludeProjects []string,
+) ([]export.ProjectIdentityObservation, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if sessionIDs != nil && len(sessionIDs) == 0 {
+		return nil, nil
+	}
+
+	query := func(ids []string) ([]export.ProjectIdentityObservation, error) {
+		predicates := []string{
+			"owner.deleted_at IS NULL",
+			"(TRIM(snap.key_source) != '' OR TRIM(snap.worktree_root_path) != '')",
+		}
+		var args []any
+		appendSet := func(expression string, values []string, negate bool) {
+			if len(values) == 0 {
+				return
+			}
+			placeholders := make([]string, len(values))
+			for i, value := range values {
+				placeholders[i] = "?"
+				args = append(args, value)
+			}
+			op := " IN "
+			if negate {
+				op = " NOT IN "
+			}
+			predicates = append(
+				predicates,
+				expression+op+"("+strings.Join(placeholders, ",")+")",
+			)
+		}
+		appendSet("owner.project", projects, false)
+		appendSet("owner.project", excludeProjects, true)
+		appendSet("snap.session_id", ids, false)
+
+		rows, err := db.getReader().QueryContext(ctx, `
+			SELECT snap.session_id, snap.project, snap.machine, snap.root_path,
+				snap.git_remote, snap.git_remote_name, snap.repository_path,
+				snap.worktree_name, snap.worktree_root_path,
+				snap.worktree_relationship, snap.checkout_state,
+				snap.git_branch, snap.remote_resolution,
+				snap.remote_candidate_count, snap.observed_at,
+				snap.normalized_remote, snap.key_source, snap.key
+			FROM session_project_identity_snapshots snap
+			JOIN sessions owner ON owner.id = snap.session_id
+			WHERE `+strings.Join(predicates, " AND ")+`
+			ORDER BY snap.session_id`, args...)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"listing publishable session project identity snapshots: %w",
+				err,
+			)
+		}
+		defer rows.Close()
+
+		var out []export.ProjectIdentityObservation
+		for rows.Next() {
+			var obs export.ProjectIdentityObservation
+			var observedAt string
+			if err := rows.Scan(
+				&obs.SessionID, &obs.Project, &obs.Machine, &obs.RootPath,
+				&obs.GitRemote, &obs.GitRemoteName, &obs.RepositoryPath,
+				&obs.WorktreeName, &obs.WorktreeRootPath,
+				&obs.WorktreeRelationship, &obs.CheckoutState,
+				&obs.GitBranch, &obs.RemoteResolution,
+				&obs.RemoteCandidateCount, &observedAt,
+				&obs.NormalizedRemote, &obs.KeySource, &obs.Key,
+			); err != nil {
+				return nil, fmt.Errorf(
+					"scanning publishable session project identity snapshot: %w",
+					err,
+				)
+			}
+			obs.ObservedAt, err = time.Parse(time.RFC3339Nano, observedAt)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"parsing publishable session identity timestamp: %w", err,
+				)
+			}
+			out = append(out, obs)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf(
+				"iterating publishable session project identity snapshots: %w",
+				err,
+			)
+		}
+		return out, nil
+	}
+
+	if sessionIDs == nil {
+		return query(nil)
+	}
+	chunkSize := max(maxSQLVars-len(projects)-len(excludeProjects), 1)
+	var out []export.ProjectIdentityObservation
+	err := QueryChunkedSize(sessionIDs, chunkSize, func(ids []string) error {
+		rows, err := query(ids)
+		if err != nil {
+			return err
+		}
+		out = append(out, rows...)
+		return nil
+	})
+	return out, err
 }
 
 func (db *DB) BuildProjectIdentityMap(

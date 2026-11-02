@@ -1,21 +1,27 @@
 package server_test
 
 import (
-	"encoding/json"
+	"database/sql"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"net/http"
-	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/service"
 )
 
 // tokenUsageJSON is a valid token_usage blob for test messages.
-var tokenUsageJSON = json.RawMessage(
+var tokenUsageJSON = jsontext.Value(
 	`{"input_tokens":100,"output_tokens":50,` +
 		`"cache_creation_input_tokens":10,` +
 		`"cache_read_input_tokens":20}`,
@@ -156,7 +162,7 @@ func seedUsagePairwiseEnv(t *testing.T, te *testEnv) {
 		project string
 		started string
 		model   string
-		usage   json.RawMessage
+		usage   jsontext.Value
 	}
 
 	entries := []entry{
@@ -165,7 +171,7 @@ func seedUsagePairwiseEnv(t *testing.T, te *testEnv) {
 			project: "alpha",
 			started: "2024-06-01T09:00:00Z",
 			model:   "claude-sonnet-4-20250514",
-			usage: json.RawMessage(
+			usage: jsontext.Value(
 				`{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":20}`,
 			),
 		},
@@ -174,7 +180,7 @@ func seedUsagePairwiseEnv(t *testing.T, te *testEnv) {
 			project: "beta",
 			started: "2024-06-01T10:00:00Z",
 			model:   "gpt-4o",
-			usage: json.RawMessage(
+			usage: jsontext.Value(
 				`{"input_tokens":30,"output_tokens":15,"cache_creation_input_tokens":0,"cache_read_input_tokens":5}`,
 			),
 		},
@@ -210,7 +216,7 @@ func TestHandleUsageSummaryJSONShape(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 
 	// Verify all expected top-level keys exist.
-	var raw map[string]json.RawMessage
+	var raw map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
 
 	required := []string{
@@ -246,7 +252,7 @@ func TestHandleUsageSummaryIncludesUnsupportedCopilotSignal(t *testing.T) {
 	require.NotNil(t, resp.UnsupportedUsage)
 	assert.Equal(t, service.UnsupportedUsageKindCopilotNoTokenData, resp.UnsupportedUsage.Kind)
 	assert.Equal(t, 0, resp.SessionCounts.Total)
-	assert.Equal(t, 0.0, resp.Totals.TotalCost)
+	assert.Equal(t, money.Money{}, resp.Totals.TotalCost)
 }
 
 func TestHandleUsageSummarySkipsUnsupportedCopilotSignalForMixedFilters(t *testing.T) {
@@ -270,7 +276,7 @@ func TestHandleUsageSummarySkipsUnsupportedCopilotSignalForMixedFilters(t *testi
 func TestHandleUsageSummaryIncludesCursorUsageEvents(t *testing.T) {
 	te := setup(t)
 
-	require.NoError(t, te.db.InsertCursorUsageEvents([]db.CursorUsageEvent{{
+	require.NoError(t, te.db.InsertCursorUsageEvents(t.Context(), []db.CursorUsageEvent{{
 		OccurredAt:       "2026-05-14T10:05:00Z",
 		Model:            "claude-4.6-opus-high-thinking",
 		Kind:             "USAGE_EVENT_KIND_USAGE_BASED",
@@ -278,8 +284,8 @@ func TestHandleUsageSummaryIncludesCursorUsageEvents(t *testing.T) {
 		OutputTokens:     567,
 		CacheWriteTokens: 0,
 		CacheReadTokens:  8901,
-		ChargedCents:     15.66,
-		CursorTokenFee:   3.32,
+		Charged:          money.MustParseDollars("0.1566"),
+		CursorTokenFee:   money.MustParseDollars("0.0332"),
 		UserID:           "152683922",
 		UserEmail:        "member@example.com",
 		IsHeadless:       false,
@@ -295,7 +301,7 @@ func TestHandleUsageSummaryIncludesCursorUsageEvents(t *testing.T) {
 
 	resp := decode[server.UsageSummaryResponse](t, w)
 	require.Len(t, resp.Daily, 1)
-	assert.InDelta(t, 0.1566, resp.Totals.TotalCost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.1566"), resp.Totals.TotalCost)
 	require.NotEmpty(t, resp.AgentTotals)
 	assert.Equal(t, "cursor", resp.AgentTotals[0].Agent)
 }
@@ -336,6 +342,71 @@ func TestHandleUsageTopSessionsLimit(t *testing.T) {
 	assert.LessOrEqual(t, len(entries), 1)
 }
 
+func TestHandleUsageTopSessionsRanksBySelectedTokenTypes(t *testing.T) {
+	te := setup(t)
+	require.NoError(t, te.db.SetSyncState(t.Context(), db.MachineAliasKeyPrefix+"old-owner", "test"))
+	for _, fixture := range []struct {
+		id        string
+		input     int
+		output    int
+		startedAt string
+	}{
+		{
+			id: "input-heavy", input: 1000, output: 1,
+			startedAt: "2024-06-01T09:00:00Z",
+		},
+		{
+			id: "output-heavy", input: 10, output: 50,
+			startedAt: "2024-06-01T10:00:00Z",
+		},
+	} {
+		te.seedSession(t, fixture.id, "demo", 1, func(sess *db.Session) {
+			sess.Agent = "codex"
+			sess.StartedAt = &fixture.startedAt
+		})
+		te.seedMessages(t, fixture.id, 1, func(_ int, msg *db.Message) {
+			msg.Role = "assistant"
+			msg.Timestamp = fixture.startedAt
+			msg.Model = "gpt-5.4"
+			msg.TokenUsage = jsontext.Value(
+				`{"input_tokens":` + strconv.Itoa(fixture.input) +
+					`,"output_tokens":` + strconv.Itoa(fixture.output) + `}`,
+			)
+		})
+	}
+
+	w := te.get(t, buildPathURL(
+		"/api/v1/usage/top-sessions",
+		map[string]string{
+			"from":        "2024-06-01",
+			"to":          "2024-06-01",
+			"timezone":    "UTC",
+			"sort":        "tokens",
+			"token_types": "output",
+			"machine":     "old-owner",
+			"limit":       "1",
+		}))
+	assertStatus(t, w, http.StatusOK)
+
+	var entries []db.TopSessionEntry
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &entries))
+	require.Len(t, entries, 1)
+	assert.Equal(t, "output-heavy", entries[0].SessionID)
+	assert.Equal(t, 10, entries[0].InputTokens)
+	assert.Equal(t, 50, entries[0].OutputTokens)
+	assert.Equal(t, 60, entries[0].TotalTokens)
+}
+
+func TestHandleUsageTopSessionsRejectsUnknownTokenType(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, buildPathURL(
+		"/api/v1/usage/top-sessions",
+		map[string]string{"token_types": "output,unknown"},
+	))
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
 func TestHandleUsagePairwiseComparisonJSONShape(t *testing.T) {
 	te := setup(t)
 	seedUsagePairwiseEnv(t, te)
@@ -354,7 +425,7 @@ func TestHandleUsagePairwiseComparisonJSONShape(t *testing.T) {
 	))
 	assertStatus(t, w, http.StatusOK)
 
-	var raw map[string]json.RawMessage
+	var raw map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
 	assert.Contains(t, raw, "left")
 	assert.Contains(t, raw, "right")
@@ -365,18 +436,36 @@ func TestHandleUsagePairwiseComparisonJSONShape(t *testing.T) {
 	assert.Equal(t, 1, resp.Right.SessionCount)
 }
 
+func TestHandleUsagePairwiseComparisonEmptyDefault(t *testing.T) {
+	te := setup(t)
+	w := te.get(t, buildPathURL("/api/v1/usage/pairwise-comparison", map[string]string{
+		"from": "2024-06-01", "to": "2024-06-01", "timezone": "UTC",
+	}))
+	assertStatus(t, w, http.StatusOK)
+	var raw struct {
+		Left  map[string]jsontext.Value `json:"left"`
+		Right map[string]jsontext.Value `json:"right"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
+	assert.NotContains(t, raw.Left, "dimension")
+	assert.NotContains(t, raw.Left, "value")
+	assert.NotContains(t, raw.Right, "dimension")
+	assert.NotContains(t, raw.Right, "value")
+}
+
 func TestHandleUsagePairwiseComparisonValidation(t *testing.T) {
 	te := setup(t)
 
 	cases := []map[string]string{
 		{
-			"from":            "2024-06-01",
-			"to":              "2024-06-01",
-			"timezone":        "UTC",
-			"left_dimension":  "model",
-			"left_value":      "claude-sonnet-4-20250514",
-			"right_dimension": "machine",
-			"right_value":     "beta",
+			"from":                "2024-06-01",
+			"to":                  "2024-06-01",
+			"timezone":            "UTC",
+			"left_dimension":      "model",
+			"left_value":          "claude-sonnet-4-20250514",
+			"right_dimension":     "machine",
+			"right_value":         "beta",
+			"fallback_to_default": "true",
 		},
 		{
 			"from":            "2024-06-01",
@@ -415,24 +504,89 @@ func TestUsageSummaryErrorRedaction(t *testing.T) {
 	assertStatus(t, w, http.StatusInternalServerError)
 }
 
-// Verify the route is actually registered by checking we
-// don't get a 404 for usage endpoints.
-func TestUsageRoutesRegistered(t *testing.T) {
+func TestHandleUsageTopSessionsGroupsByProjectKey(t *testing.T) {
 	te := setup(t)
+	conn, err := sql.Open("sqlite3", te.db.Path())
+	require.NoError(t, err)
+	defer conn.Close()
+	dbtest.SeedUsageGroups(t, conn)
+	catalog, err := te.db.BuildProjectIdentityMap(t.Context(), []string{"hermes-cron"})
+	require.NoError(t, err)
+	key := catalog["hermes-cron"].ProjectKey
+	require.NotEmpty(t, key)
+	params := map[string]string{"from": "2026-10-07", "to": "2026-10-10", "timezone": "UTC", "include_automated": "true", "group_by": "group", "project_key": key, "project": "hermes-cron", "sort": "tokens", "limit": "1"}
+	w := te.get(t, buildPathURL("/api/v1/usage/top-sessions", params))
+	assertStatus(t, w, http.StatusOK)
+	var response []map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	require.NotEmpty(t, response)
+	assert.Equal(t, "job-a", response[0]["groupKey"])
+}
 
-	endpoints := []string{
-		"/api/v1/usage/summary",
-		"/api/v1/usage/pairwise-comparison",
-		"/api/v1/usage/top-sessions",
-	}
-	for _, ep := range endpoints {
-		t.Run(ep, func(t *testing.T) {
-			req := httptest.NewRequest(
-				http.MethodGet, ep, nil,
-			)
-			w := httptest.NewRecorder()
-			te.handler.ServeHTTP(w, req)
-			assert.NotEqual(t, http.StatusNotFound, w.Code, "%s returned 404", ep)
+func TestUsageSummaryModelGroups(t *testing.T) {
+	te := setup(t, func(c *config.Config) {
+		c.ModelAliases = map[string]string{"claude-sonnet-4-20250514": "group", "gpt-4o": "group"}
+	})
+	seedUsagePairwiseEnv(t, te)
+	for _, tt := range []struct {
+		name, grouped, suffix string
+	}{
+		{"raw", "", ""},
+		{"grouped", "true", ""},
+		{"grouped stream", "true", "/stream"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := te.get(t, buildPathURL("/api/v1/usage/summary"+tt.suffix, map[string]string{
+				"from": "2024-06-01", "to": "2024-06-01", "timezone": "UTC",
+				"group_models": tt.grouped,
+			}))
+			assertStatus(t, w, http.StatusOK)
+			payload := w.Body.String()
+			if tt.suffix == "/stream" {
+				_, done, ok := strings.Cut(payload, "event: done\ndata: ")
+				require.True(t, ok, "no done event in %s", payload)
+				payload, _, _ = strings.Cut(done, "\n")
+			}
+			var body map[string]jsontext.Value
+			require.NoError(t, json.Unmarshal([]byte(payload), &body))
+			if tt.grouped == "true" {
+				assert.JSONEq(t, `{"claude-sonnet-4-20250514":"group","gpt-4o":"group"}`, string(body["model_aliases"]))
+				assert.NotContains(t, body, "pricing")
+				assert.NotContains(t, body, "schema_version")
+			} else {
+				assert.NotContains(t, body, "model_aliases")
+				assert.Contains(t, body, "pricing")
+				assert.Contains(t, body, "schema_version")
+			}
 		})
 	}
+}
+
+func TestUsageTopSessionsModelGroup(t *testing.T) {
+	te := setup(t, func(c *config.Config) {
+		c.ModelAliases = map[string]string{"claude-sonnet-4-20250514": "group", "gpt-4o": "group"}
+	})
+	seedUsagePairwiseEnv(t, te)
+	started := "2024-06-01T11:00:00Z"
+	te.seedSession(t, "unrelated-model", "gamma", 2, func(sess *db.Session) {
+		sess.StartedAt, sess.EndedAt = &started, &started
+		sess.UserMessageCount = 1
+	})
+	te.seedMessages(t, "unrelated-model", 2, func(_ int, m *db.Message) {
+		m.Timestamp = started
+		if m.Role == "assistant" {
+			m.Model = "unrelated"
+			m.TokenUsage = tokenUsageJSON
+		}
+	})
+	w := te.get(t, buildPathURL("/api/v1/usage/top-sessions", map[string]string{
+		"from": "2024-06-01", "to": "2024-06-01", "timezone": "UTC", "model": "group",
+	}))
+	assertStatus(t, w, http.StatusOK)
+	entries := decode[[]db.TopSessionEntry](t, w)
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		ids = append(ids, entry.SessionID)
+	}
+	assert.ElementsMatch(t, []string{"pairwise-alpha-sonnet", "pairwise-beta-gpt"}, ids)
 }

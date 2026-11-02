@@ -1,3 +1,4 @@
+import type { EventSource } from "eventsource";
 import { watchEvents, type DataChangedEvent } from "../api/client.js";
 
 type Listener = (e: DataChangedEvent) => void;
@@ -58,10 +59,7 @@ class EventsStore {
   /** Subscribe with a trailing-edge debounce. The callback fires
    * once, `delayMs` after the last event in a burst, with the
    * most recent event's payload. Returns unsubscribe. */
-  subscribeDebounced(
-    fn: Listener,
-    delayMs = 300,
-  ): () => void {
+  subscribeDebounced(fn: Listener, delayMs = 300): () => void {
     let timer: ReturnType<typeof setTimeout> | null = null;
     let latest: DataChangedEvent | null = null;
 
@@ -87,6 +85,10 @@ class EventsStore {
 
   private ensureOpen() {
     if (!this.available) return;
+    // Hidden streams consume HTTP/1.1 connections that API reads need.
+    if (typeof document !== "undefined" && document.hidden) {
+      return;
+    }
     // Don't retry once watchEvents has told us the endpoint is
     // permanently unavailable. The safety-net polls on each view
     // still keep data fresh in that mode.
@@ -119,11 +121,15 @@ class EventsStore {
         },
       },
     );
+    const es = this.es;
+    es.addEventListener("events_ready", () => {
+      if (this.es !== es) return;
+      for (const fn of this.listeners.values()) fn({ scope: "sync" });
+    });
   }
 
   private close() {
-    if (this.es === null) return;
-    this.es.close();
+    this.es?.close();
     this.es = null;
     if (this.healTimer !== null) {
       clearInterval(this.healTimer);
@@ -145,6 +151,7 @@ class EventsStore {
   // permanentlyFailed so this never becomes a retry storm against
   // a known-dead endpoint like PG serve's 503.
   private ensureHealTimer() {
+    if (!this.available) return;
     if (this.healTimer !== null) return;
     if (this.permanentlyFailed) return;
     this.healTimer = setInterval(() => {
@@ -172,19 +179,17 @@ class EventsStore {
   // subscribe so module import has no global side effect.
   private installVisibilityHandler() {
     if (this.visibilityHandlerInstalled) return;
-    if (
-      typeof document === "undefined" ||
-      typeof document.addEventListener !== "function"
-    ) {
+    if (typeof document === "undefined" || typeof document.addEventListener !== "function") {
       return;
     }
     this.visibilityHandlerInstalled = true;
     document.addEventListener("visibilitychange", () => {
-      if (document.hidden) return;
-      if (!this.permanentlyFailed) return;
-      if (this.listeners.size === 0) return;
+      if (this.listeners.size === 0 || !this.available) return;
+      if (document.hidden) {
+        this.close();
+        return;
+      }
       this.permanentlyFailed = false;
-      this.es = null;
       this.ensureOpen();
       this.ensureHealTimer();
     });

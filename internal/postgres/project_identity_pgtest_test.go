@@ -6,8 +6,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/dbtest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -159,27 +164,47 @@ func TestSyncProjectIdentityObservationsBatchMatchesSequential(t *testing.T) {
 	// Anchor the shared outcome so a bug that changes both paths in the
 	// same way cannot slip through the differential comparison.
 	assert.Equal(t, []identityRow{
-		{"proj", "m1", "/ambiguous-with-real", "", "",
-			"/ambiguous-with-real|"},
-		{"proj", "m1", "/ambiguous-with-real", "git@x:a.git", "origin",
-			"/ambiguous-with-real|git@x:a.git"},
+		{
+			"proj", "m1", "/ambiguous-with-real", "", "",
+			"/ambiguous-with-real|",
+		},
+		{
+			"proj", "m1", "/ambiguous-with-real", "git@x:a.git", "origin",
+			"/ambiguous-with-real|git@x:a.git",
+		},
 		{"proj", "m1", "/fallback-only", "", "", "/fallback-only|"},
-		{"proj", "m1", "/has-remote", "git@x:h.git", "origin",
-			"/has-remote|git@x:h.git"},
-		{"proj", "m1", "/mixed-fallback-first", "git@x:m2.git", "origin",
-			"/mixed-fallback-first|git@x:m2.git"},
-		{"proj", "m1", "/mixed-real-first", "git@x:m1.git", "origin",
-			"/mixed-real-first|git@x:m1.git"},
-		{"proj", "m1", "/preexisting-ambiguous", "", "",
-			"/preexisting-ambiguous|"},
-		{"proj", "m1", "/preexisting-ambiguous", "git@x:p.git", "origin",
-			"/preexisting-ambiguous|git@x:p.git"},
-		{"proj", "m1", "/preexisting-ambiguous-only", "", "",
-			"/preexisting-ambiguous-only|"},
-		{"proj", "m1", "/replaced-fallback", "git@x:r.git", "origin",
-			"/replaced-fallback|git@x:r.git"},
-		{"proj", "m1", "/updated", "git@x:u.git", "new-name",
-			"/updated|git@x:u.git"},
+		{
+			"proj", "m1", "/has-remote", "git@x:h.git", "origin",
+			"/has-remote|git@x:h.git",
+		},
+		{
+			"proj", "m1", "/mixed-fallback-first", "git@x:m2.git", "origin",
+			"/mixed-fallback-first|git@x:m2.git",
+		},
+		{
+			"proj", "m1", "/mixed-real-first", "git@x:m1.git", "origin",
+			"/mixed-real-first|git@x:m1.git",
+		},
+		{
+			"proj", "m1", "/preexisting-ambiguous", "", "",
+			"/preexisting-ambiguous|",
+		},
+		{
+			"proj", "m1", "/preexisting-ambiguous", "git@x:p.git", "origin",
+			"/preexisting-ambiguous|git@x:p.git",
+		},
+		{
+			"proj", "m1", "/preexisting-ambiguous-only", "", "",
+			"/preexisting-ambiguous-only|",
+		},
+		{
+			"proj", "m1", "/replaced-fallback", "git@x:r.git", "origin",
+			"/replaced-fallback|git@x:r.git",
+		},
+		{
+			"proj", "m1", "/updated", "git@x:u.git", "new-name",
+			"/updated|git@x:u.git",
+		},
 	}, batched)
 	var ambiguousResolution string
 	require.NoError(t, pg.QueryRowContext(ctx, `
@@ -204,9 +229,9 @@ func TestSyncProjectIdentityObservationsBatchMatchesSequential(t *testing.T) {
 	assert.Equal(t, batched, readIdentityRows(t, ctx, pg))
 }
 
-func TestPGProjectIdentityAggregatesSourceArchives(t *testing.T) {
+func TestPGListProjectIdentityObservationsChunksLargeLabelLists(t *testing.T) {
 	pgURL := testPGURL(t)
-	const schema = "agentsview_project_identity_selector_test"
+	const schema = "agentsview_project_identity_chunk_test"
 	pg, err := Open(pgURL, schema, true)
 	require.NoError(t, err)
 	defer pg.Close()
@@ -215,67 +240,50 @@ func TestPGProjectIdentityAggregatesSourceArchives(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, EnsureSchema(ctx, pg, schema))
 
-	for i, archiveID := range []string{"archive-a", "archive-b"} {
-		_, err = pg.ExecContext(ctx, `
-			INSERT INTO source_archives (source_archive_id, source_archive_salt)
-			VALUES ($1, $2)`, archiveID, archiveID+"-salt")
-		require.NoError(t, err)
-		_, err = pg.ExecContext(ctx, `
-			INSERT INTO source_project_identity_observations (
-				source_archive_id, source_archive_salt, project, machine,
-				root_path, git_remote, observed_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			archiveID, archiveID+"-salt", "app", "host", "/repo/app",
-			[]string{
-				"https://github.com/acme/app-a.git",
-				"https://github.com/acme/app-b.git",
-			}[i],
-			time.Date(2026, 7, 10, 12, i, 0, 0, time.UTC),
-		)
-		require.NoError(t, err)
+	// Cross the maxPGVars chunk boundary with duplicate labels that
+	// straddle it, and interleave two source archives across the label
+	// range: the ORDER BY leads with source_archive_id, so concatenated
+	// per-chunk (label-range) results are not globally ordered until the
+	// Go re-sort restores the documented ordering.
+	const labelCount = maxPGVars + 50
+	observedAt := time.Date(2025, 6, 2, 10, 0, 0, 0, time.UTC)
+	labels := make([]string, 0, 2*labelCount)
+	const batch = 200
+	for start := 0; start < labelCount; start += batch {
+		end := min(start+batch, labelCount)
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO source_project_identity_observations
+			(source_archive_id, project, machine, root_path, observed_at) VALUES `)
+		args := make([]any, 0, (end-start)*3)
+		for i := start; i < end; i++ {
+			label := fmt.Sprintf("chunked-project-%04d", i)
+			labels = append(labels, label, label)
+			archive := "arch-a"
+			if i%2 == 0 {
+				archive = "arch-b"
+			}
+			if i > start {
+				sb.WriteString(",")
+			}
+			sb.WriteString(fmt.Sprintf("($%d, $%d, 'host.example', '/srv/app', $%d)",
+				len(args)+1, len(args)+2, len(args)+3))
+			args = append(args, archive, label, observedAt)
+		}
+		_, err := pg.ExecContext(ctx, sb.String(), args...)
+		require.NoError(t, err, "seed chunked observations %d-%d", start, end)
 	}
 
 	store := &Store{pg: pg}
-	projects, err := store.BuildProjectIdentityMap(ctx, []string{"app", "missing"})
+	// Reverse the (duplicated) label list to prove the lookup sorts it
+	// before partitioning into chunks.
+	slices.Reverse(labels)
+	got, err := store.ListProjectIdentityObservations(ctx, labels)
 	require.NoError(t, err)
-	assert.Equal(t, export.ProjectResolutionAmbiguous, projects["app"].Resolution)
-	assert.Nil(t, projects["app"].Identity)
-	assert.NotEmpty(t, projects["app"].ProjectKey)
-	assert.NotEmpty(t, projects["missing"].ProjectKey)
-	assert.Contains(t, export.ProjectMapForWire(projects), projects["app"].ProjectKey)
-	assert.Contains(t, export.ProjectMapForWire(projects), projects["missing"].ProjectKey)
-
-}
-
-func TestPGProjectIdentityLegacySessionsUseDistinctFallbackKeys(t *testing.T) {
-	pgURL := testPGURL(t)
-	const schema = "agentsview_project_identity_legacy_scope_test"
-	pg, err := Open(pgURL, schema, true)
+	all, err := store.ListProjectIdentityObservations(ctx, nil)
 	require.NoError(t, err)
-	defer pg.Close()
-	ctx := context.Background()
-	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
-	require.NoError(t, err)
-	require.NoError(t, EnsureSchema(ctx, pg, schema))
-	_, err = pg.ExecContext(ctx, `
-		INSERT INTO sessions (id, project, machine, agent)
-		VALUES
-			('legacy-alpha', 'alpha', 'host', 'codex'),
-			('legacy-beta', 'beta', 'host', 'codex')`)
-	require.NoError(t, err)
-
-	store := &Store{pg: pg}
-	first, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
-	require.NoError(t, err)
-	second, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
-	require.NoError(t, err)
-
-	assert.NotEmpty(t, first["alpha"].ProjectKey)
-	assert.NotEmpty(t, first["beta"].ProjectKey)
-	assert.NotEqual(t, first["alpha"].ProjectKey, first["beta"].ProjectKey)
-	assert.Equal(t, first["alpha"].ProjectKey, second["alpha"].ProjectKey)
-	assert.Equal(t, first["beta"].ProjectKey, second["beta"].ProjectKey)
-	assert.Len(t, export.ProjectMapForWire(first), 2)
+	require.Len(t, all, labelCount)
+	assert.Equal(t, all, got,
+		"chunked label lookup must match the unfiltered scan, order included")
 }
 
 func TestPGSourceArchiveScopeRejectsSaltMismatch(t *testing.T) {
@@ -293,4 +301,37 @@ func TestPGSourceArchiveScopeRejectsSaltMismatch(t *testing.T) {
 		ctx, pg, "archive-a", "salt-a"))
 	err = upsertSourceArchiveScope(ctx, pg, "archive-a", "salt-b")
 	require.ErrorContains(t, err, "archive salt mismatch")
+}
+
+func TestPGUsageGroups(t *testing.T) {
+	const schema = "agentsview_usage_groups_test"
+	pg, err := Open(testPGURL(t), schema, true)
+	require.NoError(t, err)
+	defer pg.Close()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err)
+	require.NoError(t, EnsureSchema(t.Context(), pg, schema))
+	dbtest.SeedUsageGroups(t, pg)
+	dbtest.AssertUsageGroups(t, &Store{pg: pg})
+	_, err = pg.Exec(`UPDATE sessions SET display_name = 'Individual run' WHERE id = 'group-other'`)
+	require.NoError(t, err)
+	store := &Store{pg: pg}
+	for _, grouped := range []bool{false, true} {
+		rows, err := store.GetTopSessionsByCost(t.Context(), db.UsageFilter{TopSessionsByGroup: grouped}, 100)
+		require.NoError(t, err)
+		byID := make(map[string]db.TopSessionEntry)
+		byGroup := make(map[string]db.TopSessionEntry)
+		for _, row := range rows {
+			byID[row.SessionID] = row
+			if row.Project == "hermes-cron" {
+				byGroup[row.GroupKey] = row
+			}
+		}
+		assert.Equal(t, "Individual run", byID["group-other"].DisplayName)
+		assert.Equal(t, "2026-10-08T12:00:00Z", byID["group-other"].StartedAt)
+		if grouped {
+			assert.Equal(t, "Research digest", byGroup["job-a"].DisplayName)
+			assert.Equal(t, "2026-10-08T12:00:00Z", byGroup["job-a"].StartedAt)
+		}
+	}
 }

@@ -3,10 +3,13 @@ title: Session Export
 description: Content-free session summary exports for scripting and analytics
 ---
 
-`agentsview export sessions` emits versioned, content-free session summaries
-from the local archive. It is intended for scripts, BI pipelines, and archive
-handoffs that need session metadata, usage totals, pricing provenance, and
-project identity without transcript text.
+Export session metadata and token and cost totals without transcript text. Use
+`agentsview export sessions` for reporting scripts that need pricing and project
+identity. JSON produces one document; NDJSON writes one JSON object per line.
+
+Labels and launcher parent links belong to the local archive and are excluded
+from artifact export and import. Transcript parents and spawn edges remain
+part of the artifact.
 
 ## Commands
 
@@ -24,7 +27,8 @@ JSON output is one document:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 7,
+  "archive_id": "00000000-0000-4000-8000-000000000002",
   "database_id": "00000000-0000-4000-8000-000000000001",
   "cursor": {
     "next": "opaque-cursor-or-empty"
@@ -34,7 +38,7 @@ JSON output is one document:
     "table_version": "2026-07-03T12:00:00Z",
     "latest_row_updated_at": "2026-07-03T12:00:00Z",
     "custom_override_count": 0,
-    "effective_row_count": 2428,
+    "effective_row_count": 2432,
     "digest": "sha256:8d815a1737bce68fa1a19ba977bf33c8c8efcc74deb954fcf62ce80e46e75f2c",
     "cost_source": "mixed",
     "fallback": {
@@ -43,12 +47,25 @@ JSON output is one document:
     },
     "models": {
       "fixture-model-computed": {
-        "matched_pattern": "fixture-model-computed",
-        "input_cost_per_mtok": 2,
-        "output_cost_per_mtok": 8,
-        "cache_write_cost_per_mtok": 3,
-        "cache_read_cost_per_mtok": 0.5,
-        "cost_source": "computed"
+        "cost_source": "computed",
+        "resolutions": [
+          {
+            "priced_model": "fixture-model-computed",
+            "matched_pattern": "fixture-model-computed",
+            "input_cost_per_mtok": {"microdollars": 2000000},
+            "output_cost_per_mtok": {"microdollars": 8000000},
+            "cache_write_cost_per_mtok": {"microdollars": 3000000},
+            "cache_write_1h_cost_per_mtok": {"microdollars": 0},
+            "cache_read_cost_per_mtok": {"microdollars": 500000},
+            "cost_source": "computed",
+            "bands": null,
+            "application": {
+              "base_request_count": 1,
+              "aggregate_row_count": 0,
+              "bands": null
+            }
+          }
+        ]
       }
     }
   },
@@ -67,6 +84,8 @@ JSON output is one document:
   "sessions": [
     {
       "id": "remote-current",
+      "transcript_revision": "1",
+      "local_modified_at": "2026-07-03T12:00:00.123Z",
       "project": {
         "project_key": "pl1:sha256:333e5f19bc8ed34f56fa89e51a9307bbc972d173498993ed02e564d32162196f",
         "display_label": "remote-project",
@@ -106,7 +125,7 @@ JSON output is one document:
         "cache_creation_input_tokens": 80,
         "cache_read_input_tokens": 400,
         "reasoning_tokens": 0,
-        "cost_usd": 0.00476,
+        "cost": {"microdollars": 4760},
         "has_cost": true,
         "by_model": {
           "fixture-model-computed": {
@@ -116,7 +135,7 @@ JSON output is one document:
             "cache_creation_input_tokens": 80,
             "cache_read_input_tokens": 400,
             "reasoning_tokens": 0,
-            "cost_usd": 0.00476,
+            "cost": {"microdollars": 4760},
             "has_cost": true,
             "cost_source": "computed"
           }
@@ -138,21 +157,104 @@ rows on subsequent lines. The metadata line has `"type": "meta"`; session rows
 do not add a `type` discriminator.
 
 ```json
-{"type":"meta","schema_version":2,"database_id":"00000000-0000-4000-8000-000000000001","cursor":{"next":"..."},"pricing":{},"projects":{}}
-{"id":"path-current","project":{"project_key":"pl1:sha256:...","display_label":"path-project","resolution":"resolved","identity":{"key":"p1:sha256:...","kind":"machine_root","root_key":"r1:sha256:...","repository_key":"repo1:sha256:..."},"worktree":{"relationship":"main_worktree","worktree_key":"wt1:sha256:...","repository_key":"repo1:sha256:..."},"checkout":{"state":"unknown"}},"agent":"claude","started_at":"2026-07-03T11:00:00Z","ended_at":"2026-07-03T11:10:00Z","last_activity_at":"2026-07-03T11:10:00Z","duration_seconds":600,"message_count":4,"user_message_count":2,"assistant_message_count":2,"turn_count":2,"classification":"interactive","is_automated":false,"model_usage":{"models":["fixture-model-reported"],"input_tokens":300,"output_tokens":60,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":0,"cost_usd":0.0125,"has_cost":true,"by_model":{"fixture-model-reported":{"model":"fixture-model-reported","input_tokens":300,"output_tokens":60,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"reasoning_tokens":0,"cost_usd":0.0125,"has_cost":true,"cost_source":"reported"}}},"parent_session_id":null,"relationship_type":"root","total_output_tokens":0,"peak_context_tokens":0,"has_total_output_tokens":false,"has_peak_context_tokens":false}
+{"type":"meta","schema_version":7,"archive_id":"00000000-0000-4000-8000-000000000002","database_id":"00000000-0000-4000-8000-000000000001","cursor":{"next":"..."},"pricing":{},"projects":{}}
+{"id":"path-current","agent":"claude","model_usage":{"models":["fixture-model-reported"],"input_tokens":300,"output_tokens":60,"cost":{"microdollars":12500},"has_cost":true}}
 ```
 
 These snippets are abbreviated illustrations. Complete checked JSON and NDJSON
-outputs live in `testdata/golden/session_export_v2.json` and
-`testdata/golden/session_export_v2.ndjson`.
+outputs live in `testdata/golden/session_export_v7.json` and
+`testdata/golden/session_export_v7.ndjson`.
+
+### Codex Cloud usage
+
+A Codex Cloud session can have no token figures at all, so its `model_usage` can
+be `null`. It also adds two fields, `plan_usage` and `capture_coverage`:
+
+- `model_usage` is `null` when AgentsView has no token counts for the chat. It
+  never listened in while the chat ran, or it listened in but received no
+  token update. The chat's usage is unknown, not zero: do not count it as zero
+  tokens or zero cost. OpenAI's plan usage report covers it instead. Sessions
+  from other agents that recorded no usage still export zeros.
+- `plan_usage` holds OpenAI's newest plan usage report for the chat, the outcome
+  of a later check, or both. Its fields are listed in the
+  [`plan_usage` fields](/docs/session-api/#agentsview-session-usage). An
+  object with only an outcome, such as `account_unavailable`, has no figures.
+  `plan_usage` is omitted when AgentsView has stored neither.
+- `capture_coverage` has `last_capture_at`, when AgentsView last received a
+  token update for the chat, and `uncaptured_turns`, the number of finished
+  turns live capture did not fully see. It is omitted when AgentsView never
+  listened in on the chat.
+
+### Archive and database identity
+
+`archive_id` identifies the logical archive and survives full resync. Within
+that archive, `(archive_id, session.id)` identifies a session across rebuilt
+database generations. `database_id` identifies the physical database generation
+and changes on full resync; pagination cursors remain tied to that generation.
+Both IDs come from the same read snapshot as the exported rows, including empty
+results and the NDJSON metadata line. Missing archive identity is an error, not
+a reason for the read-only export to create an identity.
+
+A changed database ID under the same archive ID means that the archive was
+rebuilt, not that every session is new. Restart pagination and reconcile the new
+snapshot. Neither ID is an ordered revision, and a cursor is not a durable
+change-feed checkpoint. These IDs do not establish which of two delayed exports
+is newer or turn absence from a filtered page into a deletion signal. Copied
+archives retain their logical identity; applications that ingest independent
+copies must define their source scope rather than assume the ID identifies a
+device or a single writer.
+
+### Revision evidence
+
+Schema v6 adds two fields to each session row, in JSON and NDJSON:
+
+- `transcript_revision` is the archive's per-session counter, exported as a
+  decimal string to preserve integer precision. Compare it numerically, not
+  lexicographically. Within one archive's writer lineage, an identical
+  transcript retains its counter through full resync; a changed transcript
+  advances the previous counter once. The comparison includes persisted
+  messages, tool calls, tool-result events, and message token usage. It does
+  not export any of that content.
+- `local_modified_at` is the stored local modification timestamp, or `null` when
+  unavailable. It is not session activity time or measured working time.
+  Transcript and standalone usage-event writes can update it while
+  `last_activity_at` stays unchanged. It is a wall-clock signal: equal values,
+  clock changes, and rebuilds prevent treating it as a monotonic revision.
+  Labels and launcher parent links update only the mirror sync marker.
+
+For a materialized session receipt, retain a tuple of independent version
+evidence: **transcript revision, project identity (or a digest of the complete
+exported `project` reference), and pricing timestamp plus digest**. Also retain
+`local_modified_at` for local metadata and standalone usage-event changes.
+Project evidence can change without a transcript edit. Pricing evidence remains
+page-level: `pricing.latest_row_updated_at` is the latest timestamp among the
+effective pricing rows, and `pricing.digest` identifies their contents. An edit
+to another pricing row need not advance that maximum, and removing the newest
+row can lower it. Keep the digest even when timestamps match or are unavailable.
+
+This is not a lexicographically ordered receipt version. A larger transcript
+counter orders transcript changes, not concurrent project or pricing changes;
+equal counters do not prove equal usage totals. Standalone `usage_events` and
+session metadata are outside transcript equality. Digests establish equality,
+not chronology. Do not use the transcript counter alone to reject or accept an
+entire receipt, or compare counters from independently modified archive copies.
+
+All fields are read with their session rows in the existing read transaction;
+`--all` uses one transaction for all pages. Ordinary cursor pages remain
+separate read transactions with the existing activity-based cursor checks, not a
+revision-pinned historical snapshot. This addition does not change cursor
+semantics or add a modified-since filter, durable checkpoint, or tombstones. A
+future incremental export must cover every export-affecting writer, project and
+pricing changes, cutoff ties, and journal resets before it can promise complete
+change discovery. `--active-since` filters activity time and does not discover
+all corrections to old sessions.
 
 ## Content Boundary
 
-Session summary export does not include message content. V1 intentionally omits
-transcript text, first-message text, thinking text, tool input, tool output, and
-raw transcript bytes. It may include metadata that came from sessions, such as
-sanitized project labels, branch names, model names, token totals, and cost
-totals. It does not emit raw working-directory paths.
+Session summary export omits transcript text, first-message text, thinking text,
+tool input, tool output, and raw transcript bytes. It may include metadata that
+came from sessions, such as sanitized project labels, branch names, model names,
+token totals, and cost totals. It does not emit raw working-directory paths.
 
 ## Project Evidence
 
@@ -176,7 +278,7 @@ directory basename.
 
 The report-level `projects` catalog uses the same identities, but remote-backed
 catalog entries omit the session-specific `root_key`. See
-[Project Identity](/token-usage/#project-identity) for key prefixes,
+[Project Identity](/docs/token-usage/#project-identity) for key prefixes,
 normalization, shared-store scope, and privacy guarantees.
 
 ## Filters And Limits
@@ -271,22 +373,35 @@ error.
 Its v1 shape shipped in 0.37.1. Releases 0.38.0 and 0.38.1 introduced the
 current privacy-bounded project, repository, worktree, and checkout evidence
 shape but mistakenly continued to report version 1. Current builds report
-version 2; payloads from those two transitional releases must not be treated as
-v1-compatible. There is no flag to request v1 output. Additive fields do not
-require a bump, but row semantic changes, field type changes, sort order
-changes, cursor semantics changes, required-field meaning changes, field
-removal, pricing digest canonicalization changes, project key derivation
-changes, remote normalization changes, path fallback normalization changes, and
-new closed-enum values require a bump.
+version 7. Version 2 corrected the project-evidence marker, version 3 introduced
+exact microdollar money objects, and version 4 adds explicit
+reported-to-priced-model resolutions with complete request-pricing bands and
+application counts. Version 5 selects complete Claude snapshots before generic
+deduplication across pagination and session filters, retains earliest-session
+attribution, and includes the maximum observed web-search count in pricing.
+Version 6 applies provider-specific billing identity to computed usage and
+preserves reported cost rows and custom pricing overrides. Costs from v5 and v6
+must not be compared as the same billing semantics. Publishing `archive_id` is
+an additive v6 extension: existing session IDs, database IDs, usage, pricing,
+ordering, and cursor semantics are unchanged. Version 7 lets `model_usage` be
+`null` for a Codex Cloud session whose token counts are unknown; a v6 consumer
+that expects an object there must be updated. The two transitional releases must
+not be treated as v1-compatible. There is no flag to request an earlier output
+version. Additive fields do not require a bump, but row semantic changes, field
+type changes, sort order changes, cursor semantics changes, required-field
+meaning changes, field removal, pricing digest canonicalization changes, project
+key derivation changes, remote normalization changes, path fallback
+normalization changes, and new closed-enum values require a bump.
 
 Consumers should require the expected `schema_version` and ignore unknown
 additive fields.
 
-Closed v2 enums in this surface include project `resolution` (`resolved`,
-`unknown`, `ambiguous`), session `classification` (`interactive`, `automated`),
-and `cost_source` (`computed`, `reported`, `mixed`).
+Closed enums established in version 2 and unchanged in version 7 include project
+`resolution` (`resolved`, `unknown`, `ambiguous`), session `classification`
+(`interactive`, `automated`), and `cost_source` (`computed`, `reported`,
+`mixed`).
 
-See [Token Usage & Costs](/token-usage/#pricing-provenance) for the shared
+See [Token Usage & Costs](/docs/token-usage/#pricing-provenance) for the shared
 pricing provenance contract and
-[Token Usage & Costs](/token-usage/#project-identity) for the shared project
-identity contract.
+[Token Usage & Costs](/docs/token-usage/#project-identity) for the shared
+project identity contract.

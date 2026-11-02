@@ -4,21 +4,28 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
 type fsnotifyBackend struct {
 	watcher           *fsnotify.Watcher
+	eventInput        <-chan fsnotify.Event
 	errorInput        <-chan error
 	watchOps          fsnotifyWatchOps
+	walkDir           func(string, fs.WalkDirFunc) error
+	queue             *nativeEventQueue
 	events            chan backendEvent
 	errors            chan error
 	excludes          []string
@@ -30,19 +37,149 @@ type fsnotifyBackend struct {
 	watchOwners       map[string]map[string]struct{}
 	watchBudgetCost   map[string]int
 	runtimeBudget     int
-	rootScopes        map[string][]string
+	rootScopes        map[string][]PollingScope
 	degradedRoots     map[string]struct{}
 	onPollingRequired func(PollingObligation) error
+	onPollingReleased func(string) error
+	runtimeRoots      map[string]*runtimeWatchRoot
+	pollingMu         sync.Mutex
 	lifecycleMu       sync.Mutex
 	lifecycle         fsnotifyBackendLifecycle
 	stop              chan struct{}
+	pumpOnce          sync.Once
+	pumpStarted       atomic.Bool
+	pumpStop          chan struct{}
+	pumpDone          chan struct{}
 	done              chan struct{}
 	finishOnce        sync.Once
+
+	// depthMu guards rootDepths and rootExtraDirs. It is a leaf lock: it is
+	// taken inside rootsMu and watchMu readers, so never acquire another
+	// lock under it.
+	depthMu       sync.RWMutex
+	rootDepths    map[string]int
+	rootExtraDirs map[string][]string
+}
+
+type runtimeWatchRoot struct {
+	folders map[string]*runtimeWatchFolder
+	retryAt time.Time
+	timer   *time.Timer
+}
+
+type runtimeWatchFolder struct {
+	polling bool
+	delay   time.Duration
+	retryAt time.Time
+}
+
+// nativeEventQueueLimit bounds events held between the native reader and the
+// translating loop. It matches inotify's default max_queued_events; past it
+// the queue drops pending events and reports an overflow, which the loop
+// already turns into a lost-events full sync.
+const nativeEventQueueLimit = 16384
+
+type nativeItem struct {
+	event fsnotify.Event
+	err   error
+	retry bool
+}
+
+// nativeEventQueue decouples reading the native watcher from translating its
+// events. fsnotify's Windows backend services Add and Remove on the same
+// goroutine that delivers events over an unbuffered channel, so the goroutine
+// that consumes events must never be the one waiting on Add or Remove.
+type nativeEventQueue struct {
+	mu       sync.Mutex
+	items    []nativeItem
+	overflow bool
+	retry    bool
+	closed   bool
+	signal   chan struct{}
+}
+
+func newNativeEventQueue() *nativeEventQueue {
+	return &nativeEventQueue{signal: make(chan struct{}, 1)}
+}
+
+func (q *nativeEventQueue) push(item nativeItem) {
+	q.mu.Lock()
+	if item.retry {
+		q.retry = true
+	} else if len(q.items) >= nativeEventQueueLimit {
+		q.items = nil
+		q.overflow = true
+	} else {
+		q.items = append(q.items, item)
+	}
+	q.mu.Unlock()
+	q.wake()
+}
+
+func (q *nativeEventQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	q.wake()
+}
+
+func (q *nativeEventQueue) wake() {
+	select {
+	case q.signal <- struct{}{}:
+	default:
+	}
+}
+
+// next blocks until an item is available, the queue is closed and drained, or
+// stop is closed. An overflow surfaces as fsnotify.ErrEventOverflow ahead of
+// anything queued after it.
+func (q *nativeEventQueue) next(stop <-chan struct{}) (nativeItem, bool) {
+	for {
+		q.mu.Lock()
+		if q.overflow {
+			q.overflow = false
+			q.mu.Unlock()
+			return nativeItem{err: fsnotify.ErrEventOverflow}, true
+		}
+		if q.retry {
+			q.retry = false
+			q.mu.Unlock()
+			return nativeItem{retry: true}, true
+		}
+		if len(q.items) > 0 {
+			item := q.items[0]
+			q.items[0] = nativeItem{}
+			q.items = q.items[1:]
+			if len(q.items) == 0 {
+				q.items = nil
+			}
+			q.mu.Unlock()
+			return item, true
+		}
+		closed := q.closed
+		q.mu.Unlock()
+		if closed {
+			return nativeItem{}, false
+		}
+		select {
+		case <-q.signal:
+		case <-stop:
+			return nativeItem{}, false
+		}
+	}
 }
 
 type fsnotifyWatchOps interface {
 	Add(path string) error
 	Remove(path string) error
+}
+
+type bufferedFSNotifyWatchOps struct {
+	*fsnotify.Watcher
+}
+
+func (w bufferedFSNotifyWatchOps) Add(path string) error {
+	return w.AddWith(path, fsnotify.WithBufferSize(16<<10))
 }
 
 type fsnotifyBackendLifecycle uint8
@@ -60,16 +197,22 @@ func newFSNotifyBackend(excludes []string) (*fsnotifyBackend, error) {
 	}
 	return &fsnotifyBackend{
 		watcher:         watcher,
+		eventInput:      watcher.Events,
 		errorInput:      watcher.Errors,
-		watchOps:        watcher,
+		watchOps:        bufferedFSNotifyWatchOps{Watcher: watcher},
+		walkDir:         filepath.WalkDir,
+		queue:           newNativeEventQueue(),
 		events:          make(chan backendEvent),
 		errors:          make(chan error, 1),
 		excludes:        normalizeExcludePatterns(excludes),
 		watchOwners:     make(map[string]map[string]struct{}),
 		watchBudgetCost: make(map[string]int),
-		rootScopes:      make(map[string][]string),
+		rootScopes:      make(map[string][]PollingScope),
 		degradedRoots:   make(map[string]struct{}),
+		runtimeRoots:    make(map[string]*runtimeWatchRoot),
 		stop:            make(chan struct{}),
+		pumpStop:        make(chan struct{}),
+		pumpDone:        make(chan struct{}),
 		done:            make(chan struct{}),
 	}, nil
 }
@@ -77,25 +220,48 @@ func newFSNotifyBackend(excludes []string) (*fsnotifyBackend, error) {
 func (b *fsnotifyBackend) Events() <-chan backendEvent { return b.events }
 func (b *fsnotifyBackend) Errors() <-chan error        { return b.errors }
 
-func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchResult {
+func (b *fsnotifyBackend) AddRecursive(root string, budget int) (result RecursiveWatchResult) {
+	b.startPump()
+	b.pollingMu.Lock()
 	b.watchMu.Lock()
-	defer b.watchMu.Unlock()
+	var failedFolders []string
+	defer func() {
+		b.watchMu.Unlock()
+		b.pollingMu.Unlock()
+		if len(failedFolders) > 0 {
+			b.acquireRuntimeFolderPolling(root)
+			b.watchMu.Lock()
+			if state := b.runtimeRoots[root]; state != nil {
+				for _, folder := range failedFolders {
+					if entry := state.folders[folder]; entry != nil && entry.polling {
+						result.Unwatched--
+					}
+				}
+			}
+			b.watchMu.Unlock()
+		}
+	}()
 
-	var result RecursiveWatchResult
 	root = filepath.Clean(root)
 	b.addRecursiveRoot(root)
+	deferFolder := func(path string, err error) {
+		if path != root && watchFolderGone(path) {
+			result.Unwatched--
+			return
+		}
+		if path != root && b.onPollingRequired != nil {
+			b.deferRuntimeFolderLocked(root, path, err)
+			failedFolders = append(failedFolders, path)
+		}
+	}
 
 	remaining := budget
-	result.Err = filepath.WalkDir(root,
+	result.Err = b.walkDir(root,
 		func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
-				// WalkDir surfaces errors only for the root stat and failed
-				// directory reads, so this subtree's descendants get no
-				// native watches. Count it as degraded coverage — the owning
-				// logical root then gains a polling obligation instead of
-				// the result appearing fully watched — and keep walking the
-				// accessible remainder.
+				// Poll only the unreadable subtree while walking the accessible remainder.
 				result.Unwatched++
+				deferFolder(path, err)
 				return nil
 			}
 			if !d.IsDir() {
@@ -105,7 +271,23 @@ func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchRe
 			if path != root && b.shouldExcludeForRoot(path, root) {
 				return filepath.SkipDir
 			}
-			if remaining <= 0 {
+			// A directory an earlier root already watches natively is shared,
+			// not installed again: the kernel watch is already paid for, so
+			// settle reuse before the budget check or an overlapping root
+			// would be refused coverage that already exists.
+			if len(b.watchOwners[path]) > 0 {
+				b.addWatchOwner(path, root)
+				result.Watched++
+				return nil
+			}
+			// The root's own directory is the mandatory part of a recursive
+			// registration and its subtree is the discretionary part. A
+			// shallow unit's watch is installed unconditionally, so a plan
+			// that merges one into a recursive unit at the same path would
+			// lose that coverage the moment the budget ran out. The subtree
+			// below still reports BudgetExhausted and hands off to polling.
+			mandatory := path == root
+			if remaining <= 0 && !mandatory {
 				result.BudgetExhausted = true
 				return filepath.SkipAll
 			}
@@ -116,11 +298,20 @@ func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchRe
 					result.ResourceExhaustedAt = path
 					return filepath.SkipAll
 				}
+				deferFolder(path, addErr)
 				return nil
 			}
-			b.watchBudgetCost[path]++
+			// A mandatory watch installed past the budget sits outside the
+			// accounting entirely, the way a shallow root already does: it is
+			// not charged, so removing it must not refund a slot the process
+			// never spent. Charging it and refunding it would leave headroom
+			// above the cap that runtime subtree adds could then claim.
+			if remaining > 0 {
+				b.watchBudgetCost[path]++
+				remaining--
+				result.Allocated++
+			}
 			b.addWatchOwner(path, root)
-			remaining--
 			result.Watched++
 			return nil
 		})
@@ -134,29 +325,55 @@ func (b *fsnotifyBackend) AddRecursive(root string, budget int) RecursiveWatchRe
 func (b *fsnotifyBackend) setWatchRootPlan(roots []WatchRoot) {
 	b.watchMu.Lock()
 	defer b.watchMu.Unlock()
-	b.rootScopes = make(map[string][]string, len(roots))
+	b.rootScopes = make(map[string][]PollingScope, len(roots))
+	depths := make(map[string]int)
+	extras := make(map[string][]string)
+	for _, root := range roots {
+		if !root.Recursive || root.MaxDepth <= 0 {
+			continue
+		}
+		path := filepath.Clean(root.Path)
+		depths[path] = root.MaxDepth
+		if len(root.ExtraDirectories) > 0 {
+			extras[path] = append([]string(nil), root.ExtraDirectories...)
+		}
+	}
+	b.depthMu.Lock()
+	b.rootDepths = depths
+	b.rootExtraDirs = extras
+	b.depthMu.Unlock()
 	for _, root := range roots {
 		path := filepath.Clean(root.Path)
 		for _, scope := range root.Scopes {
-			if scope.SyncDir != "" {
-				b.rootScopes[path] = append(b.rootScopes[path], scope.SyncDir)
+			if scope.SyncDir == "" {
+				continue
+			}
+			ps := PollingScope{Agent: scope.Agent, Root: filepath.Clean(scope.SyncDir)}
+			if !slices.Contains(b.rootScopes[path], ps) {
+				b.rootScopes[path] = append(b.rootScopes[path], ps)
 			}
 		}
-		slices.Sort(b.rootScopes[path])
-		b.rootScopes[path] = slices.Compact(b.rootScopes[path])
+		slices.SortFunc(b.rootScopes[path], func(a, b PollingScope) int {
+			if a.Agent != b.Agent {
+				return strings.Compare(a.Agent, b.Agent)
+			}
+			return strings.Compare(a.Root, b.Root)
+		})
 	}
 }
 
 func (b *fsnotifyBackend) bindPollingOwnership(
 	required func(PollingObligation) error,
-	_ func(string) error,
+	released func(string) error,
 ) {
 	b.watchMu.Lock()
 	defer b.watchMu.Unlock()
 	b.onPollingRequired = required
+	b.onPollingReleased = released
 }
 
 func (b *fsnotifyBackend) AddShallow(root string) error {
+	b.startPump()
 	b.watchMu.Lock()
 	defer b.watchMu.Unlock()
 
@@ -169,9 +386,23 @@ func (b *fsnotifyBackend) AddShallow(root string) error {
 	return nil
 }
 
-func (b *fsnotifyBackend) Remove(root string) error {
+func (b *fsnotifyBackend) Remove(root string) (removeErr error) {
+	b.startPump()
+	b.pollingMu.Lock()
 	b.watchMu.Lock()
-	defer b.watchMu.Unlock()
+	var pollingKeys []string
+	defer func() {
+		released := b.onPollingReleased
+		b.watchMu.Unlock()
+		b.pollingMu.Unlock()
+		for _, key := range pollingKeys {
+			if released == nil {
+				removeErr = errors.Join(removeErr, fmt.Errorf("fsnotify root removed for %s without polling release callback", root))
+			} else if err := released(key); err != nil {
+				removeErr = errors.Join(removeErr, fmt.Errorf("release fsnotify polling for %s: %w", root, err))
+			}
+		}
+	}()
 
 	root = filepath.Clean(root)
 	b.rootsMu.Lock()
@@ -191,6 +422,19 @@ func (b *fsnotifyBackend) Remove(root string) error {
 		return candidate == root
 	})
 	b.rootsMu.Unlock()
+	if _, degraded := b.degradedRoots[root]; degraded {
+		pollingKeys = append(pollingKeys, "fsnotify-runtime:"+root)
+	}
+	if state, ok := b.runtimeRoots[root]; ok {
+		state.timer.Stop()
+		for folder, entry := range state.folders {
+			if entry.polling {
+				pollingKeys = append(pollingKeys, runtimeFolderPollingKey(root, folder))
+			}
+		}
+	}
+	delete(b.runtimeRoots, root)
+	delete(b.degradedRoots, root)
 
 	ownedPaths := make([]string, 0)
 	for path, owners := range b.watchOwners {
@@ -224,10 +468,16 @@ func (b *fsnotifyBackend) Start() error {
 		return nil
 	}
 	b.lifecycle = fsnotifyBackendRunning
+	b.startPump()
 	go b.loop()
 	return nil
 }
 
+// Stop ends event delivery and closes the native watcher. When the loop is
+// running it owns the shutdown order: it closes the native watcher only after
+// it has left any in-flight Add or Remove, so a pending request cannot be
+// abandoned by fsnotify's Close, then releases the pump. When the loop never
+// ran, Stop releases the pump itself before closing the native watcher.
 func (b *fsnotifyBackend) Stop() {
 	b.lifecycleMu.Lock()
 	if b.lifecycle == fsnotifyBackendStopped {
@@ -239,8 +489,12 @@ func (b *fsnotifyBackend) Stop() {
 	wasRunning := b.lifecycle == fsnotifyBackendRunning
 	b.lifecycle = fsnotifyBackendStopped
 	close(b.stop)
-	_ = b.watcher.Close()
 	if !wasRunning {
+		close(b.pumpStop)
+		if b.pumpStarted.Load() {
+			<-b.pumpDone
+		}
+		_ = b.watcher.Close()
 		b.finish()
 	}
 	done := b.done
@@ -250,48 +504,115 @@ func (b *fsnotifyBackend) Stop() {
 
 func (b *fsnotifyBackend) Name() string { return "fsnotify" }
 
-func (b *fsnotifyBackend) loop() {
-	defer b.finish()
+// startPump runs the native reader before the first native Add or Remove.
+// On Windows, fsnotify services those requests on the goroutine that
+// delivers events over an unbuffered channel, and registration installs
+// watches before Start runs, so an event arriving between registration Adds
+// would block the next Add forever if nothing consumed events yet. The input
+// channels are captured here so a test seam assigned before the first native
+// operation is never read concurrently with the pump.
+func (b *fsnotifyBackend) startPump() {
+	b.pumpOnce.Do(func() {
+		b.pumpStarted.Store(true)
+		go b.pump(b.eventInput, b.errorInput)
+	})
+}
+
+// pump is the sole reader of the native watcher's channels. It never calls
+// back into the native watcher, so fsnotify's reader is never left blocked
+// delivering an event while the loop waits on Add or Remove.
+func (b *fsnotifyBackend) pump(
+	eventInput <-chan fsnotify.Event,
+	errorInput <-chan error,
+) {
+	defer close(b.pumpDone)
+	defer b.queue.close()
 	for {
 		select {
+		case <-b.pumpStop:
+			return
+		case event, ok := <-eventInput:
+			if !ok {
+				return
+			}
+			b.queue.push(nativeItem{event: event})
+		case err, ok := <-errorInput:
+			if !ok {
+				return
+			}
+			b.queue.push(nativeItem{err: err})
+		}
+	}
+}
+
+func (b *fsnotifyBackend) loop() {
+	defer func() {
+		_ = b.watcher.Close()
+		close(b.pumpStop)
+		<-b.pumpDone
+		b.finish()
+	}()
+	for {
+		item, ok := b.queue.next(b.stop)
+		if !ok {
+			return
+		}
+		if item.retry {
+			if !b.retryRuntimeFolders(time.Now()) {
+				return
+			}
+			continue
+		}
+		if item.err != nil {
+			if !b.forwardNativeError(item.err) {
+				return
+			}
+			continue
+		}
+		translated, relevant := b.translateEvent(item.event)
+		if !relevant {
+			continue
+		}
+		select {
+		case b.events <- translated:
 		case <-b.stop:
 			return
-		case event, ok := <-b.watcher.Events:
-			if !ok {
-				return
-			}
-			translated, relevant := b.translateEvent(event)
-			if !relevant {
-				continue
-			}
-			select {
-			case b.events <- translated:
-			case <-b.stop:
-				return
-			}
-		case err, ok := <-b.errorInput:
-			if !ok {
-				return
-			}
-			if errors.Is(err, fsnotify.ErrEventOverflow) {
-				select {
-				case b.events <- backendEvent{Op: backendOpFullSync}:
-				case <-b.stop:
-					return
-				}
-				continue
-			}
-			select {
-			case b.errors <- err:
-			case <-b.stop:
-				return
-			}
 		}
+	}
+}
+
+// forwardNativeError reports false when the backend is stopping.
+func (b *fsnotifyBackend) forwardNativeError(err error) bool {
+	if errors.Is(err, fsnotify.ErrEventOverflow) {
+		// Overflow dropped raw events before their watch-maintenance side
+		// effects ran, so creates under recursive roots may have left
+		// subtrees without native watches. The full sync recovers the data
+		// but not the watches; polling covers the lost subtrees. Shallow
+		// roots are revalidated in place instead.
+		b.requireRuntimePolling(b.recursiveRootsSnapshot())
+		b.reinstallShallowWatches()
+		select {
+		case b.events <- backendEvent{Op: backendOpFullSync}:
+			return true
+		case <-b.stop:
+			return false
+		}
+	}
+	select {
+	case b.errors <- err:
+		return true
+	case <-b.stop:
+		return false
 	}
 }
 
 func (b *fsnotifyBackend) finish() {
 	b.finishOnce.Do(func() {
+		b.watchMu.Lock()
+		for _, state := range b.runtimeRoots {
+			state.timer.Stop()
+		}
+		b.watchMu.Unlock()
 		close(b.events)
 		close(b.errors)
 		close(b.done)
@@ -301,6 +622,15 @@ func (b *fsnotifyBackend) finish() {
 func (b *fsnotifyBackend) translateEvent(event fsnotify.Event) (backendEvent, bool) {
 	op := translateFSNotifyOp(event.Op)
 	if op == backendOpUnknown {
+		return backendEvent{}, false
+	}
+	// fsnotify still reports changes to files below a watched directory even
+	// when the file matched an exclusion during directory registration. Ignore
+	// those events here as well, otherwise transient lock-file renames can be
+	// mistaken for session changes while another process is replacing the
+	// lock. A depth limit drops directories below the plan, but a file
+	// directly inside a watched directory stays visible after it is removed.
+	if b.shouldDropEvent(event.Name) {
 		return backendEvent{}, false
 	}
 
@@ -371,10 +701,35 @@ func (b *fsnotifyBackend) watchCreatedPath(path string) (backendItemType, bool) 
 		b.watchMu.Unlock()
 		return backendItemDirectory, false
 	}
-	degraded := b.addRuntimeSubtreeLocked(path, owners)
+	degraded, _ := b.addRuntimeSubtreeLocked(path, owners)
 	b.watchMu.Unlock()
-	b.requireRuntimePolling(degraded)
+	for _, root := range degraded {
+		b.acquireRuntimeFolderPolling(root)
+	}
 	return backendItemDirectory, false
+}
+
+func (b *fsnotifyBackend) deferRuntimeFolderLocked(root, folder string, cause error) {
+	now := time.Now()
+	state, ok := b.runtimeRoots[root]
+	if !ok {
+		state = &runtimeWatchRoot{folders: make(map[string]*runtimeWatchFolder), retryAt: now.Add(10 * time.Second)}
+		state.timer = time.AfterFunc(10*time.Second, func() { b.queue.push(nativeItem{retry: true}) })
+		b.runtimeRoots[root] = state
+	}
+	if _, deferred := state.folders[folder]; !deferred {
+		entry := &runtimeWatchFolder{delay: 10 * time.Second, retryAt: now.Add(10 * time.Second)}
+		state.folders[folder] = entry
+		if entry.retryAt.Before(state.retryAt) {
+			state.retryAt = entry.retryAt
+			state.timer.Reset(time.Until(entry.retryAt))
+		}
+		count := len(state.folders)
+		// Log the first deferral and doubled counts to bound burst logging.
+		if count&(count-1) == 0 {
+			log.Printf("fsnotify watch deferred under %q for %q: %v; deferred folders=%d", root, folder, cause, count)
+		}
+	}
 }
 
 // addRuntimeSubtreeLocked recursively covers a newly created or moved-in
@@ -383,14 +738,31 @@ func (b *fsnotifyBackend) watchCreatedPath(path string) (backendItemType, bool) 
 func (b *fsnotifyBackend) addRuntimeSubtreeLocked(
 	path string,
 	owners []string,
-) []string {
+) ([]string, bool) {
 	degraded := make(map[string]struct{})
-	_ = filepath.WalkDir(path, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			for _, root := range owners {
+	complete := true
+	deferFolder := func(folder string, currentOwners []string, cause error) {
+		complete = false
+		if b.onPollingRequired == nil {
+			b.reportError(fmt.Errorf("fsnotify coverage degraded for %s without polling callback: %w", folder, cause))
+			return
+		}
+		for _, root := range currentOwners {
+			if _, degraded := b.degradedRoots[root]; degraded {
+				continue
+			}
+			b.deferRuntimeFolderLocked(root, folder, cause)
+			if !b.runtimeRoots[root].folders[folder].polling {
 				degraded[root] = struct{}{}
 			}
-			return filepath.SkipAll
+		}
+	}
+	_ = b.walkDir(path, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if !watchFolderGone(current) {
+				deferFolder(current, owners, walkErr)
+			}
+			return filepath.SkipDir
 		}
 		if !entry.IsDir() {
 			return nil
@@ -407,15 +779,22 @@ func (b *fsnotifyBackend) addRuntimeSubtreeLocked(
 		if len(b.watchOwners[current]) == 0 {
 			if b.runtimeBudget <= 0 {
 				for _, root := range currentOwners {
-					degraded[root] = struct{}{}
+					deferFolder(root, []string{root}, errors.New("native watch budget exhausted"))
 				}
-				return filepath.SkipAll
+				return filepath.SkipDir
 			}
-			if err := b.watchOps.Add(current); err != nil {
-				for _, root := range currentOwners {
-					degraded[root] = struct{}{}
+			err := b.watchOps.Add(current)
+			if err != nil {
+				if !watchFolderGone(current) {
+					if isWatchResourceExhaustion(err) {
+						for _, root := range currentOwners {
+							deferFolder(root, []string{root}, err)
+						}
+					} else {
+						deferFolder(current, currentOwners, err)
+					}
 				}
-				return filepath.SkipAll
+				return filepath.SkipDir
 			}
 			b.watchBudgetCost[current]++
 			b.runtimeBudget--
@@ -430,7 +809,15 @@ func (b *fsnotifyBackend) addRuntimeSubtreeLocked(
 		roots = append(roots, root)
 	}
 	slices.Sort(roots)
-	return roots
+	return roots, complete
+}
+
+func watchFolderGone(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+	}
+	return !info.IsDir() && info.Mode()&os.ModeSymlink == 0
 }
 
 // forgetRemovedSubtree clears native-watch ownership invalidated by a
@@ -486,36 +873,244 @@ func (b *fsnotifyBackend) reclaimWatchBudgetLocked(path string) {
 }
 
 func (b *fsnotifyBackend) requireRuntimePolling(roots []string) {
+	b.acquireRuntimePolling(roots, true)
+}
+
+func (b *fsnotifyBackend) acquireRuntimeFolderPolling(root string) {
+	b.acquireRuntimePolling([]string{root}, false)
+}
+
+func runtimeFolderPollingKey(root, folder string) string {
+	if folder == root {
+		return "fsnotify-runtime:" + root
+	}
+	return FSNotifyFolderPollingPrefix + root + ":" + folder
+}
+
+func runtimeFolderPollingScopes(root, folder string, scopes []PollingScope) []PollingScope {
+	var result []PollingScope
+	for _, scope := range scopes {
+		if folder != root && scope.Agent == "claude" {
+			if pathAtOrBelow(scope.Root, folder) {
+				rel, err := filepath.Rel(scope.Root, folder)
+				if err == nil && rel != "." {
+					scope.Root = filepath.Join(scope.Root, strings.Split(rel, string(filepath.Separator))[0])
+				}
+			} else if !pathAtOrBelow(folder, scope.Root) {
+				continue
+			}
+		}
+		result = append(result, scope)
+	}
+	return result
+}
+
+func (b *fsnotifyBackend) acquireRuntimePolling(roots []string, wholeRoot bool) {
+	type acquisition struct {
+		root       string
+		folder     string
+		state      *runtimeWatchRoot
+		entry      *runtimeWatchFolder
+		obligation PollingObligation
+		acquired   bool
+	}
+	b.pollingMu.Lock()
+	b.watchMu.Lock()
+	required, released := b.onPollingRequired, b.onPollingReleased
+	var requests []acquisition
 	for _, root := range roots {
-		b.watchMu.Lock()
-		if _, already := b.degradedRoots[root]; already {
-			b.watchMu.Unlock()
+		if _, degraded := b.degradedRoots[root]; degraded {
 			continue
 		}
-		required := b.onPollingRequired
-		scopes := append([]string(nil), b.rootScopes[root]...)
-		b.watchMu.Unlock()
-		if len(scopes) == 0 {
-			scopes = []string{root}
+		state := b.runtimeRoots[root]
+		folders := []string{root}
+		if !wholeRoot {
+			if state == nil {
+				continue
+			}
+			folders = slices.Sorted(maps.Keys(state.folders))
+			if state.folders[root] != nil {
+				folders = []string{root}
+			}
 		}
+		for _, folder := range folders {
+			var entry *runtimeWatchFolder
+			if state != nil {
+				entry = state.folders[folder]
+			}
+			if folder != root && entry != nil && entry.polling {
+				continue
+			}
+			scopes := b.rootScopes[root]
+			if len(scopes) == 0 {
+				scopes = []PollingScope{{Root: root}}
+			}
+			obligation := PollingObligation{Key: runtimeFolderPollingKey(root, folder), Scopes: runtimeFolderPollingScopes(root, folder, scopes), Probe: folder}
+			if folder != root {
+				obligation.ReleaseScopes = scopes
+			}
+			requests = append(requests, acquisition{
+				root: root, folder: folder, state: state, entry: entry,
+				obligation: obligation,
+			})
+		}
+	}
+	b.watchMu.Unlock()
+	b.pollingMu.Unlock()
+	for i := range requests {
+		request := &requests[i]
 		if required == nil {
-			b.reportError(fmt.Errorf(
-				"fsnotify coverage degraded for %s without polling callback", root,
-			))
+			b.reportError(fmt.Errorf("fsnotify coverage degraded for %s without polling callback", request.root))
+		} else if err := required(request.obligation); err != nil {
+			b.reportError(fmt.Errorf("transfer fsnotify coverage for %s to polling: %w", request.root, err))
+		} else {
+			request.acquired = true
+		}
+	}
+	b.pollingMu.Lock()
+	b.watchMu.Lock()
+	var releaseKeys []string
+	for _, request := range requests {
+		if !request.acquired {
 			continue
 		}
-		if err := required(PollingObligation{
-			Key: "fsnotify-runtime:" + root, Roots: scopes, Probe: root,
-		}); err != nil {
-			b.reportError(fmt.Errorf(
-				"transfer fsnotify coverage for %s to polling: %w", root, err,
-			))
+		root, folder := request.root, request.folder
+		if !b.registeredRootSnapshot(root) {
+			releaseKeys = append(releaseKeys, request.obligation.Key)
 			continue
+		}
+		state := b.runtimeRoots[root]
+		if folder == root {
+			b.degradedRoots[root] = struct{}{}
+			if state != nil {
+				state.timer.Stop()
+				for path, entry := range state.folders {
+					if path != root && entry.polling {
+						releaseKeys = append(releaseKeys, runtimeFolderPollingKey(root, path))
+					}
+				}
+				delete(b.runtimeRoots, root)
+			}
+		} else if state == request.state && state != nil && state.folders[folder] == request.entry {
+			request.entry.polling = true
+		} else {
+			releaseKeys = append(releaseKeys, request.obligation.Key)
+		}
+	}
+	b.watchMu.Unlock()
+	b.pollingMu.Unlock()
+	for _, key := range releaseKeys {
+		if released == nil {
+			b.reportError(fmt.Errorf("fsnotify coverage recovered for %s without polling release callback", key))
+		} else if err := released(key); err != nil {
+			b.reportError(fmt.Errorf("release fsnotify polling for %s: %w", key, err))
+		}
+	}
+}
+
+func (b *fsnotifyBackend) retryRuntimeFolders(now time.Time) bool {
+	b.pollingMu.Lock()
+	b.watchMu.Lock()
+	var due []string
+	for root, state := range b.runtimeRoots {
+		if !now.Before(state.retryAt) {
+			due = append(due, root)
+		}
+	}
+	slices.Sort(due)
+	b.watchMu.Unlock()
+	b.pollingMu.Unlock()
+	for _, root := range due {
+		b.pollingMu.Lock()
+		b.watchMu.Lock()
+		state, ok := b.runtimeRoots[root]
+		if !ok {
+			b.watchMu.Unlock()
+			b.pollingMu.Unlock()
+			continue
+		}
+		recovered := make(map[string]bool)
+		walked := make(map[string]bool)
+		for _, folder := range slices.Sorted(maps.Keys(state.folders)) {
+			entry, ok := state.folders[folder]
+			if !ok {
+				continue
+			}
+			if now.Before(entry.retryAt) {
+				continue
+			}
+			entry.delay = watcherRetryDelay(entry.delay, 2)
+			entry.retryAt = now.Add(entry.delay)
+			gone := watchFolderGone(folder)
+			complete := false
+			parent := ""
+			for path := range walked {
+				if pathAtOrBelow(path, folder) {
+					parent = path
+					break
+				}
+			}
+			if parent != "" {
+				complete = walked[parent]
+			} else if !gone && folder != root {
+				_, complete = b.addRuntimeSubtreeLocked(folder, []string{root})
+				walked[folder] = complete
+			}
+			info, err := os.Lstat(folder)
+			if watchFolderGone(folder) || complete && err == nil && info.IsDir() {
+				recovered[folder] = entry.polling
+			}
+		}
+		for folder, polling := range recovered {
+			if !polling {
+				delete(state.folders, folder)
+			}
+		}
+		released := b.onPollingReleased
+		b.watchMu.Unlock()
+		b.pollingMu.Unlock()
+		b.acquireRuntimeFolderPolling(root)
+		b.watchMu.Lock()
+		active := b.runtimeRoots[root] == state
+		b.watchMu.Unlock()
+		if !active {
+			continue
+		}
+		var completed []string
+		for _, folder := range slices.Sorted(maps.Keys(recovered)) {
+			if recovered[folder] {
+				if released == nil {
+					b.reportError(fmt.Errorf("fsnotify coverage recovered for %s without polling release callback", folder))
+					continue
+				}
+				if err := released(runtimeFolderPollingKey(root, folder)); err != nil {
+					b.reportError(fmt.Errorf("release fsnotify polling for %s: %w", folder, err))
+					continue
+				}
+			}
+			completed = append(completed, folder)
 		}
 		b.watchMu.Lock()
-		b.degradedRoots[root] = struct{}{}
+		if b.runtimeRoots[root] == state {
+			for _, folder := range completed {
+				delete(state.folders, folder)
+			}
+			if len(state.folders) == 0 {
+				state.timer.Stop()
+				delete(b.runtimeRoots, root)
+			} else {
+				state.retryAt = time.Time{}
+				for _, entry := range state.folders {
+					if state.retryAt.IsZero() || entry.retryAt.Before(state.retryAt) {
+						state.retryAt = entry.retryAt
+					}
+				}
+				state.timer.Reset(state.retryAt.Sub(now))
+			}
+		}
 		b.watchMu.Unlock()
 	}
+	return true
 }
 
 func (b *fsnotifyBackend) reportError(err error) {
@@ -540,6 +1135,38 @@ func normalizeExcludePatterns(patterns []string) []string {
 		}
 	}
 	return out
+}
+
+// reinstallShallowWatches revalidates shallow-root coverage after overflow.
+// A dropped removal loses the native watch even when the directory was
+// recreated, so every shallow root is re-added; a root that cannot be
+// re-added moves to polling exactly as an observed removal would.
+func (b *fsnotifyBackend) reinstallShallowWatches() {
+	b.rootsMu.RLock()
+	shallow := append([]string(nil), b.shallow...)
+	b.rootsMu.RUnlock()
+	lost := make([]string, 0, len(shallow))
+	for _, root := range shallow {
+		b.watchMu.Lock()
+		err := b.watchOps.Add(root)
+		b.watchMu.Unlock()
+		if err != nil {
+			lost = append(lost, root)
+		}
+	}
+	b.requireRuntimePolling(lost)
+}
+
+func (b *fsnotifyBackend) registeredRootSnapshot(root string) bool {
+	b.rootsMu.RLock()
+	defer b.rootsMu.RUnlock()
+	return slices.Contains(b.recursive, root) || slices.Contains(b.shallow, root)
+}
+
+func (b *fsnotifyBackend) recursiveRootsSnapshot() []string {
+	b.rootsMu.RLock()
+	defer b.rootsMu.RUnlock()
+	return append([]string(nil), b.recursive...)
 }
 
 func (b *fsnotifyBackend) addRecursiveRoot(root string) {
@@ -613,7 +1240,10 @@ func (b *fsnotifyBackend) addWatchOwner(path, root string) {
 }
 
 func (b *fsnotifyBackend) shouldExclude(path string) bool {
-	if len(b.excludes) == 0 {
+	b.depthMu.RLock()
+	hasDepthLimits := len(b.rootDepths) > 0
+	b.depthMu.RUnlock()
+	if len(b.excludes) == 0 && !hasDepthLimits {
 		return false
 	}
 	root, ok := b.mostSpecificContainingRoot(path)
@@ -623,12 +1253,180 @@ func (b *fsnotifyBackend) shouldExclude(path string) bool {
 	return b.shouldExcludeForRoot(path, root)
 }
 
-func (b *fsnotifyBackend) shouldExcludeForRoot(path string, root string) bool {
-	return shouldExcludeForRoot(b.excludes, path, root)
+// shouldDropEvent reports whether an fsnotify path is outside this root's
+// coverage. Name excludes apply to every path. The depth limit applies to
+// directories. A file directly inside a watched directory stays visible,
+// including after that file has been removed or renamed.
+func (b *fsnotifyBackend) shouldDropEvent(path string) bool {
+	b.depthMu.RLock()
+	hasDepthLimits := len(b.rootDepths) > 0
+	b.depthMu.RUnlock()
+	if len(b.excludes) == 0 && !hasDepthLimits {
+		return false
+	}
+	root, ok := b.mostSpecificContainingRoot(path)
+	if !ok {
+		return false
+	}
+	if shouldExcludeForRoot(b.excludes, path, root) {
+		return true
+	}
+	if !b.beyondRootDepth(path, root, 0) {
+		return false
+	}
+	parent := filepath.Dir(filepath.Clean(path))
+	if !b.filesVisibleIn(parent, root) {
+		return true
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
 }
 
-func (b *fsnotifyBackend) includeCreatedSubtreePath(root, path string) bool {
-	return !b.shouldExcludeForRoot(path, root)
+// filesVisibleIn reports whether files directly inside dir are events this
+// root asked to see: dir is within MaxDepth, or dir is a listed extra
+// directory rather than an intermediate directory on the way to one.
+func (b *fsnotifyBackend) filesVisibleIn(dir, root string) bool {
+	root = filepath.Clean(root)
+	dir = filepath.Clean(dir)
+	b.depthMu.RLock()
+	limit := b.rootDepths[root]
+	patterns := b.rootExtraDirs[root]
+	b.depthMu.RUnlock()
+	if limit <= 0 {
+		return true
+	}
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == "." {
+		return true
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) <= limit {
+		return true
+	}
+	return extraCoversFiles(parts, patterns)
+}
+
+// shouldExcludeForRoot reports whether a directory under root stays unwatched,
+// either because it matches an exclude pattern or because it lies deeper than
+// the root's planned depth limit.
+func (b *fsnotifyBackend) shouldExcludeForRoot(path string, root string) bool {
+	return shouldExcludeForRoot(b.excludes, path, root) ||
+		b.beyondRootDepth(path, root, 0)
+}
+
+// includeCreatedSubtreePath filters both files and directories found under a
+// newly created directory. Directories follow the same depth limit as native
+// watches, so the walk never descends into generated trees below it. A file
+// directly inside the deepest watched directory sits one level below the
+// depth limit and is still covered.
+func (b *fsnotifyBackend) includeCreatedSubtreePath(
+	root, path string, isDir bool,
+) bool {
+	if isDir {
+		return !b.shouldExcludeForRoot(path, root)
+	}
+	return !shouldExcludeForRoot(b.excludes, path, root) &&
+		!b.beyondRootDepth(path, root, 1)
+}
+
+// beyondRootDepth reports whether path is more than the root's depth limit
+// plus slack levels below root. A listed extra directory, and each directory
+// on the way to it, stays inside the limit. With slack, a file directly
+// inside a listed extra directory stays inside too. Roots without a limit
+// never exclude by depth.
+func (b *fsnotifyBackend) beyondRootDepth(path, root string, slack int) bool {
+	root = filepath.Clean(root)
+	b.depthMu.RLock()
+	limit := b.rootDepths[root]
+	patterns := b.rootExtraDirs[root]
+	b.depthMu.RUnlock()
+	if limit <= 0 {
+		return false
+	}
+	rel, err := filepath.Rel(root, filepath.Clean(path))
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) <= limit+slack {
+		return false
+	}
+	if extraCoversDirectory(parts, patterns) {
+		return false
+	}
+	return slack <= 0 || len(parts) < 2 ||
+		!extraCoversFiles(parts[:len(parts)-1], patterns)
+}
+
+// extraCoversDirectory reports whether parts is a listed extra directory or
+// an intermediate directory on the way to one.
+func extraCoversDirectory(parts, patterns []string) bool {
+	for _, pattern := range patterns {
+		want := extraPatternParts(pattern)
+		if matchExtraPrefix(parts, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// extraCoversFiles reports whether parts is a listed extra directory whose
+// files should be reported. An intermediate directory listed only because a
+// longer pattern passes through it does not qualify.
+func extraCoversFiles(parts, patterns []string) bool {
+	for _, pattern := range patterns {
+		want := extraPatternParts(pattern)
+		if len(want) != len(parts) || !matchExtraPrefix(parts, want) {
+			continue
+		}
+		if extraHasLongerPattern(want, patterns) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func extraHasLongerPattern(prefix, patterns []string) bool {
+	for _, pattern := range patterns {
+		want := extraPatternParts(pattern)
+		if len(want) > len(prefix) && matchExtraPrefix(prefix, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func extraPatternParts(pattern string) []string {
+	if pattern == "" {
+		return nil
+	}
+	parts := strings.Split(pattern, "/")
+	if slices.Contains(parts, "") {
+		return nil
+	}
+	return parts
+}
+
+// matchExtraPrefix reports whether parts equals want or a proper prefix of
+// want. "*" matches one directory name.
+func matchExtraPrefix(parts, want []string) bool {
+	if len(want) == 0 || len(parts) == 0 || len(parts) > len(want) {
+		return false
+	}
+	for i := range parts {
+		if want[i] != "*" && want[i] != parts[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *fsnotifyBackend) shouldEnumerateCreatedSubtree(root, path string) bool {

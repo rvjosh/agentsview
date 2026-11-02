@@ -52,6 +52,13 @@ func WithFollowSymlinkFiles() JSONLOption {
 	return func(o *JSONLSourceSetOptions) { o.FollowSymlinkFiles = true }
 }
 
+// WithRejectSymlinkCompanions keeps symlinked companion files out of the
+// source freshness fingerprint. Existing providers follow companion symlinks
+// by default for compatibility.
+func WithRejectSymlinkCompanions() JSONLOption {
+	return func(o *JSONLSourceSetOptions) { o.RejectSymlinkCompanions = true }
+}
+
 // WithDescendPath gates which directories recursive discovery descends into and
 // which source ancestors a changed path may sit under.
 func WithDescendPath(fn func(root, path string) bool) JSONLOption {
@@ -141,6 +148,15 @@ func WithForceReplace() JSONLOption {
 // sibling-metadata plumbing rather than adding an independent mechanism.
 func WithCompanionFiles(fn func(transcriptPath string) []string) JSONLOption {
 	return func(o *JSONLSourceSetOptions) { o.CompanionFiles = fn }
+}
+
+// WithOptionalCompanion folds an "unreadable" marker into the fingerprint on companion read failures.
+// directoryNames opts named companion directories into entry metadata hashing.
+func WithOptionalCompanion(fn func(companionPath string) bool, directoryNames ...string) JSONLOption {
+	return func(o *JSONLSourceSetOptions) {
+		o.OptionalCompanion = fn
+		o.OptionalCompanionDirectories = directoryNames
+	}
 }
 
 // WithCompanionTranscript registers the inverse of WithCompanionFiles: given a

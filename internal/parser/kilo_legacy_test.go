@@ -5,7 +5,7 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -14,13 +14,79 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/money"
 )
+
+func kiloLegacyDiscoverMatchesForTest(t *testing.T, root string) []singleFileMatch {
+	t.Helper()
+	var matches []singleFileMatch
+	require.NoError(t, kiloLegacyDiscoverEach(t.Context(), root,
+		func(match singleFileMatch) error {
+			matches = append(matches, match)
+			return nil
+		}))
+	return matches
+}
+
+// TestKiloLegacyDiscoveryUnreadableDirsFail guards the same contract
+// as TestRooCodeDiscoveryUnreadableTasksDirFails: a traversal failure
+// must propagate instead of presenting an authoritative empty
+// enumeration, which would tombstone baselined sessions locally and
+// let remote sync evict valid mirror data.
+func TestKiloLegacyDiscoveryUnreadableDirsFail(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory-permission read failures are not portable to Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	root := t.TempDir()
+	taskDir := filepath.Join(root, "tasks", "task-1")
+	require.NoError(t, os.MkdirAll(taskDir, 0o755))
+	metadataPath := filepath.Join(taskDir, "task_metadata.json")
+	require.NoError(t, os.WriteFile(metadataPath, []byte(`{}`), 0o644))
+	provider, ok := NewProvider(AgentKiloLegacy, ProviderConfig{
+		Roots: []string{root},
+	})
+	require.True(t, ok)
+
+	matches := kiloLegacyDiscoverMatchesForTest(t, root)
+	require.Len(t, matches, 1)
+	require.Equal(t, metadataPath, matches[0].Path)
+
+	t.Run("unreadable task dir", func(t *testing.T) {
+		require.NoError(t, os.Chmod(taskDir, 0o000))
+		t.Cleanup(func() { require.NoError(t, os.Chmod(taskDir, 0o755)) })
+		err := kiloLegacyDiscoverEach(t.Context(), root,
+			func(singleFileMatch) error { return nil })
+		require.Error(t, err)
+		require.ErrorIs(t, err, os.ErrPermission)
+		_, err = provider.Discover(t.Context())
+		require.Error(t, err,
+			"an unreadable task directory must not collect an authoritative empty discovery")
+	})
+
+	t.Run("unreadable tasks root", func(t *testing.T) {
+		tasksDir := filepath.Join(root, "tasks")
+		require.NoError(t, os.Chmod(tasksDir, 0o000))
+		t.Cleanup(func() { require.NoError(t, os.Chmod(tasksDir, 0o755)) })
+		err := kiloLegacyDiscoverEach(t.Context(), root,
+			func(singleFileMatch) error { return nil })
+		require.Error(t, err)
+		require.ErrorIs(t, err, os.ErrPermission)
+		_, err = provider.Discover(t.Context())
+		require.Error(t, err,
+			"an unreadable tasks directory must not collect an authoritative empty discovery")
+	})
+}
 
 // writeKiloLegacyFixture creates a minimal Kilo (legacy) task directory
 // containing the three JSON files. Callers may overwrite
 // individual files by writing to the returned paths.
 func writeKiloLegacyFixture(t *testing.T) (taskDir string) {
 	t.Helper()
+
 	taskDir = t.TempDir()
 	require.NoError(t, os.MkdirAll(taskDir, 0o755))
 	require.NoError(t, os.WriteFile(
@@ -104,17 +170,21 @@ func TestParseKiloLegacySessionProjectFromWorkspaceDir(t *testing.T) {
 		0o644,
 	))
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "Do the thing"},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "Do the thing",
+		},
 		{
 			"ts":   1700000000500,
 			"type": "say",
 			"say":  "api_req_started",
 			"text": `{"tokensIn":100,"tokensOut":50,"cost":0.02}`,
 		},
-		{"ts": 1700000001000, "type": "say",
+		{
+			"ts": 1700000001000, "type": "say",
 			"say":  "api_req_started",
-			"text": `Current Workspace Directory (/Users/dev/code/widgets) Files\nsrc/main.go`},
+			"text": `Current Workspace Directory (/Users/dev/code/widgets) Files\nsrc/main.go`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -128,8 +198,8 @@ func TestParseKiloLegacySessionProjectFromWorkspaceDir(t *testing.T) {
 		"project should derive from Current Workspace Directory")
 	require.Len(t, sess.UsageEvents, 1,
 		"a cost usage event should be emitted for the session")
-	require.NotNil(t, sess.UsageEvents[0].CostUSD)
-	assert.InDelta(t, 0.02, *sess.UsageEvents[0].CostUSD, 0.0001)
+	require.NotNil(t, sess.UsageEvents[0].Cost)
+	assert.Equal(t, money.MustParseDollars("0.02"), *sess.UsageEvents[0].Cost)
 }
 
 func TestParseKiloLegacySessionProjectFromAPIHistoryFallback(t *testing.T) {
@@ -143,8 +213,10 @@ func TestParseKiloLegacySessionProjectFromAPIHistoryFallback(t *testing.T) {
 	// session); the line is only present in the Claude-shaped
 	// api_conversation_history.json environment block.
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "Do the thing"},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "Do the thing",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 	api := `[
@@ -235,10 +307,14 @@ func TestExtractKiloLegacyWorkspaceDir(t *testing.T) {
 func TestParseKiloLegacySessionReadFileExtractsEmbeddedResult(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "Read the file"},
-		{"ts": 1700000001000, "type": "ask", "ask": "tool",
-			"text": `{"tool":"readFile","path":"src/foo.ts","content":"hi"}`},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "Read the file",
+		},
+		{
+			"ts": 1700000001000, "type": "ask", "ask": "tool",
+			"text": `{"tool":"readFile","path":"src/foo.ts","content":"hi"}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -260,10 +336,14 @@ func TestParseKiloLegacySessionReadFileExtractsEmbeddedResult(t *testing.T) {
 func TestParseKiloLegacySessionAppliedDiffKeepsDiff(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "Apply the change"},
-		{"ts": 1700000001000, "type": "ask", "ask": "tool",
-			"text": `{"tool":"appliedDiff","path":"src/foo.ts","diff":"@@ -1 +1 @@\\n-old\\n+new","content":"dummy"}`},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "Apply the change",
+		},
+		{
+			"ts": 1700000001000, "type": "ask", "ask": "tool",
+			"text": `{"tool":"appliedDiff","path":"src/foo.ts","diff":"@@ -1 +1 @@\\n-old\\n+new","content":"dummy"}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -285,18 +365,30 @@ func TestParseKiloLegacySessionAppliedDiffKeepsDiff(t *testing.T) {
 func TestParseKiloLegacySessionCommandOutputPairsAndFlagsError(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "Run it"},
-		{"ts": 1700000001000, "type": "ask", "ask": "command",
-			"text": "git --version"},
-		{"ts": 1700000002000, "type": "say", "say": "command_output",
-			"text": "git version 2.42.0"},
-		{"ts": 1700000003000, "type": "say", "say": "text",
-			"text": "Now break it"},
-		{"ts": 1700000004000, "type": "ask", "ask": "command",
-			"text": "false"},
-		{"ts": 1700000005000, "type": "say", "say": "command_output",
-			"text": "exit status: 1\nexit code 1"},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "Run it",
+		},
+		{
+			"ts": 1700000001000, "type": "ask", "ask": "command",
+			"text": "git --version",
+		},
+		{
+			"ts": 1700000002000, "type": "say", "say": "command_output",
+			"text": "git version 2.42.0",
+		},
+		{
+			"ts": 1700000003000, "type": "say", "say": "text",
+			"text": "Now break it",
+		},
+		{
+			"ts": 1700000004000, "type": "ask", "ask": "command",
+			"text": "false",
+		},
+		{
+			"ts": 1700000005000, "type": "say", "say": "command_output",
+			"text": "exit status: 1\nexit code 1",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -341,12 +433,18 @@ func TestParseKiloLegacySessionEmptyCommandOutputStillCompletes(t *testing.T) {
 	// preceding execute_command call rather than leave it pending.
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "Run it"},
-		{"ts": 1700000001000, "type": "ask", "ask": "command",
-			"text": "true"},
-		{"ts": 1700000002000, "type": "say", "say": "command_output",
-			"text": ""},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "Run it",
+		},
+		{
+			"ts": 1700000001000, "type": "ask", "ask": "command",
+			"text": "true",
+		},
+		{
+			"ts": 1700000002000, "type": "say", "say": "command_output",
+			"text": "",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -363,14 +461,20 @@ func TestParseKiloLegacySessionEmptyCommandOutputStillCompletes(t *testing.T) {
 func TestParseKiloLegacySessionMCPResponsePairs(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "Use MCP"},
-		{"ts": 1700000001000, "type": "ask",
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "Use MCP",
+		},
+		{
+			"ts": 1700000001000, "type": "ask",
 			"ask":  "use_mcp_server",
-			"text": `{"type":"use_mcp_tool","serverName":"brave","toolName":"search","arguments":"{\"query\":\"agentsview\"}"}`},
-		{"ts": 1700000002000, "type": "say",
+			"text": `{"type":"use_mcp_tool","serverName":"brave","toolName":"search","arguments":"{\"query\":\"agentsview\"}"}`,
+		},
+		{
+			"ts": 1700000002000, "type": "say",
 			"say":  "mcp_server_response",
-			"text": "search results"},
+			"text": "search results",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -401,14 +505,20 @@ func TestParseKiloLegacySessionMCPResponsePairs(t *testing.T) {
 func TestParseKiloLegacySessionMCPUseMcpToolShape(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "Use MCP"},
-		{"ts": 1700000001000, "type": "ask",
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "Use MCP",
+		},
+		{
+			"ts": 1700000001000, "type": "ask",
 			"ask":  "use_mcp_server",
-			"text": `{"type":"use_mcp_tool","serverName":"chrome-devtools","toolName":"take_snapshot","arguments":"{\"verbose\":false}"}`},
-		{"ts": 1700000002000, "type": "say",
+			"text": `{"type":"use_mcp_tool","serverName":"chrome-devtools","toolName":"take_snapshot","arguments":"{\"verbose\":false}"}`,
+		},
+		{
+			"ts": 1700000002000, "type": "say",
 			"say":  "mcp_server_response",
-			"text": "<snapshot result>"},
+			"text": "<snapshot result>",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -464,15 +574,36 @@ func TestParseKiloLegacyMCPToolCallUnit(t *testing.T) {
 	assert.Equal(t, "Read", tcLegacy.Category)
 }
 
+func TestBuildKiloLegacyMCPInputJSONDeterministic(t *testing.T) {
+	assert.Equal(t, `{"a":1,"z":2}`, buildKiloLegacyMCPInputJSON(
+		map[string]any{
+			"arguments": map[string]any{"z": 2, "a": 1},
+		},
+	))
+	assert.Equal(t,
+		`{"arguments":"invalid","serverName":"srv","toolName":"tool"}`,
+		buildKiloLegacyMCPInputJSON(map[string]any{
+			"type": "use_mcp_tool", "toolName": "tool",
+			"serverName": "srv", "arguments": "invalid",
+		}),
+	)
+}
+
 func TestParseKiloLegacySessionCompactBoundaryEmitted(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "Need to condense"},
-		{"ts": 1700000001000, "type": "say",
-			"say": "condense_context"},
-		{"ts": 1700000002000, "type": "say", "say": "text",
-			"text": "Continuing"},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "Need to condense",
+		},
+		{
+			"ts": 1700000001000, "type": "say",
+			"say": "condense_context",
+		},
+		{
+			"ts": 1700000002000, "type": "say", "say": "text",
+			"text": "Continuing",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -488,12 +619,18 @@ func TestParseKiloLegacySessionCompactBoundaryEmitted(t *testing.T) {
 func TestParseKiloLegacySessionDiffErrorPairsPendingToolCall(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "Edit"},
-		{"ts": 1700000001000, "type": "ask", "ask": "tool",
-			"text": `{"tool":"appliedDiff","path":"src/foo.ts","diff":"@@ -1 +1 @@\n-old\n+new"}`},
-		{"ts": 1700000002000, "type": "say",
-			"say": "diff_error", "text": "search text not found"},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "Edit",
+		},
+		{
+			"ts": 1700000001000, "type": "ask", "ask": "tool",
+			"text": `{"tool":"appliedDiff","path":"src/foo.ts","diff":"@@ -1 +1 @@\n-old\n+new"}`,
+		},
+		{
+			"ts": 1700000002000, "type": "say",
+			"say": "diff_error", "text": "search text not found",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -512,12 +649,18 @@ func TestParseKiloLegacySessionDiffErrorPairsPendingToolCall(t *testing.T) {
 func TestParseKiloLegacySessionReasoningEmittedAsThinking(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "first"},
-		{"ts": 1700000001000, "type": "say", "say": "reasoning",
-			"reasoning": "thinking through the steps"},
-		{"ts": 1700000002000, "type": "say", "say": "text",
-			"text": "answer"},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "first",
+		},
+		{
+			"ts": 1700000001000, "type": "say", "say": "reasoning",
+			"reasoning": "thinking through the steps",
+		},
+		{
+			"ts": 1700000002000, "type": "say", "say": "text",
+			"text": "answer",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -532,12 +675,18 @@ func TestParseKiloLegacySessionReasoningEmittedAsThinking(t *testing.T) {
 func TestParseKiloLegacySessionSkipsPartialMessages(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "first"},
-		{"ts": 1700000000500, "type": "say", "say": "text",
-			"text": "first (streaming)", "partial": true},
-		{"ts": 1700000001000, "type": "say", "say": "text",
-			"text": "second"},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "first",
+		},
+		{
+			"ts": 1700000000500, "type": "say", "say": "text",
+			"text": "first (streaming)", "partial": true,
+		},
+		{
+			"ts": 1700000001000, "type": "say", "say": "text",
+			"text": "second",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -570,16 +719,24 @@ func TestParseKiloLegacySessionAPIRecordingTracksPeakAndCost(t *testing.T) {
 	mustWriteRaw(t,
 		filepath.Join(taskDir, "api_conversation_history.json"), api)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "first"},
-		{"ts": 1700000000500, "type": "say",
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "first",
+		},
+		{
+			"ts": 1700000000500, "type": "say",
 			"say":  "api_req_started",
-			"text": `{"tokensIn":1000,"tokensOut":50,"cacheReads":200,"cost":0.012,"usageMissing":false}`},
-		{"ts": 1700000001000, "type": "say", "say": "text",
-			"text": "second"},
-		{"ts": 1700000001500, "type": "say",
+			"text": `{"tokensIn":1000,"tokensOut":50,"cacheReads":200,"cost":0.012,"usageMissing":false}`,
+		},
+		{
+			"ts": 1700000001000, "type": "say", "say": "text",
+			"text": "second",
+		},
+		{
+			"ts": 1700000001500, "type": "say",
 			"say":  "api_req_started",
-			"text": `{"tokensIn":2500,"tokensOut":120,"cacheReads":400,"cost":0.034,"inferenceProvider":"Z.AI","usageMissing":false}`},
+			"text": `{"tokensIn":2500,"tokensOut":120,"cacheReads":400,"cost":0.034,"inferenceProvider":"Z.AI","usageMissing":false}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -597,12 +754,56 @@ func TestParseKiloLegacySessionAPIRecordingTracksPeakAndCost(t *testing.T) {
 	assert.Equal(t, 170, ev.OutputTokens)
 	assert.Equal(t, 1000+2500, ev.InputTokens,
 		"input tokens are summed across api_req_started events")
-	require.NotNil(t, ev.CostUSD,
-		"present-positive cost should populate CostUSD")
-	assert.InDelta(t, 0.046, *ev.CostUSD, 0.0001,
+	require.NotNil(t, ev.Cost,
+		"present-positive cost should populate Cost")
+	assert.Equal(t, money.MustParseDollars("0.046"), *ev.Cost,
 		"summed cost across events")
 	assert.Equal(t, "Z.AI", ev.Model,
 		"inferenceProvider is surfaced as the usage-event model label")
+}
+
+func TestParseKiloLegacySessionQuantizesEachRequestCostBeforeSumming(
+	t *testing.T,
+) {
+	taskDir := writeKiloLegacyFixture(t)
+	msgs := []map[string]any{
+		{"ts": 1700000000000, "type": "say", "say": "text", "text": "first"},
+		{
+			"ts": 1700000000500, "type": "say", "say": "api_req_started",
+			"text": `{"tokensIn":1,"cost":0.0000004,"inferenceProvider":"Z.AI"}`,
+		},
+		{
+			"ts": 1700000001000, "type": "say", "say": "api_req_started",
+			"text": `{"tokensIn":1,"cost":0.0000004,"inferenceProvider":"Z.AI"}`,
+		},
+	}
+	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
+
+	sess, _, err := parseKiloLegacySession(taskDir, "", "h")
+
+	require.NoError(t, err)
+	require.Len(t, sess.UsageEvents, 1)
+	require.NotNil(t, sess.UsageEvents[0].Cost)
+	assert.Equal(t, money.Money{}, *sess.UsageEvents[0].Cost)
+}
+
+func TestParseKiloLegacySessionInvalidCostPreservesTokenUsage(t *testing.T) {
+	taskDir := writeKiloLegacyFixture(t)
+	msgs := []map[string]any{
+		{"ts": 1700000000000, "type": "say", "say": "text", "text": "first"},
+		{
+			"ts": 1700000000500, "type": "say", "say": "api_req_started",
+			"text": `{"tokensIn":1,"cost":-0.01,"inferenceProvider":"Z.AI"}`,
+		},
+	}
+	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
+
+	sess, _, err := parseKiloLegacySession(taskDir, "", "h")
+
+	require.NoError(t, err)
+	require.Len(t, sess.UsageEvents, 1)
+	assert.Equal(t, 1, sess.UsageEvents[0].InputTokens)
+	assert.Nil(t, sess.UsageEvents[0].Cost)
 }
 
 func TestParseKiloLegacySessionModelFromAPIHistory(t *testing.T) {
@@ -623,18 +824,28 @@ func TestParseKiloLegacySessionModelFromAPIHistory(t *testing.T) {
 		filepath.Join(taskDir, "api_conversation_history.json"), api)
 
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "first"},
-		{"ts": 1700000000500, "type": "say",
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "first",
+		},
+		{
+			"ts": 1700000000500, "type": "say",
 			"say":  "api_req_started",
-			"text": `{"tokensIn":1000,"tokensOut":50,"cacheReads":200,"cost":0,"inferenceProvider":"Z.AI","usageMissing":false}`},
-		{"ts": 1700000001000, "type": "say", "say": "text",
-			"text": "second"},
-		{"ts": 1700000001500, "type": "say",
+			"text": `{"tokensIn":1000,"tokensOut":50,"cacheReads":200,"cost":0,"inferenceProvider":"Z.AI","usageMissing":false}`,
+		},
+		{
+			"ts": 1700000001000, "type": "say", "say": "text",
+			"text": "second",
+		},
+		{
+			"ts": 1700000001500, "type": "say",
 			"say":  "api_req_started",
-			"text": `{"tokensIn":2500,"tokensOut":120,"cacheReads":400,"cost":0,"inferenceProvider":"Z.AI","usageMissing":false}`},
-		{"ts": 1700000002000, "type": "say", "say": "text",
-			"text": "third"},
+			"text": `{"tokensIn":2500,"tokensOut":120,"cacheReads":400,"cost":0,"inferenceProvider":"Z.AI","usageMissing":false}`,
+		},
+		{
+			"ts": 1700000002000, "type": "say", "say": "text",
+			"text": "third",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -644,7 +855,7 @@ func TestParseKiloLegacySessionModelFromAPIHistory(t *testing.T) {
 	// When multiple distinct models are observed, the model is omitted
 	// from the usage event to avoid misattribution.
 	require.Len(t, sess.UsageEvents, 1)
-	assert.Equal(t, "", sess.UsageEvents[0].Model,
+	assert.Empty(t, sess.UsageEvents[0].Model,
 		"usage event omits model when multiple distinct models observed")
 	assert.Equal(t, 1000+2500, sess.UsageEvents[0].InputTokens,
 		"input tokens are summed across api_req_started events")
@@ -658,7 +869,7 @@ func TestParseKiloLegacySessionModelFromAPIHistory(t *testing.T) {
 	}
 	// Multi-model sessions should not stamp any model on assistant
 	// messages to avoid misattribution.
-	require.Len(t, asstModels, 0,
+	require.Empty(t, asstModels,
 		"multi-model sessions should not stamp model on assistant messages")
 }
 
@@ -666,7 +877,7 @@ func TestParseKiloLegacyAPIHistoryModelsMissingFile(t *testing.T) {
 	taskDir := t.TempDir()
 	models, err := parseKiloLegacyAPIHistoryModels(
 		filepath.Join(taskDir, "nope.json"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Empty(t, models)
 }
 
@@ -682,10 +893,14 @@ func TestParseKiloLegacySessionMissingMetadataReturnsNilSession(t *testing.T) {
 func TestParseKiloLegacySessionOrphanToolCallTermination(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "first"},
-		{"ts": 1700000001000, "type": "ask", "ask": "tool",
-			"text": `{"tool":"readFile","path":"src/foo.ts"}`},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "first",
+		},
+		{
+			"ts": 1700000001000, "type": "ask", "ask": "tool",
+			"text": `{"tool":"readFile","path":"src/foo.ts"}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -699,12 +914,18 @@ func TestParseKiloLegacySessionOrphanToolCallTermination(t *testing.T) {
 func TestParseKiloLegacySessionFinishTaskIsClean(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "first"},
-		{"ts": 1700000001000, "type": "ask", "ask": "tool",
-			"text": `{"tool":"readFile","path":"src/foo.ts"}`},
-		{"ts": 1700000001500, "type": "ask", "ask": "tool",
-			"text": `{"tool":"finishTask"}`},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "first",
+		},
+		{
+			"ts": 1700000001000, "type": "ask", "ask": "tool",
+			"text": `{"tool":"readFile","path":"src/foo.ts"}`,
+		},
+		{
+			"ts": 1700000001500, "type": "ask", "ask": "tool",
+			"text": `{"tool":"finishTask"}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -718,10 +939,14 @@ func TestParseKiloLegacySessionFinishTaskIsClean(t *testing.T) {
 func TestParseKiloLegacySessionFinishTaskOnlyIsClean(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "first"},
-		{"ts": 1700000001000, "type": "ask", "ask": "tool",
-			"text": `{"tool":"finishTask"}`},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "first",
+		},
+		{
+			"ts": 1700000001000, "type": "ask", "ask": "tool",
+			"text": `{"tool":"finishTask"}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -730,42 +955,6 @@ func TestParseKiloLegacySessionFinishTaskOnlyIsClean(t *testing.T) {
 	assert.Equal(t, TerminationClean,
 		sess.TerminationStatus,
 		"a session whose only tool call is finishTask must be clean")
-}
-
-func TestKiloLegacyDefaultDirsCasing(t *testing.T) {
-	dirs := kiloLegacyDefaultDirs()
-	require.Len(t, dirs, 3, "three platform default dirs expected")
-	var mac, linux, win string
-	for _, d := range dirs {
-		switch {
-		case strings.HasPrefix(d, "Library/Application Support/"):
-			mac = d
-		case strings.HasPrefix(d, ".config/"):
-			linux = d
-		case strings.HasPrefix(d, "AppData/Roaming/"):
-			win = d
-		}
-	}
-	require.NotEmpty(t, mac, "macOS default present")
-	require.NotEmpty(t, linux, "Linux default present")
-	require.NotEmpty(t, win, "Windows default present")
-	assert.Contains(t, mac, "kilocode.kilo-code",
-		"lowercase extension id must appear on macOS")
-	assert.Contains(t, linux, "kilocode.kilo-code",
-		"lowercase extension id must appear on Linux")
-	assert.Contains(t, win, "kilocode.kilo-code",
-		"lowercase extension id must appear on Windows")
-}
-
-func TestKiloLegacyProviderCapabilities(t *testing.T) {
-	caps := kiloLegacyProviderCapabilities()
-	assert.Equal(t, CapabilitySupported, caps.Content.ToolCalls)
-	assert.Equal(t, CapabilitySupported, caps.Content.ToolResultEvents)
-	assert.Equal(t, CapabilitySupported, caps.Content.Thinking)
-	assert.Equal(t, CapabilitySupported, caps.Content.AggregateUsageEvents)
-	assert.Equal(t, CapabilitySupported, caps.Content.FirstMessage)
-	assert.Equal(t, CapabilitySupported, caps.Content.SessionName)
-	assert.Equal(t, CapabilitySupported, caps.Content.TerminationStatus)
 }
 
 func TestKiloLegacyDiscoverAndClassifyPath(t *testing.T) {
@@ -784,10 +973,9 @@ func TestKiloLegacyDiscoverAndClassifyPath(t *testing.T) {
 		filepath.Join(tasksDir, "_index"), 0o755,
 	))
 
-	matches := kiloLegacyDiscoverFiles(root)
+	matches := kiloLegacyDiscoverMatchesForTest(t, root)
 	require.Len(t, matches, 1)
-	assert.True(t,
-		filepath.IsAbs(matches[0].Path),
+	assert.True(t, filepath.IsAbs(matches[0].Path),
 		"discovered path must be absolute")
 
 	// ui_messages change should classify back to the same anchor.
@@ -835,7 +1023,7 @@ func TestKiloLegacyFingerprintComposite(t *testing.T) {
 	anchor := filepath.Join(taskDir, "task_metadata.json")
 	fp, err := kiloLegacyFingerprintSource(anchor)
 	require.NoError(t, err)
-	assert.Greater(t, fp.Size, int64(0))
+	assert.Positive(t, fp.Size)
 	assert.NotEmpty(t, fp.Hash)
 	// Hash must change when a sibling file's content changes.
 	require.NoError(t, os.WriteFile(
@@ -860,15 +1048,19 @@ func TestKiloLegacyParseFileReturnsUsageFromUI(t *testing.T) {
 		[]byte(`{}`), 0o644,
 	))
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "hi"},
-		{"ts": 1700000000500, "type": "say",
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "hi",
+		},
+		{
+			"ts": 1700000000500, "type": "say",
 			"say":  "api_req_started",
-			"text": `{"tokensIn":500,"tokensOut":10,"cacheReads":0,"cost":0.0015,"usageMissing":false}`},
+			"text": `{"tokensIn":500,"tokensOut":10,"cacheReads":0,"cost":0.0015,"usageMissing":false}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
-	matches := kiloLegacyDiscoverFiles(root)
+	matches := kiloLegacyDiscoverMatchesForTest(t, root)
 	require.Len(t, matches, 1)
 	results, _, err := kiloLegacyParseFile(
 		singleFileSource{Root: root, Path: matches[0].Path},
@@ -912,11 +1104,15 @@ func TestParseKiloLegacySessionToolUseIDsUnique(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []kiloLegacyMessage{
 		{Timestamp: 1688836851000, Type: "say", Say: "text", Text: "task"},
-		{Timestamp: 1688836852000, Type: "ask", Ask: "tool",
-			Text: `{"tool":"readFile","path":"a.ts"}`},
+		{
+			Timestamp: 1688836852000, Type: "ask", Ask: "tool",
+			Text: `{"tool":"readFile","path":"a.ts"}`,
+		},
 		{Timestamp: 1688836853000, Type: "say", Say: "command_output", Text: "ok"},
-		{Timestamp: 1688836854000, Type: "ask", Ask: "tool",
-			Text: `{"tool":"readFile","path":"b.ts"}`},
+		{
+			Timestamp: 1688836854000, Type: "ask", Ask: "tool",
+			Text: `{"tool":"readFile","path":"b.ts"}`,
+		},
 		{Timestamp: 1688836855000, Type: "say", Say: "command_output", Text: "ok"},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
@@ -936,10 +1132,14 @@ func TestParseKiloLegacySessionResultEventTimestamp(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []kiloLegacyMessage{
 		{Timestamp: 1688836851000, Type: "say", Say: "text", Text: "task"},
-		{Timestamp: 1688836852000, Type: "ask", Ask: "command",
-			Text: `{"command":"ls"}`},
-		{Timestamp: 1688836860000, Type: "say", Say: "command_output",
-			Text: "file1\nfile2"},
+		{
+			Timestamp: 1688836852000, Type: "ask", Ask: "command",
+			Text: `{"command":"ls"}`,
+		},
+		{
+			Timestamp: 1688836860000, Type: "say", Say: "command_output",
+			Text: "file1\nfile2",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 	_, parsed, err := parseKiloLegacySession(taskDir, "", "")
@@ -962,13 +1162,21 @@ func TestParseKiloLegacySessionResultEventTimestamp(t *testing.T) {
 func TestParseKiloLegacySessionImageOnlyMessages(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []kiloLegacyMessage{
-		{Timestamp: 1688836851000, Type: "say", Say: "text", Text: "",
-			Images: []string{"data:image/png;base64,AAA"}},
-		{Timestamp: 1688836852000, Type: "say", Say: "text",
-			Text: "I see the screenshot."},
-		{Timestamp: 1688836853000, Type: "say", Say: "text", Text: "",
-			Images: []string{"data:image/png;base64,BBB",
-				"data:image/png;base64,CCC"}},
+		{
+			Timestamp: 1688836851000, Type: "say", Say: "text", Text: "",
+			Images: []string{"data:image/png;base64,AAA"},
+		},
+		{
+			Timestamp: 1688836852000, Type: "say", Say: "text",
+			Text: "I see the screenshot.",
+		},
+		{
+			Timestamp: 1688836853000, Type: "say", Say: "text", Text: "",
+			Images: []string{
+				"data:image/png;base64,BBB",
+				"data:image/png;base64,CCC",
+			},
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 	sess, parsed, err := parseKiloLegacySession(taskDir, "", "")
@@ -990,8 +1198,10 @@ func TestParseKiloLegacySessionSkillDetection(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []kiloLegacyMessage{
 		{Timestamp: 1688836851000, Type: "say", Say: "text", Text: "task"},
-		{Timestamp: 1688836852000, Type: "ask", Ask: "tool",
-			Text: `{"tool":"skill","skillName":"my-skill","path":".codex/skills/my-skill/SKILL.md"}`},
+		{
+			Timestamp: 1688836852000, Type: "ask", Ask: "tool",
+			Text: `{"tool":"skill","skillName":"my-skill","path":".codex/skills/my-skill/SKILL.md"}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 	_, parsed, err := parseKiloLegacySession(taskDir, "", "")
@@ -1013,12 +1223,18 @@ func TestParseKiloLegacySessionMetadataMessageSkipped(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []kiloLegacyMessage{
 		{Timestamp: 1688836851000, Type: "say", Say: "text", Text: "task"},
-		{Timestamp: 1688836852000, Type: "say", Say: "api_req_started",
-			Text: `{"tokensIn":100,"tokensOut":50}`},
-		{Timestamp: 1688836853000, Type: "say", Say: "checkpoint_saved",
-			Text: ""},
-		{Timestamp: 1688836854000, Type: "say", Say: "text",
-			Text: "response"},
+		{
+			Timestamp: 1688836852000, Type: "say", Say: "api_req_started",
+			Text: `{"tokensIn":100,"tokensOut":50}`,
+		},
+		{
+			Timestamp: 1688836853000, Type: "say", Say: "checkpoint_saved",
+			Text: "",
+		},
+		{
+			Timestamp: 1688836854000, Type: "say", Say: "text",
+			Text: "response",
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 	_, parsed, err := parseKiloLegacySession(taskDir, "", "")
@@ -1062,11 +1278,15 @@ func TestParseKiloLegacySessionCodebaseSearchResultPairs(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []kiloLegacyMessage{
 		{Timestamp: 1688836851000, Type: "say", Say: "text", Text: "task"},
-		{Timestamp: 1688836852000, Type: "ask", Ask: "tool",
-			Text: `{"tool":"codebaseSearch","query":"find foo","path":null}`},
-		{Timestamp: 1688836853000, Type: "say",
+		{
+			Timestamp: 1688836852000, Type: "ask", Ask: "tool",
+			Text: `{"tool":"codebaseSearch","query":"find foo","path":null}`,
+		},
+		{
+			Timestamp: 1688836853000, Type: "say",
 			Say:  "codebase_search_result",
-			Text: `{"tool":"codebaseSearch","content":{"query":"find foo","results":[{"filePath":"src/foo.ts","score":0.9}]}}`},
+			Text: `{"tool":"codebaseSearch","content":{"query":"find foo","results":[{"filePath":"src/foo.ts","score":0.9}]}}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 	_, parsed, err := parseKiloLegacySession(taskDir, "", "")
@@ -1106,19 +1326,23 @@ func TestParseKiloLegacySessionCodebaseSearchResultStandalone(t *testing.T) {
 	// Emit a search result with no preceding tool call.
 	msgs := []kiloLegacyMessage{
 		{Timestamp: 1688836851000, Type: "say", Say: "text", Text: "task"},
-		{Timestamp: 1688836852000, Type: "say",
+		{
+			Timestamp: 1688836852000, Type: "say",
 			Say:  "codebase_search_result",
-			Text: `{"tool":"codebaseSearch","content":{"query":"orphan","results":[]}}`},
+			Text: `{"tool":"codebaseSearch","content":{"query":"orphan","results":[]}}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 	_, parsed, err := parseKiloLegacySession(taskDir, "", "")
 	require.NoError(t, err)
 
-	// Orphaned result should appear as a standalone system message.
+	// Orphaned result should appear as a standalone system message that is
+	// marked as tool output.
 	found := false
 	for _, m := range parsed {
 		if m.IsSystem && strings.Contains(m.Content, "codebaseSearch") {
 			found = true
+			assert.Equal(t, SourceSubtypeToolResult, m.SourceSubtype)
 			break
 		}
 	}
@@ -1151,8 +1375,10 @@ func TestParseKiloLegacySessionFollowupUnwrapsJSON(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []kiloLegacyMessage{
 		{Timestamp: 1688836851000, Type: "say", Say: "text", Text: "task"},
-		{Timestamp: 1688836852000, Type: "ask", Ask: "followup",
-			Text: `{"question":"Should I proceed with the refactor?","suggest":["Yes","No"]}`},
+		{
+			Timestamp: 1688836852000, Type: "ask", Ask: "followup",
+			Text: `{"question":"Should I proceed with the refactor?","suggest":["Yes","No"]}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 	_, parsed, err := parseKiloLegacySession(taskDir, "", "")
@@ -1177,8 +1403,10 @@ func TestParseKiloLegacySessionCompletionResultUnwrapsJSON(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []kiloLegacyMessage{
 		{Timestamp: 1688836851000, Type: "say", Say: "text", Text: "task"},
-		{Timestamp: 1688836852000, Type: "ask", Ask: "completion_result",
-			Text: `{"suggest":"The refactor is complete. All tests pass."}`},
+		{
+			Timestamp: 1688836852000, Type: "ask", Ask: "completion_result",
+			Text: `{"suggest":"The refactor is complete. All tests pass."}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 	_, parsed, err := parseKiloLegacySession(taskDir, "", "")
@@ -1201,21 +1429,29 @@ func TestParseKiloLegacySessionCompletionResultUnwrapsJSON(t *testing.T) {
 func TestParseKiloLegacySessionPartialCostExcluded(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "first"},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "first",
+		},
 		// A valid JSON request payload with usageMissing and no
 		// cost field — a real API request that didn't return usage
 		// data. The payload is valid JSON so it counts in the
 		// denominator; costPresent is false so it doesn't count
 		// in requestsWithCost.
-		{"ts": 1700000000500, "type": "say",
+		{
+			"ts": 1700000000500, "type": "say",
 			"say":  "api_req_started",
-			"text": `{"usageMissing":true}`},
-		{"ts": 1700000001000, "type": "say", "say": "text",
-			"text": "second"},
-		{"ts": 1700000001500, "type": "say",
+			"text": `{"usageMissing":true}`,
+		},
+		{
+			"ts": 1700000001000, "type": "say", "say": "text",
+			"text": "second",
+		},
+		{
+			"ts": 1700000001500, "type": "say",
 			"say":  "api_req_started",
-			"text": `{"tokensIn":2500,"tokensOut":120,"cacheReads":400,"cost":0.034,"inferenceProvider":"Z.AI","usageMissing":false}`},
+			"text": `{"tokensIn":2500,"tokensOut":120,"cacheReads":400,"cost":0.034,"inferenceProvider":"Z.AI","usageMissing":false}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -1224,8 +1460,8 @@ func TestParseKiloLegacySessionPartialCostExcluded(t *testing.T) {
 	require.Len(t, sess.UsageEvents, 1)
 	// The first request is a valid JSON payload (usageMissing) and
 	// counts in the denominator. Since only one of two requests has
-	// cost, CostUSD must not be set.
-	assert.Nil(t, sess.UsageEvents[0].CostUSD,
+	// cost, Cost must not be set.
+	assert.Nil(t, sess.UsageEvents[0].Cost,
 		"partial cost must not be treated as authoritative")
 	assert.Equal(t, 120, sess.UsageEvents[0].OutputTokens,
 		"output tokens from the priced request are still counted")
@@ -1234,16 +1470,22 @@ func TestParseKiloLegacySessionPartialCostExcluded(t *testing.T) {
 func TestParseKiloLegacySessionWorkspaceDirExcluded(t *testing.T) {
 	taskDir := writeKiloLegacyFixture(t)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "first"},
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "first",
+		},
 		// Non-JSON workspace metadata — should be excluded from
 		// the cost-coverage denominator entirely.
-		{"ts": 1700000000500, "type": "say",
+		{
+			"ts": 1700000000500, "type": "say",
 			"say":  "api_req_started",
-			"text": `Current Workspace Directory (/a/b/proj) Files`},
-		{"ts": 1700000001000, "type": "say",
+			"text": `Current Workspace Directory (/a/b/proj) Files`,
+		},
+		{
+			"ts": 1700000001000, "type": "say",
 			"say":  "api_req_started",
-			"text": `{"tokensIn":2500,"tokensOut":120,"cacheReads":400,"cost":0.034,"inferenceProvider":"Z.AI","usageMissing":false}`},
+			"text": `{"tokensIn":2500,"tokensOut":120,"cacheReads":400,"cost":0.034,"inferenceProvider":"Z.AI","usageMissing":false}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -1253,9 +1495,9 @@ func TestParseKiloLegacySessionWorkspaceDirExcluded(t *testing.T) {
 	// Workspace metadata is not a valid JSON payload, so it is
 	// excluded from the denominator. The single priced request
 	// is authoritative.
-	require.NotNil(t, sess.UsageEvents[0].CostUSD,
+	require.NotNil(t, sess.UsageEvents[0].Cost,
 		"single priced request with workspace metadata excluded should be authoritative")
-	assert.InDelta(t, 0.034, *sess.UsageEvents[0].CostUSD, 0.0001)
+	assert.Equal(t, money.MustParseDollars("0.034"), *sess.UsageEvents[0].Cost)
 }
 
 func TestKiloLegacyDiscoverRejectsSymlinkedTaskDir(t *testing.T) {
@@ -1284,7 +1526,7 @@ func TestKiloLegacyDiscoverRejectsSymlinkedTaskDir(t *testing.T) {
 	symlinkTask := filepath.Join(tasksDir, "symlink-task")
 	require.NoError(t, os.Symlink(outsideDir, symlinkTask))
 
-	matches := kiloLegacyDiscoverFiles(root)
+	matches := kiloLegacyDiscoverMatchesForTest(t, root)
 	require.Len(t, matches, 1,
 		"only the real task should be discovered; symlink should be rejected")
 	assert.Contains(t, matches[0].Path, "real-task",
@@ -1299,11 +1541,15 @@ func TestParseKiloLegacySessionMalformedAPIHistoryContinues(t *testing.T) {
 		`{not valid json`,
 	)
 	msgs := []map[string]any{
-		{"ts": 1700000000000, "type": "say", "say": "text",
-			"text": "hello"},
-		{"ts": 1700000000500, "type": "say",
+		{
+			"ts": 1700000000000, "type": "say", "say": "text",
+			"text": "hello",
+		},
+		{
+			"ts": 1700000000500, "type": "say",
 			"say":  "api_req_started",
-			"text": `{"tokensIn":500,"tokensOut":10,"cost":0.001,"usageMissing":false}`},
+			"text": `{"tokensIn":500,"tokensOut":10,"cost":0.001,"usageMissing":false}`,
+		},
 	}
 	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
 
@@ -1314,4 +1560,32 @@ func TestParseKiloLegacySessionMalformedAPIHistoryContinues(t *testing.T) {
 	assert.Equal(t, 10, sess.TotalOutputTokens,
 		"transcript should still be parsed from ui_messages.json")
 	require.Len(t, sess.UsageEvents, 1)
+}
+
+func TestParseKiloLegacySessionUnpairedCommandOutputIsMarkedToolOutput(
+	t *testing.T,
+) {
+	taskDir := writeKiloLegacyFixture(t)
+	msgs := []kiloLegacyMessage{
+		{Timestamp: 1688836851000, Type: "say", Say: "text", Text: "task"},
+		{
+			Timestamp: 1688836860000, Type: "say", Say: "command_output",
+			Text: "secret=abc123",
+		},
+	}
+	mustWriteJSON(t, filepath.Join(taskDir, "ui_messages.json"), msgs)
+	_, parsed, err := parseKiloLegacySession(taskDir, "", "")
+	require.NoError(t, err)
+
+	var fallback *ParsedMessage
+	for i := range parsed {
+		if parsed[i].Content == "secret=abc123" {
+			fallback = &parsed[i]
+			break
+		}
+	}
+	require.NotNil(t, fallback, "unpaired command output falls back to a row")
+	assert.True(t, fallback.IsSystem)
+	assert.Equal(t, SourceSubtypeToolResult, fallback.SourceSubtype,
+		"the fallback row's text is tool output")
 }

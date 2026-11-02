@@ -4,19 +4,201 @@ package db
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/testutil"
 )
+
+type usageVersion struct {
+	revision string
+	marker   string
+}
+
+func readUsageVersion(t *testing.T, database *DB, id string) usageVersion {
+	t.Helper()
+	var got usageVersion
+	require.NoError(t, database.getReader().QueryRow(t.Context(),
+		`SELECT transcript_revision, sync_marker FROM sessions WHERE id = ?`, id,
+	).Scan(&got.revision, &got.marker))
+	return got
+}
+
+func freezeUsageVersionSignals(t *testing.T, database *DB, id string) usageVersion {
+	t.Helper()
+	_, err := database.getWriter().Exec(t.Context(),
+		`UPDATE sessions
+		 SET created_at = '2026-07-01T10:00:00.000Z',
+		     local_modified_at = '2026-07-01T10:00:00.000Z',
+		     started_at = NULL, ended_at = NULL, file_mtime = 0
+		 WHERE id = ?`, id,
+	)
+	require.NoError(t, err)
+	return readUsageVersion(t, database, id)
+}
+
+func usageVersionMessage(id string, tokenUsage string) Message {
+	return Message{
+		SessionID: id, Ordinal: 0, Role: "assistant", Content: "answer",
+		ContentLength: len("answer"), Model: "model-x",
+		TokenUsage: json.RawMessage(tokenUsage),
+	}
+}
+
+func TestMessageMutationAdvancesUsageVersion(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *DB, string, Message)
+		write func(*testing.T, *DB, string, Message)
+	}{
+		{
+			name: "InsertMessages",
+			setup: func(t *testing.T, d *DB, id string, _ Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+			},
+			write: func(t *testing.T, d *DB, _ string, changed Message) {
+				t.Helper()
+
+				require.NoError(t, d.InsertMessages(t.Context(), []Message{changed}))
+			},
+		},
+		{
+			name: "WriteSessionIncremental",
+			setup: func(t *testing.T, d *DB, id string, _ Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+			},
+			write: func(t *testing.T, d *DB, id string, changed Message) {
+				t.Helper()
+
+				_, err := d.WriteSessionIncremental(t.Context(),
+					id, []Message{changed}, IncrementalSessionUpdate{},
+				)
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "ReplaceSessionMessages",
+			setup: func(t *testing.T, d *DB, id string, original Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+				insertMessages(t, d, original)
+			},
+			write: func(t *testing.T, d *DB, id string, changed Message) {
+				t.Helper()
+
+				require.NoError(t, d.ReplaceSessionMessages(t.Context(), id, []Message{changed}))
+			},
+		},
+		{
+			name: "ReplaceSessionContent",
+			setup: func(t *testing.T, d *DB, id string, original Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+				insertMessages(t, d, original)
+			},
+			write: func(t *testing.T, d *DB, id string, changed Message) {
+				t.Helper()
+
+				require.NoError(t, d.ReplaceSessionContent(t.Context(),
+					id, []Message{changed}, SessionSignalUpdate{}, nil,
+				))
+			},
+		},
+		{
+			name: "WriteSessionBatch",
+			setup: func(t *testing.T, d *DB, id string, original Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+				insertMessages(t, d, original)
+			},
+			write: func(t *testing.T, d *DB, id string, changed Message) {
+				t.Helper()
+
+				result, err := d.WriteSessionBatch([]SessionBatchWrite{{
+					Session:  Session{ID: id, Project: "proj", Machine: "m", Agent: "a"},
+					Messages: []Message{changed}, ReplaceMessages: true,
+				}})
+				require.NoError(t, err)
+				require.Equal(t, 1, result.WrittenSessions)
+			},
+		},
+		{
+			name: "WriteSessionBatchAtomic",
+			setup: func(t *testing.T, d *DB, id string, original Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+				insertMessages(t, d, original)
+			},
+			write: func(t *testing.T, d *DB, id string, changed Message) {
+				t.Helper()
+
+				result, err := d.WriteSessionBatchAtomic(t.Context(), []SessionBatchWrite{{
+					Session:  Session{ID: id, Project: "proj", Machine: "m", Agent: "a"},
+					Messages: []Message{changed}, ReplaceMessages: true,
+				}})
+				require.NoError(t, err)
+				require.Equal(t, 1, result.WrittenSessions)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			database := testDB(t)
+			id := "usage-version-" + tc.name
+			original := usageVersionMessage(id, `{"input_tokens":1}`)
+			changed := usageVersionMessage(id, `{"input_tokens":2}`)
+			tc.setup(t, database, id, original)
+			before := freezeUsageVersionSignals(t, database, id)
+
+			tc.write(t, database, id, changed)
+
+			after := readUsageVersion(t, database, id)
+			assert.NotEqual(t, before.revision, after.revision)
+			assert.Greater(t, after.marker, before.marker)
+		})
+	}
+}
+
+func TestMessageNoOpPreservesUsageVersion(t *testing.T) {
+	database := testDB(t)
+	id := "usage-noop-replacement"
+	msg := usageVersionMessage(id, `{"input_tokens":1}`)
+	insertSession(t, database, id, "proj")
+	insertMessages(t, database, msg)
+	before := freezeUsageVersionSignals(t, database, id)
+
+	require.NoError(t, database.ReplaceSessionMessages(t.Context(), id, []Message{msg}))
+
+	assert.Equal(t, before, readUsageVersion(t, database, id))
+}
 
 func TestSyncMarkerMaintainedByTriggers(t *testing.T) {
 	database := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
-	sess := Session{ID: "sm-1", Project: "p", Machine: "m", Agent: "claude-code",
-		CreatedAt: "2026-07-01T10:00:00.000Z"}
-	require.NoError(t, database.UpsertSession(sess))
+	sess := Session{
+		ID: "sm-1", Project: "p", Machine: "m", Agent: "claude-code",
+		CreatedAt: "2026-07-01T10:00:00.000Z",
+	}
+	require.NoError(t, database.UpsertSession(ctx, sess))
 
 	// UpsertSession does not write created_at (it relies on the schema
 	// DEFAULT for new rows), so backdate it directly the way
@@ -55,7 +237,7 @@ func TestSyncMarkerMaintainedByTriggers(t *testing.T) {
 // session file changed (e.g. a pricing-driven recompute).
 func TestReplaceSessionUsageEventsAdvancesSyncMarker(t *testing.T) {
 	database := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	backdate := func(id string) {
 		t.Helper()
@@ -73,19 +255,20 @@ func TestReplaceSessionUsageEventsAdvancesSyncMarker(t *testing.T) {
 		return marker
 	}
 
-	require.NoError(t, database.UpsertSession(Session{
-		ID: "sm-usage", Project: "p", Machine: "m", Agent: "claude-code"}))
+	require.NoError(t, database.UpsertSession(ctx, Session{
+		ID: "sm-usage", Project: "p", Machine: "m", Agent: "claude-code",
+	}))
 	backdate("sm-usage")
 	require.Equal(t, "2026-07-01T10:00:00.000Z", readMarker("sm-usage"))
 
-	require.NoError(t, database.ReplaceSessionUsageEvents("sm-usage",
+	require.NoError(t, database.ReplaceSessionUsageEvents(ctx, "sm-usage",
 		[]UsageEvent{{Source: "session", Model: "model-x", OutputTokens: 5}}))
 	assert.Greater(t, readMarker("sm-usage"), "2026-07-01T10:00:00.000Z",
 		"replacing usage events must advance sync_marker")
 
 	// A deletion-only rewrite (no new events) is a change too.
 	backdate("sm-usage")
-	require.NoError(t, database.ReplaceSessionUsageEvents("sm-usage", nil))
+	require.NoError(t, database.ReplaceSessionUsageEvents(ctx, "sm-usage", nil))
 	assert.Greater(t, readMarker("sm-usage"), "2026-07-01T10:00:00.000Z",
 		"clearing usage events must advance sync_marker")
 }
@@ -98,7 +281,7 @@ func TestReplaceSessionUsageEventsAdvancesSyncMarker(t *testing.T) {
 // (PostgreSQL and the DuckDB mirror alike).
 func TestLinkSubagentSessionsAdvancesSyncMarker(t *testing.T) {
 	database := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	backdate := func(id string) {
 		t.Helper()
@@ -116,10 +299,12 @@ func TestLinkSubagentSessionsAdvancesSyncMarker(t *testing.T) {
 		return marker
 	}
 
-	require.NoError(t, database.UpsertSession(Session{
-		ID: "sm-parent", Project: "p", Machine: "m", Agent: "claude-code"}))
-	require.NoError(t, database.UpsertSession(Session{
-		ID: "sm-child", Project: "p", Machine: "m", Agent: "claude-code"}))
+	require.NoError(t, database.UpsertSession(ctx, Session{
+		ID: "sm-parent", Project: "p", Machine: "m", Agent: "claude-code",
+	}))
+	require.NoError(t, database.UpsertSession(ctx, Session{
+		ID: "sm-child", Project: "p", Machine: "m", Agent: "claude-code",
+	}))
 	insertMessages(t, database, Message{
 		SessionID:     "sm-parent",
 		Ordinal:       0,
@@ -158,7 +343,7 @@ func TestLinkSubagentSessionsAdvancesSyncMarker(t *testing.T) {
 // local_modified_at, while a no-op call must not.
 func TestSetToolCallSubagentSessionAdvancesSyncMarker(t *testing.T) {
 	database := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	backdate := func(id string) {
 		t.Helper()
@@ -176,8 +361,9 @@ func TestSetToolCallSubagentSessionAdvancesSyncMarker(t *testing.T) {
 		return marker
 	}
 
-	require.NoError(t, database.UpsertSession(Session{
-		ID: "sm-link", Project: "p", Machine: "m", Agent: "claude-code"}))
+	require.NoError(t, database.UpsertSession(ctx, Session{
+		ID: "sm-link", Project: "p", Machine: "m", Agent: "claude-code",
+	}))
 	insertMessages(t, database, Message{
 		SessionID:     "sm-link",
 		Ordinal:       0,
@@ -194,13 +380,13 @@ func TestSetToolCallSubagentSessionAdvancesSyncMarker(t *testing.T) {
 	})
 	backdate("sm-link")
 
-	require.NoError(t, database.SetToolCallSubagentSession(
+	require.NoError(t, database.SetToolCallSubagentSession(ctx,
 		"sm-link", "toolu_sm1", "sm-linked-child"))
 	assert.Greater(t, readMarker("sm-link"), "2026-07-01T10:00:00.000Z",
 		"a new subagent linkage must advance sync_marker")
 
 	backdate("sm-link")
-	require.NoError(t, database.SetToolCallSubagentSession(
+	require.NoError(t, database.SetToolCallSubagentSession(ctx,
 		"sm-link", "toolu_sm1", "sm-linked-child"))
 	assert.Equal(t, "2026-07-01T10:00:00.000Z", readMarker("sm-link"),
 		"an unchanged linkage must not advance sync_marker")
@@ -208,7 +394,7 @@ func TestSetToolCallSubagentSessionAdvancesSyncMarker(t *testing.T) {
 
 func TestListSessionsForMirrorWindowInclusiveLowerBoundUnboundedAbove(t *testing.T) {
 	database := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sessions := []Session{
 		{ID: "w-1", Project: "p", Machine: "m", Agent: "a", CreatedAt: "2026-07-01T10:00:00.000Z"},
 		{ID: "w-2", Project: "p", Machine: "m", Agent: "a", CreatedAt: "2026-07-01T10:00:00.001Z"},
@@ -219,7 +405,7 @@ func TestListSessionsForMirrorWindowInclusiveLowerBoundUnboundedAbove(t *testing
 		{ID: "w-future", Project: "p", Machine: "m", Agent: "a", CreatedAt: "2099-01-01T00:00:00.000Z"},
 	}
 	for _, s := range sessions {
-		require.NoError(t, database.UpsertSession(s))
+		require.NoError(t, database.UpsertSession(ctx, s))
 	}
 	// UpsertSession relies on the schema DEFAULT for created_at on new rows,
 	// so backdate it directly (same pattern as TestListSessionsModifiedBetween)
@@ -258,7 +444,7 @@ func TestListSessionsForMirrorWindowInclusiveLowerBoundUnboundedAbove(t *testing
 // past all future real changes.
 func TestSyncMarkerMalformedCreatedAtIsDropped(t *testing.T) {
 	database := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	readMarker := func(id string) string {
 		t.Helper()
@@ -271,7 +457,7 @@ func TestSyncMarkerMalformedCreatedAtIsDropped(t *testing.T) {
 	// Malformed created_at with no other signal: the marker is empty, so
 	// the session is invisible to incremental windows (a full rebuild
 	// still covers it), matching the PG push's window semantics.
-	require.NoError(t, database.UpsertSession(
+	require.NoError(t, database.UpsertSession(ctx,
 		Session{ID: "sm-malformed", Project: "p", Machine: "m", Agent: "claude-code"}))
 	_, err := database.getWriter().ExecContext(ctx,
 		`UPDATE sessions SET created_at = ? WHERE id = ?`, "garbage", "sm-malformed")
@@ -281,7 +467,7 @@ func TestSyncMarkerMalformedCreatedAtIsDropped(t *testing.T) {
 
 	// Malformed created_at plus a valid ended_at: the marker equals the
 	// normalized ended_at instead of the lexically larger raw string.
-	require.NoError(t, database.UpsertSession(
+	require.NoError(t, database.UpsertSession(ctx,
 		Session{ID: "sm-mixed", Project: "p", Machine: "m", Agent: "claude-code"}))
 	_, err = database.getWriter().ExecContext(ctx,
 		`UPDATE sessions SET created_at = 'garbage',
@@ -297,4 +483,284 @@ func TestSyncMarkerMalformedCreatedAtIsDropped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, readMarker("sm-malformed"))
 	assert.Equal(t, "2026-07-02T09:30:00.000Z", readMarker("sm-mixed"))
+}
+
+// A push that starts while a sync transaction is open must list that
+// transaction's session. Otherwise the session falls below every later
+// incremental window, whose cutoff is already past its stamp.
+func TestMirrorPushCutoffCoversOpenWriteTransaction(t *testing.T) {
+	database := testDB(t)
+	ctx := t.Context()
+	insertSession(t, database, "written", "proj")
+	_, err := database.getWriter().ExecContext(ctx,
+		`UPDATE sessions SET created_at = '2026-07-01T10:00:00.000Z',
+			local_modified_at = '2026-07-01T10:00:00.000Z' WHERE id = 'written'`)
+	require.NoError(t, err)
+	since := "2026-07-02T00:00:00Z"
+	// A stamp taken just before the push reads its cutoff.
+	stamp := time.Now().Add(-time.Minute).UTC().Format("2006-01-02T15:04:05.000Z")
+
+	stamped := make(chan struct{})
+	release := make(chan struct{})
+	committed := make(chan error, 1)
+	go func() {
+		committed <- database.Update(ctx, func(tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE sessions SET local_modified_at = ? WHERE id = 'written'`, stamp,
+			); err != nil {
+				return err
+			}
+			close(stamped)
+			<-release
+			return nil
+		})
+	}()
+	<-stamped
+
+	type listing struct {
+		ids []string
+		err error
+	}
+	listed := make(chan listing, 1)
+	go func() {
+		if _, err := database.MirrorPushCutoff(ctx); err != nil {
+			listed <- listing{err: err}
+			return
+		}
+		sessions, err := database.ListSessionsForMirrorWindow(ctx, since, nil, nil)
+		ids := make([]string, 0, len(sessions))
+		for _, s := range sessions {
+			ids = append(ids, s.ID)
+		}
+		listed <- listing{ids, err}
+	}()
+	// Commit only once the push has listed or is waiting for the write
+	// lock, so a push that ignores the open transaction lists first.
+	var got listing
+	received := false
+	for !received && !testutil.GoroutineBlockedOnMutexIn("lockctx.Lock") {
+		select {
+		case got = <-listed:
+			received = true
+		default:
+			runtime.Gosched()
+		}
+	}
+	close(release)
+	if !received {
+		got = <-listed
+	}
+	require.NoError(t, <-committed)
+	require.NoError(t, got.err)
+
+	assert.Contains(t, got.ids, "written",
+		"the push must list the transaction that was open when it started")
+}
+
+// A sync-worker child writes the archive while this process has its writer
+// closed. A push that starts then must list the child's open transaction once
+// it commits, so the cutoff waits for the writer to reopen.
+func TestMirrorPushCutoffWaitsForWorkerHandoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		database := testDB(t)
+		ctx := t.Context()
+		insertSession(t, database, "child-written", "proj")
+		_, err := database.getWriter().ExecContext(ctx,
+			`UPDATE sessions SET created_at = '2026-07-01T10:00:00.000Z',
+				local_modified_at = '2026-07-01T10:00:00.000Z' WHERE id = 'child-written'`)
+		require.NoError(t, err)
+		since := "2026-07-02T00:00:00Z"
+		stamp := "2026-07-03T00:00:00.000Z"
+
+		require.NoError(t, database.CloseWriter())
+		child, err := sql.Open(sqliteArchiveDriverName, makeDSN(database.path, false))
+		require.NoError(t, err)
+		defer child.Close()
+		tx, err := child.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		_, err = tx.ExecContext(ctx,
+			`UPDATE sessions SET local_modified_at = ? WHERE id = 'child-written'`, stamp)
+		require.NoError(t, err)
+
+		type listing struct {
+			ids []string
+			err error
+		}
+		listed := make(chan listing, 1)
+		go func() {
+			if _, err := database.MirrorPushCutoff(ctx); err != nil {
+				listed <- listing{err: err}
+				return
+			}
+			sessions, err := database.ListSessionsForMirrorWindow(ctx, since, nil, nil)
+			ids := make([]string, 0, len(sessions))
+			for _, s := range sessions {
+				ids = append(ids, s.ID)
+			}
+			listed <- listing{ids, err}
+		}()
+		// A push that ignores the handoff lists before the child commits.
+		synctest.Wait()
+		var got listing
+		received := false
+		select {
+		case got = <-listed:
+			received = true
+		default:
+		}
+		require.NoError(t, tx.Commit())
+		require.NoError(t, child.Close())
+		require.NoError(t, database.ReopenWriter())
+		if !received {
+			got = <-listed
+		}
+		require.NoError(t, got.err)
+		assert.Contains(t, got.ids, "child-written",
+			"the push must list the worker write that was open when it started")
+	})
+}
+
+func TestMirrorPushCutoffStopsWaitingWhenContextEnds(t *testing.T) {
+	database := testDB(t)
+	require.NoError(t, database.CloseWriter())
+	t.Cleanup(func() { require.NoError(t, database.ReopenWriter()) })
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := database.MirrorPushCutoff(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+// A daemon push tells its client when it waits on a worker handoff long enough
+// to log it. A short handoff stays quiet.
+func TestWaitForWriterReportsALongWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		database := testDB(t)
+		require.NoError(t, database.CloseWriter())
+		var notices atomic.Int32
+		ctx := WithWriterWaitNotice(t.Context(), func() { notices.Add(1) })
+		done := make(chan error, 1)
+		go func() { done <- database.WaitForWriter(ctx) }()
+
+		time.Sleep(writerHandoffNoticeAfter - time.Second)
+		synctest.Wait()
+		assert.Zero(t, notices.Load(), "a short wait must stay quiet")
+		time.Sleep(2 * writerHandoffNoticeAfter)
+		synctest.Wait()
+		assert.Equal(t, int32(1), notices.Load())
+
+		require.NoError(t, database.ReopenWriter())
+		require.NoError(t, <-done)
+	})
+}
+
+// A push that runs out of time while a local sync holds the writer says it gave
+// up waiting, so the reader knows the push timed out.
+func TestWaitForWriterSaysItGaveUpOnATimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		database := testDB(t)
+		require.NoError(t, database.CloseWriter())
+		t.Cleanup(func() { require.NoError(t, database.ReopenWriter()) })
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		err := database.WaitForWriter(ctx)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.EqualError(t, err,
+			"gave up waiting for the local sync to finish: context deadline exceeded")
+	})
+}
+
+// A canceled push must not wait out a long archive write for its cutoff: it
+// would keep the daemon's push turn and hold up shutdown.
+func TestMirrorPushCutoffStopsWaitingBehindALongWrite(t *testing.T) {
+	database := testDB(t)
+	inWrite := make(chan struct{})
+	release := make(chan struct{})
+	// Release the write before the database closes, even when the test fails.
+	endWrite := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(endWrite)
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- database.Update(t.Context(), func(*sql.Tx) error {
+			close(inWrite)
+			<-release
+			return nil
+		})
+	}()
+	<-inWrite
+	ctx, cancel := context.WithCancel(t.Context())
+	cutoff := make(chan error, 1)
+	go func() {
+		_, err := database.MirrorPushCutoff(ctx)
+		cutoff <- err
+	}()
+	require.Eventually(t, func() bool {
+		return testutil.GoroutineBlockedOnMutexIn("lockctx.Lock")
+	}, 10*time.Second, 5*time.Millisecond)
+	cancel()
+	select {
+	case err := <-cutoff:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "the cutoff waited for the write after its request ended")
+	}
+	endWrite()
+	require.NoError(t, <-writeDone)
+	// The abandoned lock request must not keep the lock.
+	_, err := database.MirrorPushCutoff(t.Context())
+	require.NoError(t, err)
+}
+
+// A push saves its progress with a time limit, and a canceled push must stop
+// saving. Both must hold while a long archive write has the lock, or the push
+// keeps the daemon's push turn until the write ends.
+func TestPushStateWritesStopWaitingBehindALongWrite(t *testing.T) {
+	for name, write := range map[string]func(context.Context, *DB) error{
+		"SetSyncState": func(ctx context.Context, d *DB) error {
+			return d.SetSyncState(ctx, "last_push_at", "cutoff")
+		},
+		"GetOrCreateSyncState": func(ctx context.Context, d *DB) error {
+			_, err := d.GetOrCreateSyncState(ctx, "pg_push_marker_id", "marker")
+			return err
+		},
+		"Update": func(ctx context.Context, d *DB) error {
+			return d.Update(ctx, func(*sql.Tx) error { return nil })
+		},
+		"DeleteSyncStateByPrefix": func(ctx context.Context, d *DB) error {
+			return d.DeleteSyncStateByPrefix(ctx, "duckdb_")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			database := testDB(t)
+			inWrite := make(chan struct{})
+			release := make(chan struct{})
+			endWrite := sync.OnceFunc(func() { close(release) })
+			t.Cleanup(endWrite)
+			writeDone := make(chan error, 1)
+			go func() {
+				writeDone <- database.Update(t.Context(), func(*sql.Tx) error {
+					close(inWrite)
+					<-release
+					return nil
+				})
+			}()
+			<-inWrite
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			saved := make(chan error, 1)
+			go func() { saved <- write(ctx, database) }()
+			require.Eventually(t, func() bool {
+				return testutil.GoroutineBlockedOnMutexIn("lockctx.Lock")
+			}, 10*time.Second, 5*time.Millisecond)
+			cancel()
+			select {
+			case err := <-saved:
+				require.ErrorIs(t, err, context.Canceled)
+			case <-time.After(5 * time.Second):
+				require.Fail(t, "the canceled write kept waiting for the lock")
+			}
+			endWrite()
+			require.NoError(t, <-writeDone)
+			require.NoError(t, write(t.Context(), database))
+		})
+	}
 }

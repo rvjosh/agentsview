@@ -12,7 +12,10 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/pathutil"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
 	"go.kenn.io/agentsview/internal/timeutil"
 )
 
@@ -43,6 +46,7 @@ func newSessionCommand() *cobra.Command {
 
 	cmd.AddCommand(newSessionGetCommand())
 	cmd.AddCommand(newSessionUsageCommand())
+	cmd.AddCommand(newSessionUsageBatchCommand())
 	cmd.AddCommand(newSessionListCommand())
 	cmd.AddCommand(newSessionMessagesCommand())
 	cmd.AddCommand(newSessionToolCallsCommand())
@@ -50,6 +54,8 @@ func newSessionCommand() *cobra.Command {
 	cmd.AddCommand(newSessionSyncCommand())
 	cmd.AddCommand(newSessionWatchCommand())
 	cmd.AddCommand(newSessionSearchCommand())
+	cmd.AddCommand(newSessionLabelCommand())
+	cmd.AddCommand(newSessionParentCommand())
 	return cmd
 }
 
@@ -70,10 +76,21 @@ func resolveService(
 		if err != nil {
 			return nil, nil, err
 		}
-		return service.NewHTTPBackend(remote, token, false),
+		return servicehttp.NewHTTPBackend(remote, token, false, ""),
 			func() {}, nil
 	}
-	cfg, err := config.LoadPFlags(cmd.Flags())
+	scope := config.ScopeLocal
+	for _, name := range []string{"semantic", "hybrid"} {
+		if enabled, _ := cmd.Flags().GetBool(name); enabled {
+			scope |= config.ScopeVector
+		}
+	}
+	mode, _ := cmd.Flags().GetString("mode")
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == db.RecallQueryModeVector || mode == db.RecallQueryModeHybrid {
+		scope |= config.ScopeVector
+	}
+	cfg, err := config.LoadPFlagsFor(cmd.Flags(), scope)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
 			"loading config: %w", err,
@@ -84,13 +101,18 @@ func resolveService(
 		return nil, nil, err
 	}
 	if usePG {
+		if scope&config.ScopeVector != 0 {
+			if err := cfg.ApplyDeploymentEmbeddings(); err != nil {
+				return nil, nil, fmt.Errorf("loading deployment embeddings: %w", err)
+			}
+		}
 		return newPGReadService(cfg, pgCfg)
 	}
 	tr, err := ensureTransport(&cfg, transportIntentRead, 0)
 	if err != nil {
 		return nil, nil, err
 	}
-	return newService(cfg, tr)
+	return newService(cmd.Context(), cfg, tr)
 }
 
 // resolveSinceFlag validates the --since/--active-since pair shared by
@@ -144,7 +166,7 @@ func resolveWritableServiceWithIntent(
 		if err != nil {
 			return nil, nil, err
 		}
-		return service.NewHTTPBackend(remote, token, false),
+		return servicehttp.NewHTTPBackend(remote, token, false, ""),
 			func() {}, nil
 	}
 	if pgReadRequested(cmd) {
@@ -152,7 +174,7 @@ func resolveWritableServiceWithIntent(
 			"--pg is read-only and cannot be used with write commands",
 		)
 	}
-	cfg, err := config.LoadPFlags(cmd.Flags())
+	cfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
@@ -160,7 +182,7 @@ func resolveWritableServiceWithIntent(
 	if fresh {
 		tr, err = ensureTransport(&cfg, transportIntentArchiveWrite, 0)
 	} else {
-		tr, err = detectTransport(cfg.DataDir, cfg.AuthToken, 0)
+		tr, err = detectClientTransportContext(cmd.Context(), &cfg, 0)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -183,7 +205,7 @@ func resolveWritableServiceWithIntent(
 				"is reachable and compatible, or stop it to write locally",
 		)
 	}
-	return syncService(cfg, tr)
+	return syncService(cmd.Context(), cfg, tr)
 }
 
 func resolvePGReadConfig(
@@ -219,6 +241,10 @@ func explicitServerToken(cmd *cobra.Command) (string, error) {
 	}
 	path, err := cmd.Flags().GetString("server-token-file")
 	if err == nil && strings.TrimSpace(path) != "" {
+		path, err = pathutil.ExpandHome(path)
+		if err != nil {
+			return "", fmt.Errorf("expanding --server-token-file: %w", err)
+		}
 		b, err := os.ReadFile(path)
 		if err != nil {
 			return "", fmt.Errorf("reading --server-token-file: %w", err)

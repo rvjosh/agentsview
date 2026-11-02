@@ -5,13 +5,14 @@ package artifact
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"strings"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // Artifact kinds. Each kind maps to a top-level directory in an artifact
@@ -32,8 +33,28 @@ var (
 
 var errIncompleteArtifact = errors.New("incomplete artifact")
 
-// formatVersion is the current artifact wire format version.
-const formatVersion = 1
+// Wire versions advance independently because each artifact kind has its own
+// schema and consumers. A change to one kind must not invalidate the others.
+const (
+	checkpointFormatVersion = 1
+	// Manifest v2 replaces usage_events[].cost_usd floats with exact
+	// integer-microdollar cost objects. Manifest v3 adds the optional
+	// session_kind provenance field. Manifest v4 adds the optional
+	// provider_id billing field on usage events. Manifest v5 adds session group_key,
+	// v6 adds session pr_links, and v7 adds plan_usage and capture_coverage.
+	// Older manifests decode with missing fields empty. Export writes the
+	// lowest version that holds the session's fields.
+	manifestPRLinksVersion   = 6
+	manifestFormatVersion    = 7
+	manifestMinDecodeVersion = 2
+	// Segment v2 adds the optional prompt_source provenance field on
+	// message records. Segment v3 adds the optional provider_id billing
+	// field. Segment v4 adds the optional reasoning_effort field; v1 through
+	// v3 segments still decode, with the fields defaulting to empty.
+	messageSegmentFormatVersion    = 4
+	messageSegmentMinDecodeVersion = 1
+	metadataEventFormatVersion     = 1
+)
 
 // metadataEventExtension is the file extension for metadata event artifacts.
 const metadataEventExtension = ".json"
@@ -50,11 +71,10 @@ func validateArtifactName(name string) error {
 
 func normalizeMetadataName(name string) (filename, hash string, err error) {
 	base := strings.TrimSuffix(name, metadataEventExtension)
-	idx := strings.LastIndex(base, "-")
-	if idx < 0 {
+	_, hash, ok := strings.CutLast(base, "-")
+	if !ok {
 		return "", "", fmt.Errorf("%w: metadata artifact missing hash suffix", ErrArtifactInvalid)
 	}
-	hash = base[idx+1:]
 	if err := validateHashHex(hash); err != nil {
 		return "", "", err
 	}
@@ -70,21 +90,11 @@ func normalizeCheckpointName(name string) (string, error) {
 }
 
 func checkpointSequence(filename string) (int, error) {
-	base := strings.TrimSuffix(filename, ".json")
-	if len(base) != len("cp-0000000000") || !strings.HasPrefix(base, "cp-") {
-		return 0, fmt.Errorf("%w: invalid checkpoint name", ErrArtifactInvalid)
+	sequence, err := db.ParseArtifactCheckpointSequence(filename)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %w", ErrArtifactInvalid, err)
 	}
-	seq := 0
-	for _, r := range base[len("cp-"):] {
-		if r < '0' || r > '9' {
-			return 0, fmt.Errorf("%w: invalid checkpoint name", ErrArtifactInvalid)
-		}
-		seq = seq*10 + int(r-'0')
-	}
-	if seq <= 0 {
-		return 0, fmt.Errorf("%w: invalid checkpoint sequence", ErrArtifactInvalid)
-	}
-	return seq, nil
+	return sequence, nil
 }
 
 func validateHashHex(hash string) error {
@@ -118,7 +128,7 @@ type manifest struct {
 	SessionName     *string              `json:"session_name,omitempty"`
 	Segments        []string             `json:"segments"`
 	UsageEvents     []artifactUsageEvent `json:"usage_events,omitempty"`
-	RawSource       *rawSourceRef        `json:"raw_source,omitempty"`
+	RawSource       *RawSourceRef        `json:"raw_source,omitempty"`
 	DataVersion     int                  `json:"data_version"`
 	Generation      int                  `json:"generation"`
 	// Signal state persisted on the session row but absent from the wire
@@ -127,28 +137,60 @@ type manifest struct {
 	// and quality signal state instead of resetting to false/zero. Secret-scan
 	// state is deliberately not carried: findings live outside the manifest,
 	// so imported sessions are treated as unscanned.
-	SessionHasToolCalls   bool                    `json:"session_has_tool_calls,omitempty"`
-	SessionHasContextData bool                    `json:"session_has_context_data,omitempty"`
+	SessionHasToolCalls   bool                    `json:"session_has_tool_calls,omitzero"`
+	SessionHasContextData bool                    `json:"session_has_context_data,omitzero"`
 	SessionQualitySignals *manifestQualitySignals `json:"session_quality_signals,omitempty"`
+	// PlanUsage and CaptureCoverage are the session's codex-cloud plan usage
+	// and live token capture coverage, nil when the session has none. They
+	// omit only when nil, so a present but empty value still round-trips.
+	PlanUsage       *artifactPlanUsage       `json:"plan_usage,omitzero"`
+	CaptureCoverage *artifactCaptureCoverage `json:"capture_coverage,omitzero"`
+}
+
+// artifactPlanUsage is the wire form of a session's plan usage report and
+// the newest outcome after it. Field names match db.PlanUsageView.
+// CountedUnder is the usage root's session ID on the exporting origin.
+type artifactPlanUsage struct {
+	DataAsOf        string                     `json:"data_as_of,omitempty"`
+	DataStatus      string                     `json:"data_status,omitempty"`
+	UsageSource     string                     `json:"usage_source,omitempty"`
+	WeeklyPercent   *float64                   `json:"weekly_percent,omitzero"`
+	FiveHourPercent *float64                   `json:"five_hour_percent,omitzero"`
+	Credits         *string                    `json:"credits,omitzero"`
+	Groups          []db.SessionPlanUsageGroup `json:"groups,omitempty"`
+	Final           bool                       `json:"final,omitzero"`
+	OutcomeKind     string                     `json:"outcome_kind,omitempty"`
+	OutcomeAt       string                     `json:"outcome_at,omitempty"`
+	CountedUnder    string                     `json:"counted_under,omitempty"`
+}
+
+// artifactCaptureCoverage is the wire form of a session's live token
+// capture coverage. Field names match db.CaptureCoverageView.
+type artifactCaptureCoverage struct {
+	LastCaptureAt   string `json:"last_capture_at,omitempty"`
+	UncapturedTurns int    `json:"uncaptured_turns,omitzero"`
 }
 
 type artifactUsageEvent struct {
-	MessageOrdinal           *int     `json:"message_ordinal,omitempty"`
-	Source                   string   `json:"source"`
-	Model                    string   `json:"model"`
-	InputTokens              int      `json:"input_tokens,omitempty"`
-	OutputTokens             int      `json:"output_tokens,omitempty"`
-	CacheCreationInputTokens int      `json:"cache_creation_input_tokens,omitempty"`
-	CacheReadInputTokens     int      `json:"cache_read_input_tokens,omitempty"`
-	ReasoningTokens          int      `json:"reasoning_tokens,omitempty"`
-	CostUSD                  *float64 `json:"cost_usd,omitempty"`
-	CostStatus               string   `json:"cost_status,omitempty"`
-	CostSource               string   `json:"cost_source,omitempty"`
-	OccurredAt               string   `json:"occurred_at,omitempty"`
-	DedupKey                 string   `json:"dedup_key,omitempty"`
+	MessageOrdinal           *int         `json:"message_ordinal,omitempty"`
+	Source                   string       `json:"source"`
+	Model                    string       `json:"model"`
+	ProviderID               string       `json:"provider_id,omitempty"`
+	InputTokens              int          `json:"input_tokens,omitzero"`
+	OutputTokens             int          `json:"output_tokens,omitzero"`
+	CacheCreationInputTokens int          `json:"cache_creation_input_tokens,omitzero"`
+	CacheReadInputTokens     int          `json:"cache_read_input_tokens,omitzero"`
+	ReasoningTokens          int          `json:"reasoning_tokens,omitzero"`
+	Cost                     *money.Money `json:"cost,omitempty"`
+	CostStatus               string       `json:"cost_status,omitempty"`
+	CostSource               string       `json:"cost_source,omitempty"`
+	OccurredAt               string       `json:"occurred_at,omitempty"`
+	DedupKey                 string       `json:"dedup_key,omitempty"`
 }
 
-type rawSourceRef struct {
+// RawSourceRef identifies one bounded raw provider artifact without embedding
+// its contents in a portable manifest.
+type RawSourceRef struct {
 	Hash      string `json:"hash"`
 	Size      int64  `json:"size"`
 	MediaType string `json:"media_type,omitempty"`
@@ -156,13 +198,13 @@ type rawSourceRef struct {
 }
 
 type metadataEvent struct {
-	Version    int             `json:"v"`
-	HLC        string          `json:"hlc"`
-	Origin     string          `json:"origin"`
-	SessionGID string          `json:"session_gid"`
-	Op         string          `json:"op"`
-	Value      json.RawMessage `json:"value,omitempty"`
-	Pin        *MetadataPin    `json:"pin,omitempty"`
+	Version    int            `json:"v"`
+	HLC        string         `json:"hlc"`
+	Origin     string         `json:"origin"`
+	SessionGID string         `json:"session_gid"`
+	Op         string         `json:"op"`
+	Value      jsontext.Value `json:"value,omitempty"`
+	Pin        *MetadataPin   `json:"pin,omitempty"`
 }
 
 // MetadataPin identifies a pinned message with stable source coordinates.
@@ -179,25 +221,28 @@ type segmentMessage struct {
 	Content           string            `json:"content"`
 	ThinkingText      string            `json:"thinking_text,omitempty"`
 	Timestamp         string            `json:"timestamp,omitempty"`
-	HasThinking       bool              `json:"has_thinking,omitempty"`
-	HasToolUse        bool              `json:"has_tool_use,omitempty"`
-	ContentLength     int               `json:"content_length,omitempty"`
+	HasThinking       bool              `json:"has_thinking,omitzero"`
+	HasToolUse        bool              `json:"has_tool_use,omitzero"`
+	ContentLength     int               `json:"content_length,omitzero"`
 	Model             string            `json:"model,omitempty"`
-	TokenUsage        json.RawMessage   `json:"token_usage,omitempty"`
-	ContextTokens     int               `json:"context_tokens,omitempty"`
-	OutputTokens      int               `json:"output_tokens,omitempty"`
-	HasContextTokens  bool              `json:"has_context_tokens,omitempty"`
-	HasOutputTokens   bool              `json:"has_output_tokens,omitempty"`
+	ReasoningEffort   string            `json:"reasoning_effort,omitempty"`
+	ProviderID        string            `json:"provider_id,omitempty"`
+	TokenUsage        jsontext.Value    `json:"token_usage,omitempty"`
+	ContextTokens     int               `json:"context_tokens,omitzero"`
+	OutputTokens      int               `json:"output_tokens,omitzero"`
+	HasContextTokens  bool              `json:"has_context_tokens,omitzero"`
+	HasOutputTokens   bool              `json:"has_output_tokens,omitzero"`
 	ClaudeMessageID   string            `json:"claude_message_id,omitempty"`
 	ClaudeRequestID   string            `json:"claude_request_id,omitempty"`
 	ToolCalls         []segmentToolCall `json:"tool_calls,omitempty"`
-	IsSystem          bool              `json:"is_system,omitempty"`
+	IsSystem          bool              `json:"is_system,omitzero"`
 	SourceType        string            `json:"source_type,omitempty"`
 	SourceSubtype     string            `json:"source_subtype,omitempty"`
+	PromptSource      string            `json:"prompt_source,omitempty"`
 	SourceUUID        string            `json:"source_uuid,omitempty"`
 	SourceParentUUID  string            `json:"source_parent_uuid,omitempty"`
-	IsSidechain       bool              `json:"is_sidechain,omitempty"`
-	IsCompactBoundary bool              `json:"is_compact_boundary,omitempty"`
+	IsSidechain       bool              `json:"is_sidechain,omitzero"`
+	IsCompactBoundary bool              `json:"is_compact_boundary,omitzero"`
 }
 
 type segmentToolCall struct {
@@ -236,9 +281,9 @@ var rawSourceMediaTypes = map[string]bool{
 const maxRawSourceSize = int64(1 << 30)
 
 // ValidateRawSource checks a manifest's optional raw_source reference
-// against the frozen v1 contract. A nil reference is valid (raw capture is
+// against the stable wire contract. A nil reference is valid (raw capture is
 // optional).
-func ValidateRawSource(raw *rawSourceRef) error {
+func ValidateRawSource(raw *RawSourceRef) error {
 	if raw == nil {
 		return nil
 	}
@@ -281,7 +326,7 @@ func encodeSegment(msgs []db.Message) ([]byte, error) {
 
 func segmentMessageFromDB(msg db.Message) segmentMessage {
 	record := segmentMessage{
-		Version:           formatVersion,
+		Version:           messageSegmentFormatVersion,
 		Ordinal:           msg.Ordinal,
 		Role:              msg.Role,
 		Content:           msg.Content,
@@ -291,6 +336,8 @@ func segmentMessageFromDB(msg db.Message) segmentMessage {
 		HasToolUse:        msg.HasToolUse,
 		ContentLength:     msg.ContentLength,
 		Model:             msg.Model,
+		ReasoningEffort:   msg.ReasoningEffort,
+		ProviderID:        msg.ProviderID,
 		TokenUsage:        msg.TokenUsage,
 		ContextTokens:     msg.ContextTokens,
 		OutputTokens:      msg.OutputTokens,
@@ -301,6 +348,7 @@ func segmentMessageFromDB(msg db.Message) segmentMessage {
 		IsSystem:          msg.IsSystem,
 		SourceType:        msg.SourceType,
 		SourceSubtype:     msg.SourceSubtype,
+		PromptSource:      msg.PromptSource,
 		SourceUUID:        msg.SourceUUID,
 		SourceParentUUID:  msg.SourceParentUUID,
 		IsSidechain:       msg.IsSidechain,

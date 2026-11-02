@@ -2,8 +2,11 @@ package parser
 
 import (
 	"bufio"
-	"encoding/json"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,34 +89,48 @@ func parsePiLikeSession(
 		project = ExtractProjectFromCwd(cwd)
 	}
 
-	// Branch lineage. Upstream pi records the parent as branchedFrom, a
-	// file path whose basename without extension is the parent's session
-	// ID. OMP (Oh My Pi) v3 headers instead record parentSession, the
-	// parent's session ID directly. branchedFrom wins when present so
-	// upstream pi is unchanged; parentSession is the OMP-only fallback.
-	// Both paths reuse this session's own idPrefix, so the mapped value
-	// matches the parent's stored ID (idPrefix + its session id) and
-	// lineage resolves.
+	// OMP's directory layout identifies subagents independently of whether
+	// their headers also carry lineage.
+	var ompParentID string
+	if agent == AgentOMP {
+		ompParentID = ompParentHeaderSessionID(path)
+	}
+	isOMPSubagent := ompParentID != ""
+
+	// branchedFrom keeps its existing filename identity and precedence.
+	// OMP parentSession may be an opaque raw ID or a transcript path;
+	// other Pi-family providers retain their existing path resolution.
 	var parentSessionID string
 	if branchedFrom := gjson.Get(headerLine, "branchedFrom").Str; branchedFrom != "" {
-		base := filepath.Base(branchedFrom)
-		parentSessionID = idPrefix + strings.TrimSuffix(base, filepath.Ext(base))
-	} else if agent == AgentOMP {
-		if parentSession := gjson.Get(headerLine, "parentSession").Str; parentSession != "" {
-			parentSessionID = idPrefix + parentSession
+		parentSessionID = idPrefix + piPersistedPathSessionID(branchedFrom)
+	} else if parentSession := gjson.Get(headerLine, "parentSession").Str; parentSession != "" &&
+		(agent == AgentPi || agent == AgentOMP || agent == AgentPrimeAgent ||
+			agent == AgentOMO || agent == AgentStepCode) {
+		if agent == AgentOMP {
+			if parentID := ompParentSessionID(path, parentSession, sessionID, ompParentID); parentID != "" {
+				parentSessionID = idPrefix + parentID
+			}
+		} else {
+			parentSessionID = idPrefix + primeParentSessionID(path, parentSession)
 		}
+	} else if ompParentID != "" {
+		// Older OMP children omit parentSession entirely.
+		parentSessionID = idPrefix + ompParentID
 	}
 
-	// OMP writes subagent transcripts inside a directory named after the
-	// parent's transcript file: <project>/<parent>.jsonl sits alongside
-	// <project>/<parent>/<agent>.jsonl. A subagent header carries neither
-	// branchedFrom nor parentSession, so lineage is recovered from the
-	// sibling parent transcript. This nests to arbitrary depth.
-	var isOMPSubagent bool
-	if agent == AgentOMP && parentSessionID == "" {
-		if parentID := ompParentHeaderSessionID(path); parentID != "" {
-			parentSessionID = idPrefix + parentID
-			isOMPSubagent = true
+	// The pi-subagents extension writes a fresh child to
+	// <project>/<parent>/<runId>/run-N/session.jsonl. Older releases leave
+	// parentSession out of the header, so lineage comes from the parent
+	// transcript three levels up. Newer releases record parentSession, the same
+	// field /fork uses, so the run directory is what marks the child as a
+	// subagent. The header's parent wins when both are present.
+	var isPiSubagent bool
+	if agent == AgentPi || agent == AgentOMO {
+		if parentID := piSubagentParentSessionID(path); parentID != "" {
+			if parentSessionID == "" {
+				parentSessionID = idPrefix + parentID
+			}
+			isPiSubagent = true
 		}
 	}
 
@@ -122,13 +139,16 @@ func parsePiLikeSession(
 
 	// --- Main message loop ---
 	var (
-		messages     []ParsedMessage
-		firstMessage string
-		sessionName  string
-		ordinal      int
-		userCount    int
-		currentModel string
+		messages      []ParsedMessage
+		firstMessage  string
+		sessionName   string
+		ordinal       int
+		userCount     int
+		currentModel  string
+		currentEffort string
+		assistantByID map[string]int
 	)
+	assistantByID = make(map[string]int)
 	// Pi emits metadata rows that stay in the tree, so bridge them to the
 	// nearest visible ancestor before assigning SourceParentUUID.
 	visibleAncestorByID := map[string]string{}
@@ -189,8 +209,8 @@ func parsePiLikeSession(
 			case "assistant":
 				sourceParentUUID := resolveVisibleAncestor(parentID)
 				msg := parsePiAssistantMessage(
-					line, ordinal, currentModel, entryID,
-					sourceParentUUID,
+					line, ordinal, currentModel, currentEffort,
+					entryID, sourceParentUUID, cwd,
 				)
 				if msg == nil {
 					continue
@@ -200,6 +220,7 @@ func parsePiLikeSession(
 				}
 				messages = append(messages, *msg)
 				if entryID != "" {
+					assistantByID[entryID] = len(messages) - 1
 					visibleAncestorByID[entryID] = entryID
 				}
 				ordinal++
@@ -237,6 +258,16 @@ func parsePiLikeSession(
 				currentModel = id
 			}
 
+		case "thinking_level_change":
+			if entryID != "" {
+				visibleAncestorByID[entryID] = resolveVisibleAncestor(
+					parentID,
+				)
+			}
+			if level := gjson.Get(line, "thinkingLevel").Str; level != "" {
+				currentEffort = level
+			}
+
 		case "compaction":
 			sourceParentUUID := resolveVisibleAncestor(parentID)
 			msg := parsePiCompactionMessage(
@@ -261,13 +292,30 @@ func parsePiLikeSession(
 				sessionName = name.Str
 			}
 
+		case "child_usage_attributed":
+			if entryID != "" {
+				visibleAncestorByID[entryID] = resolveVisibleAncestor(
+					parentID,
+				)
+			}
+			if agent != AgentPrimeAgent {
+				continue
+			}
+			targetID := gjson.Get(line, "targetId").Str
+			if index, ok := assistantByID[targetID]; ok &&
+				index >= 0 && index < len(messages) {
+				applyPiUsage(
+					&messages[index], gjson.Get(line, "aggregateUsage"),
+				)
+			}
+
 		default:
 			if entryID != "" {
 				visibleAncestorByID[entryID] = resolveVisibleAncestor(
 					parentID,
 				)
 			}
-			// skip silently (e.g., thinking_level_change)
+			// skip silently (entry types with no visible content)
 		}
 	}
 
@@ -329,13 +377,55 @@ func parsePiLikeSession(
 			Mtime: info.ModTime().UnixNano(),
 		},
 	}
-	if isOMPSubagent {
+	// A persisted parent means the transcript was branched from another
+	// session (/fork, /clone), not spawned as a subagent. A subagent child
+	// found in a pi-subagents run directory still overrides this below.
+	if (agent == AgentPrimeAgent || agent == AgentPi || agent == AgentOMO ||
+		agent == AgentStepCode) && parentSessionID != "" {
+		sess.RelationshipType = RelFork
+	}
+	if isOMPSubagent || isPiSubagent || (agent == AgentStepCode && isStepCodeChildSessionID(sessionID)) {
 		sess.RelationshipType = RelSubagent
 	}
 
 	accumulateMessageTokenUsage(sess, messages)
 
 	return sess, messages, nil
+}
+
+// isStepCodeChildSessionID reports whether a StepCode header ID belongs to a
+// spawned subagent or workflow agent. StepCode writes those children beside
+// the parent with no parentSession, so the ID prefix is the only marker.
+func isStepCodeChildSessionID(id string) bool {
+	return strings.HasPrefix(id, "subagent-") || strings.HasPrefix(id, "workflow-")
+}
+
+func piPersistedPathSessionID(value string) string {
+	base := piPersistedPathBase(value)
+	return strings.TrimSuffix(base, filepath.Ext(base))
+}
+
+func piPersistedPathBase(value string) string {
+	return filepath.Base(strings.ReplaceAll(value, `\`, "/"))
+}
+
+func primeParentSessionID(childPath, persistedPath string) string {
+	base := piPersistedPathBase(persistedPath)
+	localSibling := filepath.Join(filepath.Dir(childPath), base)
+	// pi-subagents names every child session.jsonl, so a nested child's parent
+	// basename can match the child's own file. A session is never its own parent.
+	if filepath.Clean(localSibling) != filepath.Clean(childPath) {
+		if headerID, ok := piSessionHeaderID(localSibling); ok && headerID != "" {
+			return headerID
+		}
+	}
+	if filepath.IsAbs(persistedPath) &&
+		filepath.Clean(persistedPath) != filepath.Clean(localSibling) {
+		if headerID, ok := piSessionHeaderID(persistedPath); ok && headerID != "" {
+			return headerID
+		}
+	}
+	return strings.TrimSuffix(base, filepath.Ext(base))
 }
 
 // parsePiUserMessage parses a message entry with role="user".
@@ -379,27 +469,33 @@ func parsePiUserMessage(
 // Returns nil if the entry is malformed. fallbackModel is the most
 // recent model id seen (from a prior assistant message or
 // model_change entry), used when this message has no inline model.
+// fallbackEffort is the most recent thinking_level_change value, used
+// when this message has no inline thinkingLevel.
 func parsePiAssistantMessage(
-	line string, ordinal int, fallbackModel, sourceUUID,
-	sourceParentUUID string,
+	line string, ordinal int, fallbackModel, fallbackEffort, sourceUUID,
+	sourceParentUUID, sessionCwd string,
 ) *ParsedMessage {
 	var (
-		parts       []string
-		toolCalls   []ParsedToolCall
-		hasThinking bool
-		hasToolUse  bool
+		parts         []string
+		dialogue      []string
+		thinkingParts []string
+		toolCalls     []ParsedToolCall
+		hasThinking   bool
+		hasToolUse    bool
 	)
 
 	msgContent := gjson.Get(line, "message.content")
 	if msgContent.Type == gjson.String {
 		// Plain string content (back-compat format variation).
 		parts = append(parts, msgContent.Str)
+		dialogue = append(dialogue, msgContent.Str)
 	} else {
 		msgContent.ForEach(func(_, block gjson.Result) bool {
 			switch block.Get("type").Str {
 			case "text":
 				if t := block.Get("text").Str; t != "" {
 					parts = append(parts, t)
+					dialogue = append(dialogue, t)
 				}
 			case "thinking":
 				// Set hasThinking regardless of whether the thinking
@@ -408,8 +504,8 @@ func parsePiAssistantMessage(
 				// to mark the message.
 				hasThinking = true
 				if thinking := block.Get("thinking").Str; thinking != "" {
-					parts = append(parts,
-						"[Thinking]\n"+thinking+"\n[/Thinking]")
+					thinkingParts = append(thinkingParts, thinking)
+					parts = append(parts, "[Thinking]\n"+thinking+"\n[/Thinking]")
 				}
 			case "toolCall":
 				hasToolUse = true
@@ -420,15 +516,18 @@ func parsePiAssistantMessage(
 				// "description" so the frontend can use a single
 				// params.description check across all agents.
 				argsRaw = normalizePiIntent(argsRaw)
+				rendering := formatPiToolUse(name, argsRaw)
 				toolCalls = append(toolCalls, ParsedToolCall{
 					ToolUseID: id,
 					ToolName:  name,
 					Category:  NormalizeToolCategory(name),
 					InputJSON: argsRaw,
+					SkillName: inferPiSkillName(
+						name, argsRaw, sessionCwd,
+					),
+					Rendering: rendering,
 				})
-				parts = append(parts, formatPiToolUse(
-					name, argsRaw,
-				))
+				parts = append(parts, rendering)
 			}
 			return true
 		})
@@ -444,6 +543,8 @@ func parsePiAssistantMessage(
 		SourceUUID:       sourceUUID,
 		SourceParentUUID: sourceParentUUID,
 		Content:          content,
+		DialogueText:     new(strings.Join(dialogue, "\n")),
+		ThinkingText:     strings.Join(thinkingParts, "\n\n"),
 		Timestamp:        ts,
 		HasThinking:      hasThinking,
 		HasToolUse:       hasToolUse,
@@ -451,7 +552,63 @@ func parsePiAssistantMessage(
 		ToolCalls:        toolCalls,
 	}
 	applyPiTokenUsage(pm, line, fallbackModel)
+	applyPiReasoningEffort(pm, line, fallbackEffort)
 	return pm
+}
+
+// inferPiSkillName attributes a Pi tool call to a skill when the call
+// is a skill load. Pi has no dedicated skill tool: a native skill load
+// is emitted as an ordinary `read` tool call whose path argument points
+// at the skill's SKILL.md (Pi resolves skills from many roots:
+// ~/.pi/agent/skills, project .pi/skills, .agents/skills, package
+// skills/, --skill <path>), or, in newer OMP builds, at a
+// skill://<name> URI in that read path. Without attribution these calls
+// inflate the Read tool count and leave the Skills dimension empty.
+// Relative SKILL.md paths resolve against the session working directory
+// (sessionCwd).
+func inferPiSkillName(toolName, inputJSON, sessionCwd string) string {
+	if isCursorSkillReadTool(toolName) {
+		// Pi's read input carries no cwd/workdir key, so
+		// inferSkillNameFromJSONPaths can't resolve relative SKILL.md
+		// paths; try the path keys directly against the session working
+		// directory first, mirroring the OpenCode parser.
+		for _, key := range []string{"path", "file_path"} {
+			fp := gjson.Get(inputJSON, key).Str
+			if skill, ok := piSkillURISkillName(fp); ok {
+				return skill
+			}
+			if fp != "" && sessionCwd != "" {
+				if name := skillNameFromPath(context.Background(), fp, sessionCwd); name != "" {
+					return name
+				}
+			}
+		}
+		return inferSkillNameFromJSONPaths(context.Background(), inputJSON)
+	}
+	return inferCodexSkillNameWithBase(context.Background(), toolName, inputJSON, sessionCwd)
+}
+
+// piSkillURISkillName extracts the decoded skill name from the
+// skill://<name> URI used as a Pi-family read path. ok is false when
+// path is not a valid skill URI, leaving attribution to the SKILL.md
+// path heuristic.
+func piSkillURISkillName(path string) (string, bool) {
+	path = strings.TrimSpace(path)
+	if !strings.HasPrefix(path, "skill://") {
+		return "", false
+	}
+	rest := path[len("skill://"):]
+	if end := strings.IndexAny(rest, "/?# \t\n\r"); end >= 0 {
+		rest = rest[:end]
+	}
+	if rest == "" {
+		return "", false
+	}
+	name, err := url.PathUnescape(rest)
+	if err != nil || name == "" {
+		return "", false
+	}
+	return name, true
 }
 
 // applyPiTokenUsage extracts the assistant message's model and
@@ -459,8 +616,8 @@ func parsePiAssistantMessage(
 // usage as a flat object under message.usage with provider-
 // agnostic input/output keys plus optional cache breakdowns.
 // Cache fields are read from both the nested cache.{read,write}
-// shape (OpenCode-style) and the flat cacheRead/cacheCreation
-// shape (Anthropic-style) so both transports work.
+// shape (OpenCode-style) and the flat cacheRead/cacheCreation/cacheWrite
+// shapes used across Pi-family producers.
 //
 // Coverage semantics match the claude parser contract: a field
 // present at zero is preserved as "known zero" and sets its
@@ -477,6 +634,22 @@ func applyPiTokenUsage(
 	}
 
 	usage := gjson.Get(line, "message.usage")
+	applyPiUsage(pm, usage)
+}
+
+// applyPiReasoningEffort records the thinking level Pi requested for an
+// assistant response. Newer Pi versions write it on the message as
+// thinkingLevel; older ones only append thinking_level_change entries, so
+// the most recent entry value fills in. The value is stored as Pi wrote it.
+func applyPiReasoningEffort(pm *ParsedMessage, line, fallback string) {
+	if level := gjson.Get(line, "message.thinkingLevel").Str; level != "" {
+		pm.ReasoningEffort = level
+	} else {
+		pm.ReasoningEffort = fallback
+	}
+}
+
+func applyPiUsage(pm *ParsedMessage, usage gjson.Result) {
 	if !usage.Exists() {
 		return
 	}
@@ -490,6 +663,9 @@ func applyPiTokenUsage(
 	cacheWriteField := usage.Get("cache.write")
 	if !cacheWriteField.Exists() {
 		cacheWriteField = usage.Get("cacheCreation")
+	}
+	if !cacheWriteField.Exists() {
+		cacheWriteField = usage.Get("cacheWrite")
 	}
 
 	if !inputField.Exists() && !outputField.Exists() &&
@@ -508,7 +684,7 @@ func applyPiTokenUsage(
 		"cache_read_input_tokens":     cacheRead,
 		"cache_creation_input_tokens": cacheCreate,
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}
@@ -609,7 +785,7 @@ func normalizePiIntent(argsRaw string) string {
 	}
 	// Unmarshal into a map, rename the intent key to "description",
 	// and re-marshal to produce valid JSON with proper escaping.
-	var m map[string]json.RawMessage
+	var m map[string]jsontext.Value
 	if err := json.Unmarshal([]byte(argsRaw), &m); err != nil {
 		return argsRaw
 	}
@@ -622,7 +798,7 @@ func normalizePiIntent(argsRaw string) string {
 	}
 	delete(m, "agent__intent")
 	delete(m, "_i")
-	out, err := json.Marshal(m)
+	out, err := json.Marshal(m, json.Deterministic(true))
 	if err != nil {
 		return argsRaw
 	}
@@ -642,15 +818,98 @@ func piTimestamp(line string) time.Time {
 	return time.Time{}
 }
 
-// ompParentHeaderSessionID returns the parent OMP session's stored raw ID for a
-// nested subagent transcript, or "" when childPath is not a nested subagent.
-// OMP stores subagents in a directory named after the parent transcript (minus
-// the .jsonl extension), so the parent transcript is the containing directory
-// plus ".jsonl". The ID resolution mirrors parent parsing: prefer the header
-// id, but support V1 parent transcripts by falling back to the parent filename.
+// ompParentSessionID preserves raw parent IDs and resolves path references
+// through transcript headers. A stale path can use a matching local structural
+// parent or sibling, but must not borrow an unrelated directory parent.
+func ompParentSessionID(childPath, parentReference, childID, structuralParentID string) string {
+	if !strings.ContainsAny(parentReference, `/\`) &&
+		!strings.HasSuffix(parentReference, ".jsonl") {
+		return parentReference
+	}
+	if childID == "" {
+		childID = strings.TrimSuffix(filepath.Base(childPath), ".jsonl")
+	}
+
+	parentPath := filepath.FromSlash(strings.ReplaceAll(parentReference, `\`, "/"))
+	if !filepath.IsAbs(parentPath) {
+		parentPath = filepath.Join(filepath.Dir(childPath), parentPath)
+	}
+	structuralParentPath := filepath.Dir(childPath) + ".jsonl"
+	if filepath.Clean(parentPath) != filepath.Clean(structuralParentPath) {
+		if parentID := ompTranscriptSessionID(parentPath); parentID != "" && parentID != childID {
+			return parentID
+		}
+	}
+
+	base := piPersistedPathBase(parentReference)
+	if structuralParentID != "" && structuralParentID != childID &&
+		base == filepath.Base(structuralParentPath) {
+		return structuralParentID
+	}
+	localSibling := filepath.Join(filepath.Dir(childPath), base)
+	if filepath.Clean(localSibling) != filepath.Clean(parentPath) &&
+		filepath.Clean(localSibling) != filepath.Clean(structuralParentPath) {
+		if parentID := ompTranscriptSessionID(localSibling); parentID != "" && parentID != childID {
+			return parentID
+		}
+	}
+	return ""
+}
+
+// ompParentHeaderSessionID resolves the structural parent at
+// <containing-directory>.jsonl, including legacy V1 transcript identities.
 func ompParentHeaderSessionID(childPath string) string {
-	parent := filepath.Dir(childPath) + ".jsonl"
-	parentID, ok := ompSessionHeaderID(parent)
+	return ompTranscriptSessionID(filepath.Dir(childPath) + ".jsonl")
+}
+
+// ompTranscriptSessionID rejects malformed parent hints without changing the
+// existing header-reading semantics of other Pi-family providers.
+func ompTranscriptSessionID(path string) string {
+	header, ok := piSessionHeader(path)
+	if !ok || !gjson.Valid(header) {
+		return ""
+	}
+	if id := gjson.Get(header, "id").Str; id != "" {
+		return id
+	}
+	return strings.TrimSuffix(filepath.Base(path), ".jsonl")
+}
+
+// piSubagentParentSessionID returns the parent Pi session's stored raw ID for a
+// pi-subagents child at <parent>/<runId>/run-N/session.jsonl, or "" when
+// childPath does not have that shape or no Pi transcript sits at
+// <parent>.jsonl. A delegated child's own children resolve to that child,
+// because the extension nests them below its session.jsonl stem.
+func piSubagentParentSessionID(childPath string) string {
+	if filepath.Base(childPath) != "session.jsonl" {
+		return ""
+	}
+	runDir := filepath.Dir(childPath)
+	if !isPiSubagentRunDir(filepath.Base(runDir)) {
+		return ""
+	}
+	return parentTranscriptSessionID(filepath.Dir(filepath.Dir(runDir)) + ".jsonl")
+}
+
+// isPiSubagentRunDir reports whether name is a pi-subagents attempt directory
+// (run-0, run-1, ...).
+func isPiSubagentRunDir(name string) bool {
+	n, ok := strings.CutPrefix(name, "run-")
+	if !ok || n == "" {
+		return false
+	}
+	for _, r := range n {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parentTranscriptSessionID returns the session ID a parent transcript at
+// parent parses to, or "" when parent is not a Pi-format transcript.
+func parentTranscriptSessionID(parent string) string {
+	parentID, ok := piSessionHeaderID(parent)
 	if !ok {
 		return ""
 	}
@@ -660,11 +919,15 @@ func ompParentHeaderSessionID(childPath string) string {
 	return strings.TrimSuffix(filepath.Base(parent), ".jsonl")
 }
 
-// ompSessionHeaderID reads path's session header id, skipping a leading OMP
+// piSessionHeaderID reads path's session header id, skipping a leading OMP
 // title slot line. The boolean reports whether the file has a valid pi session
-// header. os.Open intentionally follows symlinks to supported parent
-// transcripts.
-func ompSessionHeaderID(path string) (string, bool) {
+// header. os.Open intentionally follows symlinks to supported transcripts.
+func piSessionHeaderID(path string) (string, bool) {
+	header, ok := piSessionHeader(path)
+	return gjson.Get(header, "id").Str, ok
+}
+
+func piSessionHeader(path string) (string, bool) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", false
@@ -683,7 +946,7 @@ func ompSessionHeaderID(path string) (string, bool) {
 		if gjson.Get(line, "type").Str != "session" {
 			return "", false
 		}
-		return gjson.Get(line, "id").Str, true
+		return line, true
 	}
 	return "", false
 }

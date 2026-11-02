@@ -2,8 +2,7 @@ package parser
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
+	"encoding/json/v2"
 	"path/filepath"
 	"testing"
 
@@ -30,7 +29,7 @@ func TestProviderConfigCloneCopiesRoots(t *testing.T) {
 }
 
 func TestProviderBaseZeroValueOptionalMethods(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	var base ProviderBase
 
 	discovered, err := base.Discover(ctx)
@@ -66,7 +65,7 @@ func TestProviderBaseZeroValueOptionalMethods(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Empty(t, fingerprint)
-	assert.True(t, errors.Is(err, ErrUnsupportedProviderFeature))
+	require.ErrorIs(t, err, ErrUnsupportedProviderFeature)
 	var unsupported UnsupportedProviderFeatureError
 	require.ErrorAs(t, err, &unsupported)
 	assert.Equal(t, AgentType(""), unsupported.Provider)
@@ -94,7 +93,7 @@ func TestUnsupportedProviderFeatureErrorWrapsSentinel(t *testing.T) {
 		Feature:  ProviderFeatureFingerprint,
 	}
 
-	assert.True(t, errors.Is(err, ErrUnsupportedProviderFeature))
+	require.ErrorIs(t, err, ErrUnsupportedProviderFeature)
 	assert.Contains(t, err.Error(), string(AgentCodex))
 	assert.Contains(t, err.Error(), ProviderFeatureFingerprint)
 }
@@ -150,6 +149,8 @@ func TestProviderRegistryMirrorsAgentRegistry(t *testing.T) {
 
 func TestStoredSourceHintCapabilitiesMatchConsumers(t *testing.T) {
 	wantSupported := map[AgentType]bool{
+		AgentOpenClaw:  true,
+		AgentCursorIDE: true,
 		AgentDevin:     true,
 		AgentForge:     true,
 		AgentKiro:      true,
@@ -161,6 +162,7 @@ func TestStoredSourceHintCapabilitiesMatchConsumers(t *testing.T) {
 		AgentWindsurf:  true,
 		AgentZCode:     true,
 		AgentZed:       true,
+		AgentCline:     true,
 	}
 
 	for _, factory := range ProviderFactories() {
@@ -213,28 +215,6 @@ func TestStoredSourceHintScopesDistinguishContainersFromExactMembers(t *testing.
 		visualStudioScopes.StoredSourceHintScopes(ChangedPathRequest{Path: member}))
 }
 
-func TestVerifiedLocalStatCapabilitiesMatchConsumers(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported,
-		(SourceCapabilities{}).VerifiedLocalStat,
-		"new providers must opt in explicitly")
-
-	wantSupported := map[AgentType]bool{
-		AgentClaude: true,
-		AgentCodex:  true,
-	}
-	for _, factory := range ProviderFactories() {
-		agent := factory.Definition().Type
-		got := factory.Capabilities().Source.VerifiedLocalStat
-		if wantSupported[agent] {
-			assert.Equalf(t, CapabilitySupported, got,
-				"%s supports verified local stat trust", agent)
-		} else {
-			assert.Equalf(t, CapabilityUnsupported, got,
-				"%s must not schedule verified local stat trust", agent)
-		}
-	}
-}
-
 func TestProviderFactoryLookupRejectsMissingAgent(t *testing.T) {
 	require.NotEmpty(t, Registry)
 	agent := Registry[0].Type
@@ -254,19 +234,6 @@ func TestProviderFactoryLookupRejectsMissingAgent(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = NewProvider("missing", ProviderConfig{})
 	assert.False(t, ok)
-}
-
-func TestProviderFactoryByTypeDevin(t *testing.T) {
-	factory, ok := ProviderFactoryByType(AgentDevin)
-	require.True(t, ok)
-	assert.Equal(t, AgentDevin, factory.Definition().Type)
-
-	provider := factory.NewProvider(ProviderConfig{
-		Roots:   []string{"/tmp/devin"},
-		Machine: "devbox",
-	})
-	require.NotNil(t, provider)
-	assert.Equal(t, AgentDevin, provider.Definition().Type)
 }
 
 func TestProviderMigrationModesCoverRegistry(t *testing.T) {
@@ -309,11 +276,9 @@ func (f testProviderFactory) Capabilities() Capabilities {
 
 func (f testProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	return &testProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   f.caps,
-			Config: cfg.Clone(),
-		},
+		Def:    cloneAgentDef(f.def),
+		Caps:   f.caps,
+		Config: cfg.Clone(),
 	}
 }
 

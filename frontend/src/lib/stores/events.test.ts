@@ -1,4 +1,7 @@
+import { EventSource } from "eventsource";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+vi.mock("eventsource", () => ({ EventSource: vi.fn() }));
 
 // Minimal EventSource stub. Tests control when events fire and
 // assert on the number of instances created.
@@ -34,9 +37,7 @@ class FakeEventSource {
   }
 
   fireOpen() {
-    (this.listeners["open"] || []).forEach((cb) =>
-      cb(new Event("open") as MessageEvent),
-    );
+    (this.listeners["open"] || []).forEach((cb) => cb(new Event("open") as MessageEvent));
   }
 
   static reset() {
@@ -46,7 +47,9 @@ class FakeEventSource {
 
 beforeEach(async () => {
   FakeEventSource.reset();
-  vi.stubGlobal("EventSource", FakeEventSource);
+  vi.mocked(EventSource).mockImplementation(function (url) {
+    return new FakeEventSource(String(url)) as unknown as EventSource;
+  });
   const { events } = await import("./events.svelte.js");
   events.setAvailable(true);
 });
@@ -56,6 +59,57 @@ afterEach(() => {
 });
 
 describe("events store", () => {
+  it("releases hidden streams and refreshes subscribers on return and every reconnect", async () => {
+    vi.useFakeTimers();
+    const visibility = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+    const { events, EVENTS_STORE_HEAL_INTERVAL_MS } = await import("./events.svelte.js");
+    const received = vi.fn();
+    const otherReceived = vi.fn();
+    const unsub = events.subscribe(received);
+    const otherUnsub = events.subscribe(otherReceived);
+    try {
+      expect(FakeEventSource.instances).toHaveLength(0);
+      visibility.mockReturnValue(false);
+      document.dispatchEvent(new Event("visibilitychange"));
+      const first = FakeEventSource.instances[0]!;
+      first.fire("events_ready", {});
+      expect(received).toHaveBeenCalledExactlyOnceWith({ scope: "sync" });
+      expect(otherReceived).toHaveBeenCalledExactlyOnceWith({ scope: "sync" });
+      received.mockClear();
+      otherReceived.mockClear();
+      visibility.mockReturnValue(true);
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(first.closed).toBe(true);
+      await vi.advanceTimersByTimeAsync(EVENTS_STORE_HEAL_INTERVAL_MS * 2);
+      expect(FakeEventSource.instances).toHaveLength(1);
+      expect(received).not.toHaveBeenCalled();
+      visibility.mockReturnValue(false);
+      document.dispatchEvent(new Event("visibilitychange"));
+      expect(FakeEventSource.instances).toHaveLength(2);
+      expect(received).not.toHaveBeenCalled();
+      expect(otherReceived).not.toHaveBeenCalled();
+      const reopened = FakeEventSource.instances[1]!;
+      reopened.fireOpen();
+      expect(received).not.toHaveBeenCalled();
+      reopened.fire("events_ready", {});
+      expect(received).toHaveBeenCalledTimes(1);
+      expect(otherReceived).toHaveBeenCalledTimes(1);
+      expect(received).toHaveBeenLastCalledWith({ scope: "sync" });
+      reopened.readyState = 0;
+      reopened.fireError();
+      reopened.readyState = 1;
+      reopened.fireOpen();
+      reopened.fire("events_ready", {});
+      expect(FakeEventSource.instances).toHaveLength(2);
+      expect(received).toHaveBeenCalledTimes(2);
+      expect(otherReceived).toHaveBeenCalledTimes(2);
+      expect(received).toHaveBeenLastCalledWith({ scope: "sync" });
+    } finally {
+      unsub();
+      otherUnsub();
+    }
+  });
+
   it("does not open an EventSource while live events are unavailable", async () => {
     const { events } = await import("./events.svelte.js");
     events.setAvailable(false);
@@ -125,9 +179,7 @@ describe("events store", () => {
 
   it("self-heals a closed EventSource after a transient failure", async () => {
     vi.useFakeTimers();
-    const { events, EVENTS_STORE_HEAL_INTERVAL_MS } = await import(
-      "./events.svelte.js"
-    );
+    const { events, EVENTS_STORE_HEAL_INTERVAL_MS } = await import("./events.svelte.js");
     const received: string[] = [];
     const unsub = events.subscribe((e) => received.push(e.scope));
     const first = FakeEventSource.instances[0]!;
@@ -155,9 +207,7 @@ describe("events store", () => {
 
   it("does not heal after a permanent failure (never opened)", async () => {
     vi.useFakeTimers();
-    const { events, EVENTS_STORE_HEAL_INTERVAL_MS } = await import(
-      "./events.svelte.js"
-    );
+    const { events, EVENTS_STORE_HEAL_INTERVAL_MS } = await import("./events.svelte.js");
     const unsub = events.subscribe(() => {});
     const first = FakeEventSource.instances[0]!;
 
@@ -210,10 +260,7 @@ describe("events store", () => {
     vi.useFakeTimers();
     const { events } = await import("./events.svelte.js");
     const received: string[] = [];
-    const unsub = events.subscribeDebounced(
-      (e) => received.push(e.scope),
-      100,
-    );
+    const unsub = events.subscribeDebounced((e) => received.push(e.scope), 100);
     const es = FakeEventSource.instances[0]!;
     es.fire("data_changed", { scope: "messages" });
     es.fire("data_changed", { scope: "messages" });

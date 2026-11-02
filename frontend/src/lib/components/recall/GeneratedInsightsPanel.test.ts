@@ -1,0 +1,320 @@
+import { reportErrorShown } from "../../utils/telemetry.js";
+import type { InsightTask } from "../../stores/insights.svelte.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { mount, tick, unmount } from "svelte";
+import { router } from "../../stores/router.svelte.js";
+import { ui } from "../../stores/ui.svelte.js";
+
+const mocks = vi.hoisted(() => ({
+  cancelInFlightReads: vi.fn(),
+  deleteItem: vi.fn(),
+  downloadInsightExport: vi.fn().mockResolvedValue(undefined),
+  generate: vi.fn(),
+  load: vi.fn().mockResolvedValue(undefined),
+  loadAgents: vi.fn(),
+  loadProjects: vi.fn(),
+  select: vi.fn(),
+  selectTask: vi.fn(),
+}));
+
+const state = vi.hoisted(() => {
+  const selectedItem = {
+    id: 42,
+    type: "llm_canned",
+    kind: "prompt_maturity_review",
+    date_from: "2026-07-01",
+    date_to: "2026-07-31",
+    project: "agentsview",
+    agent: "claude",
+    model: "local-model",
+    content: "# Generated report",
+    created_at: "2026-08-01T12:00:00Z",
+  };
+  return {
+    serverVersion: { read_only: false, insight_generation_available: true },
+    sessions: {
+      agents: [] as Array<{ name: string; session_count: number }>,
+      projects: [],
+      loadAgents: mocks.loadAgents,
+      loadProjects: mocks.loadProjects,
+    },
+    store: {
+      dateFrom: "2026-07-01",
+      dateTo: "2026-07-31",
+      project: "agentsview",
+      sessionAgent: "codex",
+      automatedScope: "human",
+      cannedKind: "prompt_maturity_review",
+      agent: "claude",
+      promptText: "Focus on verification",
+      items: [selectedItem],
+      tasks: [],
+      loading: false,
+      selectedId: 42,
+      selectedTaskId: null as string | null,
+      selectedItem,
+      selectedTask: undefined as InsightTask | undefined,
+      cancelInFlightReads: mocks.cancelInFlightReads,
+      deleteItem: mocks.deleteItem,
+      dismissTask: vi.fn(),
+      generate: mocks.generate,
+      load: mocks.load,
+      retryTask: vi.fn(),
+      select: mocks.select,
+      selectTask: mocks.selectTask,
+      setAgent: vi.fn(),
+      setAutomatedScope: vi.fn(),
+      setCannedKind: vi.fn(),
+      setDateFrom: vi.fn(),
+      setDateTo: vi.fn(),
+      setProject: vi.fn(),
+      setSessionAgent: vi.fn(),
+      setType: vi.fn(),
+    },
+  };
+});
+
+vi.mock("../../stores/insights.svelte.js", async () => {
+  const { SvelteMap } = await import("svelte/reactivity");
+  const selected = new SvelteMap<string, unknown>();
+  for (const key of ["selectedTask", "selectedTaskId"]) {
+    Object.defineProperty(state.store, key, {
+      get: () => selected.get(key),
+      set: (value: unknown) => {
+        selected.set(key, value);
+      },
+    });
+  }
+  return { insights: state.store };
+});
+
+vi.mock("../../stores/sessions.svelte.js", () => ({
+  sessions: state.sessions,
+}));
+
+vi.mock("../../stores/sync.svelte.js", () => ({
+  sync: {
+    serverVersion: state.serverVersion,
+    stats: { earliest_session: "2026-01-01T00:00:00Z" },
+  },
+}));
+
+vi.mock("../../api/client.js", () => ({
+  downloadInsightExport: mocks.downloadInsightExport,
+}));
+
+vi.mock("../../utils/markdown.js", () => ({
+  renderMarkdown: (content: string) => content,
+  loadAssetImages: () => ({ destroy() {} }),
+}));
+
+// @ts-ignore
+import GeneratedInsightsPanel from "./GeneratedInsightsPanel.svelte";
+
+describe("GeneratedInsightsPanel", () => {
+  let component: ReturnType<typeof mount> | undefined;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    state.serverVersion.insight_generation_available = true;
+    router.route = "recall";
+    router.params = { tab: "generated" };
+    state.store.selectedTask = undefined;
+    state.store.selectedId = 42;
+    state.store.selectedItem = state.store.items[0]!;
+    state.sessions.agents = [];
+    ui.activeModal = null;
+  });
+
+  afterEach(async () => {
+    if (component) await unmount(component);
+    component = undefined;
+    document.body.innerHTML = "";
+    router.params = {};
+  });
+
+  it("counts a retry failure with the same task ID", async () => {
+    const failed = { clientId: "task-a", status: "error", error: "Failed" } as InsightTask;
+    state.store.selectedTask = failed;
+    state.store.selectedTaskId = "task-a";
+    state.store.retryTask.mockImplementation(() => {
+      state.store.selectedTask = { ...failed, status: "generating", error: null };
+    });
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("insight");
+    document.querySelector<HTMLButtonElement>(".generated-actions button")!.click();
+    await tick();
+    state.store.selectedTask = { ...failed };
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledTimes(2);
+    state.store.selectedTask = { ...failed };
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledTimes(2);
+    state.store.selectedTaskId = "task-b";
+    state.store.selectedTask = { ...failed, clientId: "task-b" };
+    await tick();
+    mocks.select.mockImplementation(() => (state.store.selectedTask = undefined));
+    document.querySelector<HTMLButtonElement>(".generated-list button")!.click();
+    await tick();
+    state.store.selectedTask = failed;
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledTimes(4);
+  });
+
+  it("shows every input that scopes a generated report", async () => {
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+
+    const text = document.body.textContent ?? "";
+    for (const label of [
+      "Date range",
+      "Project",
+      "Session agent",
+      "Session scope",
+      "Template",
+      "Generator",
+      "Optional focus",
+    ]) {
+      expect(text).toContain(label);
+    }
+  });
+
+  it("does not reorder the shared session agent list", async () => {
+    state.sessions.agents = [
+      { name: "codex", session_count: 5 },
+      { name: "claude", session_count: 8 },
+    ];
+
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+
+    expect(state.sessions.agents.map((agent) => agent.name)).toEqual(["codex", "claude"]);
+  });
+
+  it("disables generation when a writable server denies the capability", async () => {
+    state.serverVersion.insight_generation_available = false;
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    const generate = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.trim() === "Generate",
+    );
+    expect(generate).toBeDefined();
+    expect(generate!.disabled).toBe(true);
+    generate!.click();
+    expect(mocks.generate).not.toHaveBeenCalled();
+  });
+
+  it("generates from the scope retained in the insights store", async () => {
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+
+    const generate = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.trim() === "Generate",
+    );
+    expect(generate).toBeDefined();
+    generate!.click();
+
+    expect(state.store.setType).toHaveBeenCalledWith("llm_canned");
+    expect(mocks.generate).toHaveBeenCalledOnce();
+  });
+
+  it("writes selected reports to the Generated insights deep link", async () => {
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+
+    const report = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(".generated-list button"),
+    ).find((button) => button.textContent?.includes("agentsview"));
+    expect(report).toBeDefined();
+    report!.click();
+    await tick();
+
+    expect(mocks.select).toHaveBeenCalledWith(42);
+    expect(router.params).toEqual({ tab: "generated", insight: "42" });
+  });
+
+  it("keeps export, publish, and delete actions available for saved reports", async () => {
+    const setPublishTarget = vi.spyOn(ui, "setPublishTarget");
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>("button"));
+    buttons.find((button) => button.textContent?.trim() === "Export")!.click();
+    buttons.find((button) => button.textContent?.trim() === "Publish")!.click();
+    buttons.find((button) => button.ariaLabel === "Delete generated insight")!.click();
+    await tick();
+
+    expect(mocks.downloadInsightExport).toHaveBeenCalledWith(42);
+    expect(setPublishTarget).toHaveBeenCalledWith({ kind: "insight", id: 42 });
+    expect(mocks.deleteItem).toHaveBeenCalledWith(42);
+    expect(router.params).toEqual({ tab: "generated" });
+  });
+
+  it("renders canned reports as Markdown and routes tool-effectiveness reports to their view", async () => {
+    state.store.selectedItem = {
+      ...state.store.items[0]!,
+      schema_version: "llm_insight.v1",
+      structured_json: JSON.stringify({
+        schema_version: "llm_insight.v1",
+        summary: "s",
+        recommendations: [],
+      }),
+    } as typeof state.store.selectedItem;
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    expect(document.querySelector("[data-testid=tool-effectiveness-unavailable]")).toBeNull();
+    expect(document.querySelector(".generated-detail .markdown-body")?.textContent).toContain(
+      "# Generated report",
+    );
+    expect(document.querySelector(".tool-effectiveness-report")).toBeNull();
+    await unmount(component);
+
+    state.store.selectedItem = {
+      ...state.store.items[0]!,
+      type: "tool_effectiveness",
+      kind: "",
+      content: "saved tool report",
+    };
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    expect(document.querySelector("[data-testid=tool-effectiveness-unavailable]")).not.toBeNull();
+    expect(document.body.textContent).toContain("saved tool report");
+    expect(document.querySelector(".generated-badge")?.textContent?.trim()).toBe(
+      "Tool Effectiveness",
+    );
+    expect(document.body.textContent).not.toContain("calls judged");
+    await unmount(component);
+
+    state.store.selectedItem = {
+      ...state.store.items[0]!,
+      type: "tool_effectiveness",
+      kind: "",
+      schema_version: "tool_effectiveness.v1",
+      structured_json: JSON.stringify({
+        session_id: "s1",
+        call_count: 1234,
+        conclusions: [{ assessment: "helped", text: "Read found it", ordinals: [1], calls: [] }],
+        omissions: [],
+      }),
+    } as typeof state.store.selectedItem;
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    expect(document.querySelector(".tool-effectiveness-report")).not.toBeNull();
+    const chips = [...document.querySelectorAll(".generated-meta-chip")].map((c) =>
+      c.textContent?.trim(),
+    );
+    expect(chips).toContain("1,234 calls judged");
+  });
+
+  it("cancels archive reads without canceling generation tasks", async () => {
+    component = mount(GeneratedInsightsPanel, { target: document.body });
+    await tick();
+    await unmount(component);
+    component = undefined;
+
+    expect(mocks.cancelInFlightReads).toHaveBeenCalledOnce();
+  });
+});

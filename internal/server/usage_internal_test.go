@@ -2,16 +2,20 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"net/http"
 	"net/url"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/parsertest"
 	"go.kenn.io/agentsview/internal/service"
@@ -21,12 +25,12 @@ import (
 // window used across the usage handler tests.
 const oneDayUsageRange = "from=2024-06-01&to=2024-06-01"
 
-func TestUsageInputAPIErrorPreservesMachineReadableCode(t *testing.T) {
+func TestUsageInputAPIErrorMapsToBadRequest(t *testing.T) {
 	err := usageInputAPIError(&service.UsageInputError{
 		Code: service.UsageErrorCodeUnknownProjectKey,
 		Msg:  "wording may change",
 	})
-	var response *apiErrorResponse
+	var response *apiResponseError
 	require.ErrorAs(t, err, &response)
 	assert.Equal(t, http.StatusBadRequest, response.Status)
 	assert.Equal(t, service.UsageErrorCodeUnknownProjectKey, response.Code)
@@ -35,6 +39,7 @@ func TestUsageInputAPIErrorPreservesMachineReadableCode(t *testing.T) {
 
 type usageSummaryCountsSpy struct {
 	db.Store
+	mu                   sync.Mutex
 	dailyCalls           int
 	countsCalls          int
 	matchingSessionCalls int
@@ -47,6 +52,64 @@ type usageComparisonProjectKeySpy struct {
 	usageSummaryCountsSpy
 	activeLabels []string
 	projectMap   map[string]export.ProjectMapEntry
+}
+
+func TestUsageSummaryStreamUsesResolvedMachine(t *testing.T) {
+	s := testServer(t, 30*time.Second)
+	require.NoError(t, s.db.(*db.DB).SetSyncState(t.Context(), db.MachineLabelKeyPrefix+"id-a", "Workstation"))
+	spy := &usageSummaryCountsSpy{Store: s.db}
+	s.db = spy
+	s.sessions = service.NewReadOnlyBackend(spy)
+	w := serveGet(t, s, "/api/v1/usage/summary/stream?"+oneDayUsageRange+"&machine=Workstation")
+	assertRecorderStatus(t, w, http.StatusOK)
+	assert.Contains(t, w.Body.String(), "event: done\n")
+	assert.Contains(t, w.Body.String(), "event: progress\n")
+	require.Len(t, spy.filters, 1)
+	assert.Equal(t, "id-a", spy.filters[0].Machine)
+	assert.NotNil(t, spy.filters[0].Progress)
+}
+
+type usageMachineCatalogFailureStore struct{ db.Store }
+
+func (s usageMachineCatalogFailureStore) GetMachineLabels(context.Context) (map[string]string, error) {
+	return nil, errors.New("machine catalog database detail")
+}
+
+type usageProjectCatalogFailureStore struct {
+	db.Store
+	err error
+}
+
+func (s usageProjectCatalogFailureStore) GetActiveProjectLabels(context.Context) ([]string, error) {
+	return nil, s.err
+}
+
+func TestUsageStreamMapsCatalogFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		err     error
+		status  int
+		message string
+		machine bool
+	}{
+		{"machine metadata", nil, http.StatusInternalServerError, "internal error", true},
+		{"deadline", context.DeadlineExceeded, http.StatusGatewayTimeout, "gateway timeout", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := testServer(t, 30*time.Second)
+			query := "&project_key=pl1:sha256:known"
+			if tt.machine {
+				s.db = usageMachineCatalogFailureStore{Store: s.db}
+				query = "&machine=Workstation"
+			} else {
+				s.db = usageProjectCatalogFailureStore{Store: s.db, err: tt.err}
+			}
+			w := serveGet(t, s, "/api/v1/usage/summary/stream?"+oneDayUsageRange+query)
+			assertRecorderStatus(t, w, tt.status)
+			assert.Contains(t, w.Body.String(), `"error":"`+tt.message+`"`)
+			assert.NotContains(t, w.Body.String(), "machine catalog database detail")
+		})
+	}
 }
 
 func (s *usageComparisonProjectKeySpy) GetActiveProjectLabels(
@@ -78,6 +141,7 @@ func assertUsageQueryCalls(
 	wantDaily, wantCounts, wantMatching int,
 ) {
 	t.Helper()
+
 	assert.Equal(t, wantDaily, spy.dailyCalls, "daily usage calls")
 	assert.Equal(t, wantCounts, spy.countsCalls, "session count calls")
 	assert.Equal(t, wantMatching, spy.matchingSessionCalls, "matching session calls")
@@ -86,6 +150,8 @@ func assertUsageQueryCalls(
 func (s *usageSummaryCountsSpy) GetDailyUsage(
 	_ context.Context, f db.UsageFilter,
 ) (db.DailyUsageResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.dailyCalls++
 	s.filters = append(s.filters, f)
 	if len(s.result.Daily) == 0 && s.result.Totals == (db.UsageTotals{}) &&
@@ -94,9 +160,9 @@ func (s *usageSummaryCountsSpy) GetDailyUsage(
 		return db.DailyUsageResult{
 			Daily: []db.DailyUsageEntry{{
 				Date:      "2024-06-01",
-				TotalCost: 1,
+				TotalCost: money.MustParseDollars("1"),
 			}},
-			Totals: db.UsageTotals{TotalCost: 1},
+			Totals: db.UsageTotals{TotalCost: money.MustParseDollars("1")},
 			SessionCounts: db.UsageSessionCounts{
 				Total:     1,
 				ByProject: map[string]int{"proj": 1},
@@ -119,6 +185,12 @@ func (s *usageSummaryCountsSpy) GetUsageMatchingSessionCount(
 ) (int, error) {
 	s.matchingSessionCalls++
 	return s.matchingSessionCount, nil
+}
+
+func (s *usageSummaryCountsSpy) GetPlanUsageSessionCounts(
+	_ context.Context, _ db.UsageFilter,
+) (db.PlanUsageSessionCounts, error) {
+	return db.PlanUsageSessionCounts{}, nil
 }
 
 func TestUsageSummaryScansCurrentPeriodOnly(t *testing.T) {
@@ -182,7 +254,8 @@ func TestUsageComparisonScansPriorPeriodOnly(t *testing.T) {
 	s := newRoutedTestServerWithStore(t, spy)
 
 	w := serveGet(t, s,
-		"/api/v1/usage/comparison?"+oneDayUsageRange+"&current_cost=3")
+		"/api/v1/usage/comparison?"+oneDayUsageRange+
+			"&current_microdollars=3000000")
 	assertRecorderStatus(t, w, http.StatusOK)
 
 	assertUsageQueryCalls(t, spy, 1, 0, 0)
@@ -191,8 +264,8 @@ func TestUsageComparisonScansPriorPeriodOnly(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
 	assert.Equal(t, "2024-05-31", out.PriorFrom)
 	assert.Equal(t, "2024-05-31", out.PriorTo)
-	assert.Equal(t, 1.0, out.PriorTotalCost)
-	assert.Equal(t, 2.0, out.DeltaPct)
+	assert.Equal(t, money.MustParseDollars("1"), out.PriorTotalCost)
+	assert.InDelta(t, 2.0, out.DeltaPct, 0)
 }
 
 func TestUsageComparisonCopiesGitBranchFilterToPriorPeriod(t *testing.T) {
@@ -201,7 +274,9 @@ func TestUsageComparisonCopiesGitBranchFilterToPriorPeriod(t *testing.T) {
 	branch := db.EncodeBranchFilterToken("alpha", "main")
 
 	w := serveGet(t, s,
-		"/api/v1/usage/comparison?"+oneDayUsageRange+"&current_cost=3&git_branch="+url.QueryEscape(branch))
+		"/api/v1/usage/comparison?"+oneDayUsageRange+
+			"&current_microdollars=3000000&git_branch="+
+			url.QueryEscape(branch))
 	assertRecorderStatus(t, w, http.StatusOK)
 
 	require.Len(t, spy.filters, 1)
@@ -225,7 +300,8 @@ func TestUsageComparisonCopiesResolvedProjectExclusionToPriorPeriod(
 
 	w := serveGet(t, s,
 		"/api/v1/usage/comparison?"+oneDayUsageRange+
-			"&current_cost=3&exclude_project_key="+url.QueryEscape(projectKey))
+			"&current_microdollars=3000000&exclude_project_key="+
+			url.QueryEscape(projectKey))
 	assertRecorderStatus(t, w, http.StatusOK)
 
 	require.Len(t, spy.filters, 1)
@@ -248,7 +324,7 @@ func TestUsageComparisonNoDefaultRangeRequiresConcreteRange(t *testing.T) {
 	s := newRoutedTestServerWithStore(t, spy)
 
 	w := serveGet(t, s,
-		"/api/v1/usage/comparison?no_default_range=true&current_cost=3")
+		"/api/v1/usage/comparison?no_default_range=true&current_microdollars=3000000")
 	assertRecorderStatus(t, w, http.StatusBadRequest)
 	assert.Contains(t, w.Body.String(), "requires from and to")
 
@@ -260,10 +336,22 @@ func TestUsageComparisonAllowsZeroCurrentCost(t *testing.T) {
 	s := newRoutedTestServerWithStore(t, spy)
 
 	w := serveGet(t, s,
-		"/api/v1/usage/comparison?"+oneDayUsageRange+"&current_cost=0")
+		"/api/v1/usage/comparison?"+oneDayUsageRange+
+			"&current_microdollars=0")
 	assertRecorderStatus(t, w, http.StatusOK)
 
 	assertUsageQueryCalls(t, spy, 1, 0, 0)
+}
+
+func TestUsageComparisonRejectsNegativeCurrentCost(t *testing.T) {
+	spy := &usageSummaryCountsSpy{}
+	s := newRoutedTestServerWithStore(t, spy)
+
+	w := serveGet(t, s,
+		"/api/v1/usage/comparison?"+oneDayUsageRange+
+			"&current_microdollars=-1")
+	assertRecorderStatus(t, w, http.StatusBadRequest)
+	assertUsageQueryCalls(t, spy, 0, 0, 0)
 }
 
 func TestUsageSummarySetsUnsupportedUsageForCopilotNoTokenData(t *testing.T) {
@@ -410,16 +498,15 @@ func TestUsagePairwiseComparisonScansTwoDailyFilters(t *testing.T) {
 
 	assert.Equal(t, 2, spy.dailyCalls)
 	require.Len(t, spy.filters, 2)
-	assert.Equal(t, "claude-sonnet-4-20250514", spy.filters[0].Model)
-	assert.Equal(t, "", spy.filters[0].Project)
-	assert.Equal(t, "", spy.filters[1].Model)
-	assert.Equal(t, "beta", spy.filters[1].Project)
+	assert.ElementsMatch(t,
+		[][2]string{{"claude-sonnet-4-20250514", ""}, {"", "beta"}},
+		[][2]string{{spy.filters[0].Model, spy.filters[0].Project}, {spy.filters[1].Model, spy.filters[1].Project}})
 	assert.False(t, spy.filters[0].SkipSessionCounts)
 	assert.False(t, spy.filters[1].SkipSessionCounts)
 }
 
-func TestUsagePairwiseComparisonOpenAPIRequiresSideParams(t *testing.T) {
-	s := testServer(t, 30)
+func TestUsagePairwiseComparisonOpenAPIOptionalSideParams(t *testing.T) {
+	s := testServer(t, 30*time.Second)
 	spec := readOpenAPISpec(t, s.Handler())
 	op := requireOpenAPIOperation(t, spec, "get", "/api/v1/usage/pairwise-comparison")
 
@@ -430,8 +517,53 @@ func TestUsagePairwiseComparisonOpenAPIRequiresSideParams(t *testing.T) {
 		}
 	}
 
-	assert.True(t, required["left_dimension"])
-	assert.True(t, required["left_value"])
-	assert.True(t, required["right_dimension"])
-	assert.True(t, required["right_value"])
+	for _, name := range []string{"left_dimension", "left_value", "right_dimension", "right_value", "fallback_to_default"} {
+		require.Contains(t, required, name)
+		assert.False(t, required[name], "%s must be optional", name)
+	}
+}
+
+func TestUsagePairwiseComparisonOpenAPIAllowsNullCostPerSessionDelta(
+	t *testing.T,
+) {
+	spec := OpenAPISpec(VersionInfo{})
+	deltaSchema, ok := spec.Components.Schemas.Map()["ServiceUsagePairwiseComparisonDelta"]
+	require.True(t, ok, "pairwise comparison delta schema missing")
+	costPerSessionSchema, ok := deltaSchema.Properties["costPerSessionDelta"]
+	require.True(t, ok, "costPerSessionDelta schema missing")
+
+	require.Len(t, costPerSessionSchema.AnyOf, 2)
+	assert.Equal(t, "#/components/schemas/MoneyMoney",
+		costPerSessionSchema.AnyOf[0].Ref,
+	)
+	assert.Equal(t, "null", costPerSessionSchema.AnyOf[1].Type)
+}
+
+func TestUsageRoutesRejectUnknownProjectKeysBeforeQuerying(t *testing.T) {
+	for _, path := range []string{
+		"/api/v1/usage/summary", "/api/v1/usage/summary/stream",
+		"/api/v1/usage/comparison",
+	} {
+		for _, param := range []string{"project_key", "exclude_project_key"} {
+			t.Run(path+"/"+param, func(t *testing.T) {
+				spy := &usageComparisonProjectKeySpy{
+					activeLabels: []string{"team"},
+					projectMap: map[string]export.ProjectMapEntry{
+						"team": {ProjectKey: "pl1:sha256:known"},
+					},
+				}
+				s := newRoutedTestServerWithStore(t, spy)
+
+				w := serveGet(t, s, path+"?"+oneDayUsageRange+
+					"&current_microdollars=0&"+param+"="+
+					url.QueryEscape("pl1:sha256:missing"))
+
+				assertRecorderStatus(t, w, http.StatusBadRequest)
+				assert.Contains(t, w.Body.String(),
+					`"code":"`+service.UsageErrorCodeUnknownProjectKey+`"`)
+				assert.NotContains(t, w.Body.String(), "event:")
+				assertUsageQueryCalls(t, &spy.usageSummaryCountsSpy, 0, 0, 0)
+			})
+		}
+	}
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"log"
@@ -33,7 +32,7 @@ func resolveTestArchiveQueryBackend(
 	t *testing.T, policy archiveQueryPolicy,
 ) archiveQueryBackend {
 	t.Helper()
-	backend, cleanup, err := resolveArchiveQueryBackend(context.Background(), policy)
+	backend, cleanup, err := resolveArchiveQueryBackend(t.Context(), policy)
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 	return backend
@@ -118,7 +117,7 @@ func restoreTestLogOutput(t *testing.T) {
 	t.Helper()
 	orig := log.Writer()
 	t.Cleanup(func() {
-		if closer, ok := log.Writer().(io.Closer); ok {
+		if closer, ok := log.Writer().(io.Closer); ok && log.Writer() != orig {
 			_ = closer.Close()
 		}
 		log.SetOutput(orig)

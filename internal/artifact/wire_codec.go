@@ -9,11 +9,15 @@ import (
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
+	"go.kenn.io/agentsview/internal/ctxio"
 )
 
 const (
 	manifestExtension = ".json.zst"
 	segmentExtension  = ".ndjson.zst"
+
+	manifestDecodedLimit = int64(16 << 20)
+	segmentDecodedLimit  = int64(64 << 20)
 
 	// zstd.NewWriter documents an 8 MiB maximum default window. Pinning that
 	// size keeps existing package-written artifacts readable without accepting
@@ -83,7 +87,7 @@ func ToWireRef(ref Ref) (WireRef, error) {
 // reference. It only removes a transport extension and never joins paths.
 func FromWireRef(origin string, kind Kind, name string) (Ref, error) {
 	if err := validateOriginID(origin); err != nil {
-		return Ref{}, fmt.Errorf("%w: %v", ErrArtifactInvalid, err)
+		return Ref{}, fmt.Errorf("%w: %w", ErrArtifactInvalid, err)
 	}
 	if err := validateArtifactName(name); err != nil {
 		return Ref{}, err
@@ -168,7 +172,7 @@ func DecodeWire(
 	}
 
 	encoded := &wireLimitedReader{
-		reader: &wireContextReader{ctx: ctx, reader: &wireSourceReader{reader: src}},
+		reader: ctxio.Reader{Context: ctx, Reader: &wireSourceReader{reader: src}},
 		limit:  limits.MaxEncodedBytes,
 		label:  "encoded wire input",
 	}
@@ -272,7 +276,7 @@ func copyWireStream(ctx context.Context, dst io.Writer, src io.Reader) error {
 	defer wireCopyBufferPool.Put(pooled)
 	_, err := io.CopyBuffer(
 		&wireContextWriter{ctx: ctx, writer: dst},
-		&wireContextReader{ctx: ctx, reader: src},
+		ctxio.Reader{Context: ctx, Reader: src},
 		pooled[:],
 	)
 	if err != nil {
@@ -284,18 +288,6 @@ func copyWireStream(ctx context.Context, dst io.Writer, src io.Reader) error {
 	// already blocked must provide its own context-aware unblocking mechanism;
 	// this codec does not spawn per-I/O goroutines that could leak behind it.
 	return ctx.Err()
-}
-
-type wireContextReader struct {
-	ctx    context.Context
-	reader io.Reader
-}
-
-func (r *wireContextReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, err
-	}
-	return r.reader.Read(p)
 }
 
 // errWireDestination tags write failures from the caller's decode destination

@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"sort"
@@ -63,6 +64,7 @@ type exportSessionsConfig struct {
 
 type exportSessionsOutput struct {
 	SchemaVersion int                               `json:"schema_version"`
+	ArchiveID     string                            `json:"archive_id"`
 	DatabaseID    string                            `json:"database_id"`
 	Cursor        exportSessionsOutputCursor        `json:"cursor"`
 	Pricing       any                               `json:"pricing"`
@@ -73,6 +75,7 @@ type exportSessionsOutput struct {
 type exportSessionsMetaOutput struct {
 	Type          string                            `json:"type"`
 	SchemaVersion int                               `json:"schema_version"`
+	ArchiveID     string                            `json:"archive_id"`
 	DatabaseID    string                            `json:"database_id"`
 	Cursor        exportSessionsOutputCursor        `json:"cursor"`
 	Pricing       any                               `json:"pricing"`
@@ -90,6 +93,10 @@ type exportSessionsCursorResetError struct {
 }
 
 func newExportCommand() *cobra.Command {
+	return newExportCommandWithDeps(defaultExportReportingDeps())
+}
+
+func newExportCommandWithDeps(deps exportReportingDeps) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "export",
 		Short:        "Export local archive data",
@@ -101,7 +108,12 @@ func newExportCommand() *cobra.Command {
 		},
 	}
 	cmd.AddCommand(newExportSessionsCommand())
+	cmd.AddCommand(newExportConversationsCommand())
 	cmd.AddCommand(newExportStatusCommand())
+	cmd.AddCommand(newExportHourCommand(deps))
+	cmd.AddCommand(newExportDayCommand(deps))
+	cmd.AddCommand(newExportDigestCommand(deps))
+	cmd.AddCommand(newExportRangeCommand(deps))
 	return cmd
 }
 
@@ -112,11 +124,11 @@ func newExportStatusCommand() *cobra.Command {
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			appCfg, err := config.LoadPFlags(cmd.Flags())
+			appCfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 			if err != nil {
 				return fmt.Errorf("loading config: %w", err)
 			}
-			database, err := openExportReadOnlyDB(appCfg)
+			database, err := openExportReadOnlyDB(cmd.Context(), appCfg)
 			if err != nil {
 				return err
 			}
@@ -139,21 +151,21 @@ func newExportStatusCommand() *cobra.Command {
 	}
 }
 
-func openExportReadOnlyDB(appCfg config.Config) (*db.DB, error) {
-	database, err := openReadOnlyDB(appCfg)
+func openExportReadOnlyDB(ctx context.Context, appCfg config.Config) (*db.DB, error) {
+	database, err := openReadOnlyDB(ctx, appCfg)
 	if err == nil {
 		return database, nil
 	}
 	if !db.IsSchemaUpgradeRequired(err) {
 		return nil, fmt.Errorf("open local archive: %w", err)
 	}
-	if upgradeErr := db.UpgradeExportSchemaInPlace(
+	if upgradeErr := db.UpgradeExportSchemaInPlace(ctx,
 		appCfg.DBPath, err,
 	); upgradeErr != nil {
 		return nil, fmt.Errorf(
 			"upgrade local archive schema for export: %w", upgradeErr)
 	}
-	database, err = openReadOnlyDB(appCfg)
+	database, err = openReadOnlyDB(ctx, appCfg)
 	if err != nil {
 		return nil, fmt.Errorf("reopen upgraded local archive: %w", err)
 	}
@@ -161,6 +173,7 @@ func openExportReadOnlyDB(appCfg config.Config) (*db.DB, error) {
 }
 
 func newExportSessionsCommand() *cobra.Command {
+	var profile *SyncConfig
 	cfg := exportSessionsConfig{
 		Limit:  db.MaxSessionLimit,
 		Format: exportSessionsFormat("json"),
@@ -171,6 +184,7 @@ func newExportSessionsCommand() *cobra.Command {
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			defer startSyncProfile(*profile)()
 			cfg.MinToolFailuresSet = cmd.Flags().Changed("min-tool-failures")
 			if cfg.JSON {
 				if cmd.Flags().Changed("format") && cfg.Format != "json" {
@@ -181,6 +195,7 @@ func newExportSessionsCommand() *cobra.Command {
 			return runExportSessions(cmd, cfg)
 		},
 	}
+	profile = bindExportProfile(cmd)
 
 	flags := cmd.Flags()
 	flags.StringVar(&cfg.Project, "project", "",
@@ -188,7 +203,7 @@ func newExportSessionsCommand() *cobra.Command {
 	flags.StringVar(&cfg.ExcludeProject, "exclude-project", "",
 		"Exclude sessions from the given project")
 	flags.StringVar(&cfg.Machine, "machine", "",
-		"Filter by machine name")
+		machineFilterHelp)
 	flags.StringVar(&cfg.GitBranch, "git-branch", "",
 		"Filter by project/branch token")
 	flags.StringVar(&cfg.Agent, "agent", "",
@@ -247,11 +262,11 @@ func runExportSessions(cmd *cobra.Command, cfg exportSessionsConfig) error {
 			"--limit must be between 1 and %d", db.MaxSessionLimit)
 	}
 
-	appCfg, err := config.LoadPFlags(cmd.Flags())
+	appCfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
-	database, err := openExportReadOnlyDB(appCfg)
+	database, err := openExportReadOnlyDB(cmd.Context(), appCfg)
 	if err != nil {
 		return err
 	}
@@ -289,12 +304,13 @@ func runExportSessions(cmd *cobra.Command, cfg exportSessionsConfig) error {
 		return err
 	}
 
-	output := buildExportSessionsOutput(databaseID, pages)
-	enc := json.NewEncoder(cmd.OutOrStdout())
+	output := buildExportSessionsOutput(pages)
+	enc := jsontext.NewEncoder(cmd.OutOrStdout())
 	if cfg.Format == "ndjson" {
-		if err := enc.Encode(exportSessionsMetaOutput{
+		if err := json.MarshalEncode(enc, exportSessionsMetaOutput{
 			Type:          "meta",
 			SchemaVersion: output.SchemaVersion,
+			ArchiveID:     output.ArchiveID,
 			DatabaseID:    output.DatabaseID,
 			Cursor:        output.Cursor,
 			Pricing:       output.Pricing,
@@ -303,13 +319,13 @@ func runExportSessions(cmd *cobra.Command, cfg exportSessionsConfig) error {
 			return err
 		}
 		for _, row := range output.Sessions {
-			if err := enc.Encode(row); err != nil {
+			if err := json.MarshalEncode(enc, row); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	return enc.Encode(output)
+	return json.MarshalEncode(enc, output)
 }
 
 // ensureExportSessionsPricing installs embedded fallback plus custom pricing
@@ -372,6 +388,13 @@ func collectExportSessionPages(
 		Limit:           cfg.Limit,
 		Format:          string(cfg.Format),
 	}
+	if cfg.Cursor == "" {
+		var err error
+		opts.Filter.Machine, err = db.ResolveMachineFilter(ctx, database, opts.Filter.Machine)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if cfg.All {
 		return database.ExportAllSessionSummaries(ctx, opts)
 	}
@@ -425,18 +448,19 @@ func splitExportSessionsCSV(s string) []string {
 }
 
 func buildExportSessionsOutput(
-	databaseID string, pages []db.SessionExportResult,
+	pages []db.SessionExportResult,
 ) exportSessionsOutput {
 	var pricing *export.PricingBlock
 	output := exportSessionsOutput{
 		SchemaVersion: export.SessionSummarySchemaVersion,
-		DatabaseID:    databaseID,
 		Cursor:        exportSessionsOutputCursor{},
 		Pricing:       map[string]any{},
 		Projects:      map[string]export.ProjectMapEntry{},
 		Sessions:      []db.SessionSummaryRow{},
 	}
 	for _, page := range pages {
+		output.ArchiveID = page.ArchiveID
+		output.DatabaseID = page.DatabaseID
 		if output.SchemaVersion == export.SessionSummarySchemaVersion &&
 			page.SchemaVersion != 0 {
 			output.SchemaVersion = page.SchemaVersion
@@ -476,15 +500,16 @@ func mergeExportSessionsPricing(
 
 	merged := cloneExportSessionsPricing(base)
 	if merged.Models == nil {
-		merged.Models = map[string]export.EffectiveModelRate{}
+		merged.Models = map[string]export.ModelPricingProvenance{}
 	}
-	for model, rate := range next.Models {
+	for model, provenance := range next.Models {
 		if existing, ok := merged.Models[model]; ok {
-			rate = mergeExportSessionsModelRate(existing, rate)
+			provenance = mergeExportSessionsModelProvenance(
+				existing, provenance)
 		} else {
-			rate = cloneExportSessionsModelRate(rate)
+			provenance = cloneExportSessionsModelProvenance(provenance)
 		}
-		merged.Models[model] = rate
+		merged.Models[model] = provenance
 	}
 	merged.Fallback.Models = mergeExportSessionsStringSets(
 		merged.Fallback.Models, next.Fallback.Models)
@@ -524,12 +549,24 @@ func cloneExportSessionsPricing(
 	clone := *block
 	clone.Fallback.Models = append([]string{}, block.Fallback.Models...)
 	clone.Fallback.Used = len(clone.Fallback.Models) > 0
-	clone.Models = make(map[string]export.EffectiveModelRate,
+	clone.Models = make(map[string]export.ModelPricingProvenance,
 		len(block.Models))
-	for model, rate := range block.Models {
-		clone.Models[model] = cloneExportSessionsModelRate(rate)
+	for model, provenance := range block.Models {
+		clone.Models[model] = cloneExportSessionsModelProvenance(provenance)
 	}
 	return &clone
+}
+
+func cloneExportSessionsModelProvenance(
+	provenance export.ModelPricingProvenance,
+) export.ModelPricingProvenance {
+	clone := provenance
+	clone.Resolutions = make([]export.EffectiveModelRate,
+		len(provenance.Resolutions))
+	for i, rate := range provenance.Resolutions {
+		clone.Resolutions[i] = cloneExportSessionsModelRate(rate)
+	}
+	return clone
 }
 
 func cloneExportSessionsModelRate(
@@ -539,7 +576,54 @@ func cloneExportSessionsModelRate(
 		pattern := *rate.MatchedPattern
 		rate.MatchedPattern = &pattern
 	}
+	rate.Bands = append([]export.PricingBand(nil), rate.Bands...)
+	rate.Application.Bands = append(
+		[]export.AppliedPricingBand(nil),
+		rate.Application.Bands...,
+	)
 	return rate
+}
+
+type exportSessionsModelResolutionKey struct {
+	pricedModel       string
+	matchedPattern    string
+	hasMatchedPattern bool
+}
+
+func mergeExportSessionsModelProvenance(
+	base, next export.ModelPricingProvenance,
+) export.ModelPricingProvenance {
+	merged := cloneExportSessionsModelProvenance(base)
+	merged.CostSource = mergeExportSessionsCostSource(
+		merged.CostSource, next.CostSource)
+	positions := make(map[exportSessionsModelResolutionKey]int,
+		len(merged.Resolutions))
+	for i, rate := range merged.Resolutions {
+		positions[exportSessionsModelRateKey(rate)] = i
+	}
+	for _, rate := range next.Resolutions {
+		key := exportSessionsModelRateKey(rate)
+		if i, ok := positions[key]; ok {
+			merged.Resolutions[i] = mergeExportSessionsModelRate(
+				merged.Resolutions[i], rate)
+			continue
+		}
+		positions[key] = len(merged.Resolutions)
+		merged.Resolutions = append(merged.Resolutions,
+			cloneExportSessionsModelRate(rate))
+	}
+	sort.Slice(merged.Resolutions, func(i, j int) bool {
+		left := exportSessionsModelRateKey(merged.Resolutions[i])
+		right := exportSessionsModelRateKey(merged.Resolutions[j])
+		if left.pricedModel != right.pricedModel {
+			return left.pricedModel < right.pricedModel
+		}
+		if left.hasMatchedPattern != right.hasMatchedPattern {
+			return !left.hasMatchedPattern
+		}
+		return left.matchedPattern < right.matchedPattern
+	})
+	return merged
 }
 
 func mergeExportSessionsModelRate(
@@ -550,8 +634,56 @@ func mergeExportSessionsModelRate(
 		pattern := *next.MatchedPattern
 		merged.MatchedPattern = &pattern
 	}
+	if len(merged.Bands) == 0 && len(next.Bands) > 0 {
+		merged.Bands = append([]export.PricingBand(nil), next.Bands...)
+	}
+	merged.Application = mergeExportSessionsPricingApplication(
+		merged.Application,
+		next.Application,
+	)
 	merged.CostSource = mergeExportSessionsCostSource(
 		merged.CostSource, next.CostSource)
+	return merged
+}
+
+func exportSessionsModelRateKey(
+	rate export.EffectiveModelRate,
+) exportSessionsModelResolutionKey {
+	key := exportSessionsModelResolutionKey{
+		pricedModel: rate.PricedModel,
+	}
+	if rate.MatchedPattern != nil {
+		key.matchedPattern = *rate.MatchedPattern
+		key.hasMatchedPattern = true
+	}
+	return key
+}
+
+func mergeExportSessionsPricingApplication(
+	base, next export.PricingApplication,
+) export.PricingApplication {
+	merged := export.PricingApplication{
+		BaseRequestCount:  base.BaseRequestCount + next.BaseRequestCount,
+		AggregateRowCount: base.AggregateRowCount + next.AggregateRowCount,
+	}
+	counts := make(map[int]int, len(base.Bands)+len(next.Bands))
+	for _, band := range base.Bands {
+		counts[band.AboveInputTokens] += band.RequestCount
+	}
+	for _, band := range next.Bands {
+		counts[band.AboveInputTokens] += band.RequestCount
+	}
+	thresholds := make([]int, 0, len(counts))
+	for threshold := range counts {
+		thresholds = append(thresholds, threshold)
+	}
+	sort.Ints(thresholds)
+	for _, threshold := range thresholds {
+		merged.Bands = append(merged.Bands, export.AppliedPricingBand{
+			AboveInputTokens: threshold,
+			RequestCount:     counts[threshold],
+		})
+	}
 	return merged
 }
 
@@ -610,7 +742,7 @@ func writeExportSessionsCursorReset(
 		Message:    "session export cursor is no longer valid; restart the export",
 		DatabaseID: databaseID,
 	}
-	if err := json.NewEncoder(cmd.ErrOrStderr()).Encode(payload); err != nil {
+	if err := json.MarshalEncode(jsontext.NewEncoder(cmd.ErrOrStderr()), payload); err != nil {
 		return err
 	}
 	return withSilentExitCode(

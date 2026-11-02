@@ -1,8 +1,11 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vite-plus/test';
-import { mount, unmount, tick } from 'svelte';
+import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
+import { mount, unmount, tick } from "svelte";
+import { controlFrames } from "../test/frames.js";
+import { realVirtualizer } from "../test/virtualizer.js";
+import { cancelScrollReconcile } from "./createVirtualizer.svelte.js";
 // @ts-ignore
-import VirtualizerTest from './VirtualizerTest.svelte';
+import VirtualizerTest from "./VirtualizerTest.svelte";
 
 const ASYNC_UPDATE_DELAY_MS = 100;
 
@@ -10,11 +13,12 @@ type MockOptions = Record<string, unknown>;
 
 const { lastOptions, lastInstance } = vi.hoisted(() => ({
   lastOptions: { value: undefined as MockOptions | undefined },
-  lastInstance: { value: undefined as Record<string, unknown> | undefined }
+  lastInstance: { value: undefined as Record<string, unknown> | undefined },
 }));
 
-vi.mock('@tanstack/virtual-core', async () => {
-  const original = await vi.importActual<typeof import('@tanstack/virtual-core')>('@tanstack/virtual-core');
+vi.mock("@tanstack/virtual-core", async () => {
+  const original =
+    await vi.importActual<typeof import("@tanstack/virtual-core")>("@tanstack/virtual-core");
   return {
     ...original,
     Virtualizer: class {
@@ -30,6 +34,7 @@ vi.mock('@tanstack/virtual-core', async () => {
         lastOptions.value = opts;
       }
       _willUpdate() {}
+      cancelScroll() {}
     },
     observeElementOffset: vi.fn(),
     observeElementRect: vi.fn(),
@@ -40,7 +45,32 @@ vi.mock('@tanstack/virtual-core', async () => {
   };
 });
 
-describe('initialOffset semantics', () => {
+it("cancels TanStack index reconciliation before a preceding row is measured", async () => {
+  const { Virtualizer } =
+    await vi.importActual<typeof import("@tanstack/virtual-core")>("@tanstack/virtual-core");
+  const { flushFrames } = controlFrames();
+  const { instance, element, cleanup } = realVirtualizer(Virtualizer, { count: 10, height: 200 });
+  try {
+    instance.scrollToIndex(1, { align: "start" });
+    expect(element.scrollTop).toBe(100);
+    cancelScrollReconcile(instance);
+    // At the top, default size anchoring cannot mask a stale index reconcile.
+    element.scrollTop = 0;
+    instance.resizeItem(0, 300);
+    instance.getVirtualItems();
+    flushFrames();
+    flushFrames();
+
+    expect(instance.getOffsetForIndex(1, "start")?.[0]).toBe(300);
+    expect(element.scrollTop).toBe(0);
+    expect(instance.scrollOffset).toBe(0);
+  } finally {
+    cleanup();
+    vi.unstubAllGlobals();
+  }
+});
+
+describe("initialOffset semantics", () => {
   beforeEach(() => {
     lastOptions.value = undefined;
     lastInstance.value = undefined;
@@ -52,11 +82,11 @@ describe('initialOffset semantics', () => {
     vi.useRealTimers();
   });
 
-  it('element virtualizer uses scrollTop on first mount', async () => {
+  it("element virtualizer uses scrollTop on first mount", async () => {
     const onInstanceChange = vi.fn();
-    const container = document.createElement('div');
-    const scrollDiv = document.createElement('div');
-    Object.defineProperty(scrollDiv, 'scrollTop', {
+    const container = document.createElement("div");
+    const scrollDiv = document.createElement("div");
+    Object.defineProperty(scrollDiv, "scrollTop", {
       value: 200,
       writable: false,
     });
@@ -64,7 +94,7 @@ describe('initialOffset semantics', () => {
     const component = mount(VirtualizerTest, {
       target: container,
       props: {
-        type: 'element',
+        type: "element",
         options: {
           count: 10,
           getScrollElement: () => scrollDiv,
@@ -82,14 +112,14 @@ describe('initialOffset semantics', () => {
     unmount(component);
   });
 
-  it('element virtualizer falls back to 0 with null scroll element', async () => {
+  it("element virtualizer falls back to 0 with null scroll element", async () => {
     const onInstanceChange = vi.fn();
-    const container = document.createElement('div');
+    const container = document.createElement("div");
 
     const component = mount(VirtualizerTest, {
       target: container,
       props: {
-        type: 'element',
+        type: "element",
         options: {
           count: 10,
           getScrollElement: () => null,
@@ -107,14 +137,14 @@ describe('initialOffset semantics', () => {
     unmount(component);
   });
 
-  it('window virtualizer uses 0 on first mount', async () => {
+  it("window virtualizer uses 0 on first mount", async () => {
     const onInstanceChange = vi.fn();
-    const container = document.createElement('div');
+    const container = document.createElement("div");
 
     const component = mount(VirtualizerTest, {
       target: container,
       props: {
-        type: 'window',
+        type: "window",
         options: {
           count: 20,
           estimateSize: () => 50,
@@ -131,11 +161,11 @@ describe('initialOffset semantics', () => {
     unmount(component);
   });
 
-  it('element virtualizer ignores user initialOffset with scrollTop=0', async () => {
+  it("element virtualizer ignores user initialOffset with scrollTop=0", async () => {
     const onInstanceChange = vi.fn();
-    const container = document.createElement('div');
-    const scrollDiv = document.createElement('div');
-    Object.defineProperty(scrollDiv, 'scrollTop', {
+    const container = document.createElement("div");
+    const scrollDiv = document.createElement("div");
+    Object.defineProperty(scrollDiv, "scrollTop", {
       value: 0,
       writable: false,
     });
@@ -143,7 +173,7 @@ describe('initialOffset semantics', () => {
     const component = mount(VirtualizerTest, {
       target: container,
       props: {
-        type: 'element',
+        type: "element",
         options: {
           count: 10,
           getScrollElement: () => scrollDiv,
@@ -161,14 +191,14 @@ describe('initialOffset semantics', () => {
     unmount(component);
   });
 
-  it('window virtualizer ignores user initialOffset', async () => {
+  it("window virtualizer ignores user initialOffset", async () => {
     const onInstanceChange = vi.fn();
-    const container = document.createElement('div');
+    const container = document.createElement("div");
 
     const component = mount(VirtualizerTest, {
       target: container,
       props: {
-        type: 'window',
+        type: "window",
         options: {
           count: 20,
           estimateSize: () => 50,
@@ -185,11 +215,11 @@ describe('initialOffset semantics', () => {
     unmount(component);
   });
 
-  it('update path prefers instance.scrollOffset over wrapper initialOffset', async () => {
+  it("update path prefers instance.scrollOffset over wrapper initialOffset", async () => {
     const onInstanceChange = vi.fn();
-    const container = document.createElement('div');
-    const scrollDiv = document.createElement('div');
-    Object.defineProperty(scrollDiv, 'scrollTop', {
+    const container = document.createElement("div");
+    const scrollDiv = document.createElement("div");
+    Object.defineProperty(scrollDiv, "scrollTop", {
       value: 0,
       writable: false,
     });
@@ -197,7 +227,7 @@ describe('initialOffset semantics', () => {
     const component = mount(VirtualizerTest, {
       target: container,
       props: {
-        type: 'element',
+        type: "element",
         options: {
           count: 10,
           getScrollElement: () => scrollDiv,
@@ -229,7 +259,7 @@ describe('initialOffset semantics', () => {
   });
 });
 
-describe('createVirtualizer reactivity', () => {
+describe("createVirtualizer reactivity", () => {
   beforeEach(() => {
     lastOptions.value = undefined;
     lastInstance.value = undefined;
@@ -243,25 +273,25 @@ describe('createVirtualizer reactivity', () => {
 
   it.each([
     {
-      type: 'element' as const,
+      type: "element" as const,
       options: {
         count: 10,
-        getScrollElement: () => document.createElement('div'),
+        getScrollElement: () => document.createElement("div"),
         estimateSize: (): number => 50,
       },
     },
     {
-      type: 'window' as const,
+      type: "window" as const,
       options: {
         count: 20,
         estimateSize: (): number => 50,
       },
     },
   ])(
-    'updates when onChange fires with same reference ($type virtualizer)',
+    "updates when onChange fires with same reference ($type virtualizer)",
     async ({ type, options }) => {
       const onInstanceChange = vi.fn();
-      const container = document.createElement('div');
+      const container = document.createElement("div");
 
       const component = mount(VirtualizerTest, {
         target: container,
@@ -274,7 +304,7 @@ describe('createVirtualizer reactivity', () => {
       expect(lastOptions.value).toBeDefined();
 
       const { onChange } = lastOptions.value!;
-      expect(typeof onChange).toBe('function');
+      expect(typeof onChange).toBe("function");
 
       const firstInstance = onInstanceChange.mock.calls[0]![0];
       expect(component.getVirtualizer().instance).toBe(firstInstance);
@@ -283,7 +313,7 @@ describe('createVirtualizer reactivity', () => {
       expect(rawInstance).toBe(firstInstance);
 
       // Mutate raw instance to verify same object reference
-      (rawInstance as Record<string, unknown>)._test_mutation = 'updated';
+      (rawInstance as Record<string, unknown>)._test_mutation = "updated";
 
       // 1. Sync update (onChange(..., false))
       (onChange as (inst: unknown, async: boolean) => void)(rawInstance, false);
@@ -294,7 +324,7 @@ describe('createVirtualizer reactivity', () => {
       expect(onInstanceChange).toHaveBeenCalledTimes(2);
       const receivedSync = onInstanceChange.mock.calls[1]![0];
       expect(receivedSync).toBe(rawInstance);
-      expect(receivedSync._test_mutation).toBe('updated');
+      expect(receivedSync._test_mutation).toBe("updated");
       expect(component.getVirtualizer().instance).toBe(rawInstance);
 
       // 2. Async update (onChange(..., true))
@@ -311,7 +341,7 @@ describe('createVirtualizer reactivity', () => {
       expect(onInstanceChange).toHaveBeenCalledTimes(3);
       const receivedAsync = onInstanceChange.mock.calls[2]![0];
       expect(receivedAsync).toBe(rawInstance);
-      expect(receivedAsync._test_mutation).toBe('updated');
+      expect(receivedAsync._test_mutation).toBe("updated");
 
       unmount(component);
     },

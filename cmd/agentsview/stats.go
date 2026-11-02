@@ -4,7 +4,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -75,7 +76,7 @@ func newStatsCommand() *cobra.Command {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(stats)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), stats)
 			}
 			return printStatsHuman(cmd.OutOrStdout(), stats)
 		},
@@ -151,7 +152,7 @@ func registerStatsFlags(
 func openStatsService(
 	cmd *cobra.Command,
 ) (service.SessionService, func(), error) {
-	cfg, err := config.LoadPFlags(cmd.Flags())
+	cfg, err := config.LoadPFlagsFor(cmd.Flags(), config.ScopeLocal)
 	if err != nil {
 		return nil, nil, fmt.Errorf("loading config: %w", err)
 	}
@@ -159,14 +160,7 @@ func openStatsService(
 	if err != nil {
 		return nil, nil, err
 	}
-	if tr.Mode == transportHTTP && tr.ReadOnly {
-		d, err := openReadOnlyDB(cfg)
-		if err != nil {
-			return nil, nil, fmt.Errorf("opening db: %w", err)
-		}
-		return service.NewDirectBackend(d, nil), func() { d.Close() }, nil
-	}
-	return newService(cfg, tr)
+	return newService(cmd.Context(), cfg, tr)
 }
 
 // printStatsHuman renders a human-readable summary of a SessionStats
@@ -225,7 +219,7 @@ type errWriter struct {
 
 func (e *errWriter) Write(p []byte) (int, error) {
 	if e.err != nil {
-		return len(p), nil
+		return 0, e.err
 	}
 	n, err := e.w.Write(p)
 	if err != nil {
@@ -398,9 +392,9 @@ func printCacheEconomics(w io.Writer, c *db.StatsCacheEconomics) {
 	fmt.Fprintln(w, "Cache economics (claude-only)")
 	fmt.Fprintf(w, "  Overall hit ratio:   %.2f\n",
 		c.CacheHitRatio.Overall)
-	fmt.Fprintf(w, "  $ spent:             $%.2f\n", c.DollarsSpent)
-	fmt.Fprintf(w, "  $ saved vs uncached: $%.2f\n",
-		c.DollarsSavedVsUncached)
+	fmt.Fprintf(w, "  $ spent:             %s\n", fmtCost(c.DollarsSpent))
+	fmt.Fprintf(w, "  $ saved vs uncached: %s\n",
+		fmtCost(c.DollarsSavedVsUncached))
 	fmt.Fprintln(w)
 }
 
@@ -446,6 +440,16 @@ func printOutcomeStats(w io.Writer, o *db.StatsOutcomeStats) {
 	}
 	if o.PRsMerged != nil {
 		fmt.Fprintf(w, "  PRs merged:          %s\n", fmtInt(*o.PRsMerged))
+	}
+	if len(o.Skipped) > 0 {
+		// Without these lines a total missing an unknown number of
+		// repositories reads exactly like a complete one.
+		fmt.Fprintln(w, "  Incomplete:")
+		for _, skipped := range o.Skipped {
+			fmt.Fprintf(w, "    %s (%s): %s\n",
+				skipped.Repo, skipped.Op,
+				strings.ReplaceAll(skipped.Reason, "\n", "\n      "))
+		}
 	}
 	fmt.Fprintln(w)
 }

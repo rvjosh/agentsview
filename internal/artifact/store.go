@@ -29,7 +29,7 @@ func validateStoreRef(ref Ref) error {
 
 func validateStoreCollection(origin string, kind Kind) error {
 	if err := validateOriginID(origin); err != nil {
-		return fmt.Errorf("%w: %v", ErrArtifactInvalid, err)
+		return fmt.Errorf("%w: %w", ErrArtifactInvalid, err)
 	}
 	switch kind {
 	case KindCheckpoints, KindManifests, KindSegments, KindMeta, KindRaw:
@@ -92,6 +92,18 @@ func canonicalArtifactMediaType(kind Kind) string {
 	}
 }
 
+type contextArtifactReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *contextArtifactReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
 func artifactStoreError(op string, ref Ref, err error) error {
 	return &ArtifactOpError{Op: op, Ref: ref, Err: err}
 }
@@ -110,7 +122,7 @@ type Ref struct {
 // NewRef validates and constructs a canonical logical artifact reference.
 func NewRef(origin string, kind Kind, name string) (Ref, error) {
 	if err := validateOriginID(origin); err != nil {
-		return Ref{}, fmt.Errorf("%w: %v", ErrArtifactInvalid, err)
+		return Ref{}, fmt.Errorf("%w: %w", ErrArtifactInvalid, err)
 	}
 	if err := validateCanonicalArtifactName(kind, name); err != nil {
 		return Ref{}, err

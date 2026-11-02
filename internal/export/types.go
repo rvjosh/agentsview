@@ -3,11 +3,17 @@
 // API surfaces depend on their field names.
 package export
 
-import "time"
+import (
+	"time"
 
-const UsageDailySchemaVersion = 2
-const ActivityReportSchemaVersion = 2
-const SessionSummarySchemaVersion = 2
+	"go.kenn.io/agentsview/internal/money"
+)
+
+const (
+	UsageDailySchemaVersion     = 6
+	ActivityReportSchemaVersion = 8
+	SessionSummarySchemaVersion = 7
+)
 
 // CostSource is a closed contract enum. Adding a value requires a schema version
 // bump for any export surface that emits it.
@@ -20,15 +26,15 @@ const (
 )
 
 type PricingBlock struct {
-	Source              string                        `json:"source"`
-	TableVersion        string                        `json:"table_version"`
-	LatestRowUpdatedAt  *time.Time                    `json:"latest_row_updated_at"`
-	CustomOverrideCount int                           `json:"custom_override_count"`
-	EffectiveRowCount   int                           `json:"effective_row_count"`
-	Digest              string                        `json:"digest"`
-	CostSource          CostSource                    `json:"cost_source"`
-	Fallback            PricingFallback               `json:"fallback"`
-	Models              map[string]EffectiveModelRate `json:"models"`
+	Source              string                            `json:"source"`
+	TableVersion        string                            `json:"table_version"`
+	LatestRowUpdatedAt  *time.Time                        `json:"latest_row_updated_at"`
+	CustomOverrideCount int                               `json:"custom_override_count"`
+	EffectiveRowCount   int                               `json:"effective_row_count"`
+	Digest              string                            `json:"digest"`
+	CostSource          CostSource                        `json:"cost_source"`
+	Fallback            PricingFallback                   `json:"fallback"`
+	Models              map[string]ModelPricingProvenance `json:"models"`
 }
 
 type PricingFallback struct {
@@ -36,13 +42,45 @@ type PricingFallback struct {
 	Models []string `json:"models"`
 }
 
+type ModelPricingProvenance struct {
+	CostSource  CostSource           `json:"cost_source"`
+	Resolutions []EffectiveModelRate `json:"resolutions"`
+}
+
 type EffectiveModelRate struct {
-	MatchedPattern        *string    `json:"matched_pattern"`
-	InputCostPerMTok      float64    `json:"input_cost_per_mtok"`
-	OutputCostPerMTok     float64    `json:"output_cost_per_mtok"`
-	CacheWriteCostPerMTok float64    `json:"cache_write_cost_per_mtok"`
-	CacheReadCostPerMTok  float64    `json:"cache_read_cost_per_mtok"`
-	CostSource            CostSource `json:"cost_source"`
+	PricedModel           string      `json:"priced_model"`
+	MatchedPattern        *string     `json:"matched_pattern"`
+	InputCostPerMTok      money.Money `json:"input_cost_per_mtok"`
+	OutputCostPerMTok     money.Money `json:"output_cost_per_mtok"`
+	CacheWriteCostPerMTok money.Money `json:"cache_write_cost_per_mtok"`
+	// Zero means no separate 1h cache-write rate; 1h writes bill at
+	// cache_write_cost_per_mtok.
+	CacheWrite1hCostPerMTok money.Money        `json:"cache_write_1h_cost_per_mtok"`
+	CacheReadCostPerMTok    money.Money        `json:"cache_read_cost_per_mtok"`
+	CostSource              CostSource         `json:"cost_source"`
+	Bands                   []PricingBand      `json:"bands"`
+	Application             PricingApplication `json:"application"`
+}
+
+type PricingBand struct {
+	AboveInputTokens    int         `json:"above_input_tokens"`
+	InputPerMTok        money.Money `json:"input_cost_per_mtok"`
+	OutputPerMTok       money.Money `json:"output_cost_per_mtok"`
+	CacheWritePerMTok   money.Money `json:"cache_write_cost_per_mtok"`
+	CacheWrite1hPerMTok money.Money `json:"cache_write_1h_cost_per_mtok"`
+	CacheReadPerMTok    money.Money `json:"cache_read_cost_per_mtok"`
+	UpdatedAt           *time.Time  `json:"-"`
+}
+
+type PricingApplication struct {
+	BaseRequestCount  int                  `json:"base_request_count"`
+	AggregateRowCount int                  `json:"aggregate_row_count"`
+	Bands             []AppliedPricingBand `json:"bands"`
+}
+
+type AppliedPricingBand struct {
+	AboveInputTokens int `json:"above_input_tokens"`
+	RequestCount     int `json:"request_count"`
 }
 
 // ProjectResolution is a closed contract enum. Adding a value requires a schema
@@ -172,6 +210,9 @@ type ProjectIdentityObservation struct {
 	NormalizedRemote     string               `json:"normalized_remote"`
 	KeySource            string               `json:"key_source"`
 	Key                  string               `json:"key"`
+	// SourceRecorded marks a repository URL the session source recorded,
+	// which may repair a stored snapshot that lacks one. It is not stored.
+	SourceRecorded bool `json:"-"`
 }
 
 type SessionExportCursor struct {

@@ -1,22 +1,27 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({ reportErrorShown: vi.fn() }));
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import UsagePairwiseComparisonPanel from "./UsagePairwiseComparisonPanel.svelte";
 import { usage } from "../../stores/usage.svelte.js";
 import type {
-  UsagePairwiseComparisonResponse,
+  ServiceUsagePairwiseComparisonResponse,
   UsageSummaryResponse,
-} from "../../api/types/usage.js";
+} from "../../api/generated/index";
+import { testMoney } from "../../test/money.js";
 
 function usageSummary(): UsageSummaryResponse {
   return {
     from: "2024-01-01",
     to: "2024-01-31",
+    projects: {},
     totals: {
       inputTokens: 400,
       outputTokens: 200,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
-      totalCost: 99.99,
+      totalCost: testMoney(99.99),
+      cacheSavings: testMoney(0),
     },
     daily: [],
     projectTotals: [
@@ -27,7 +32,7 @@ function usageSummary(): UsageSummaryResponse {
         outputTokens: 100,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 10,
+        cost: testMoney(10),
       },
       {
         project_key: "pl1:sha256:beta",
@@ -36,7 +41,7 @@ function usageSummary(): UsageSummaryResponse {
         outputTokens: 50,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 8,
+        cost: testMoney(8),
       },
     ],
     modelTotals: [
@@ -46,7 +51,7 @@ function usageSummary(): UsageSummaryResponse {
         outputTokens: 100,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 10,
+        cost: testMoney(10),
       },
       {
         model: "gpt-4o",
@@ -54,7 +59,7 @@ function usageSummary(): UsageSummaryResponse {
         outputTokens: 50,
         cacheCreationTokens: 0,
         cacheReadTokens: 0,
-        cost: 8,
+        cost: testMoney(8),
       },
     ],
     agentTotals: [],
@@ -69,37 +74,37 @@ function usageSummary(): UsageSummaryResponse {
       uncachedInputTokens: 400,
       outputTokens: 200,
       hitRate: 0,
-      savingsVsUncached: 0,
+      savingsVsUncached: testMoney(0),
     },
   };
 }
 
-function pairwiseComparison(): UsagePairwiseComparisonResponse {
+function pairwiseComparison(): ServiceUsagePairwiseComparisonResponse {
   return {
     left: {
-      totalCost: 4,
+      totalCost: testMoney(4),
       inputTokens: 200,
       outputTokens: 100,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalTokens: 300,
       sessionCount: 2,
-      costPerSession: 2,
+      costPerSession: testMoney(2),
       tokensPerSession: 150,
     },
     right: {
-      totalCost: 5.5,
+      totalCost: testMoney(5.5),
       inputTokens: 100,
       outputTokens: 50,
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
       totalTokens: 150,
       sessionCount: 1,
-      costPerSession: 5.5,
+      costPerSession: testMoney(5.5),
       tokensPerSession: 150,
     },
     deltas: {
-      totalCostDelta: 1.5,
+      totalCostDelta: testMoney(1.5),
       totalCostDeltaRatio: 0.375,
       inputTokensDelta: -100,
       inputTokensDeltaRatio: -0.5,
@@ -113,7 +118,7 @@ function pairwiseComparison(): UsagePairwiseComparisonResponse {
       totalTokensDeltaRatio: -0.5,
       sessionCountDelta: -1,
       sessionCountDeltaRatio: -0.5,
-      costPerSessionDelta: 3.5,
+      costPerSessionDelta: testMoney(3.5),
       costPerSessionRatio: 1.75,
       tokensPerSessionDelta: 0,
       tokensPerSessionRatio: 0,
@@ -142,9 +147,70 @@ describe("UsagePairwiseComparisonPanel", () => {
     };
     usage.loading.pairwise = false;
     usage.errors.pairwise = null;
+    usage.mode = "cost";
+    usage.setSelectedTokenTypes(["input", "cache_write", "cache_read", "output"]);
     document.body.innerHTML = "";
     vi.restoreAllMocks();
   });
+
+  it("reports the analytics kind for a visible comparison error", async () => {
+    usage.errors.pairwise = "Comparison failed";
+    const component = mount(UsagePairwiseComparisonPanel, { target: document.body });
+    await tick();
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics");
+    unmount(component);
+  });
+
+  it.each(["first default", "comparison before totals", "remembered refresh"] as const)(
+    "keeps pickers disabled until totals and the first default pair load, %s",
+    async (scenario) => {
+      if (scenario !== "remembered refresh") usage.summary = null;
+      if (scenario === "first default") {
+        usage.pairwiseSelection = {
+          left: { dimension: "model", value: "" },
+          right: { dimension: "model", value: "" },
+        };
+      }
+      usage.loading.pairwise = scenario !== "comparison before totals";
+      if (usage.loading.pairwise) usage.pairwiseComparison = null;
+      const spy = vi.spyOn(usage, "setPairwiseSide");
+      const component = mount(UsagePairwiseComparisonPanel, { target: document.body });
+      await tick();
+      const pickers = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(".pairwise-typeahead button"),
+      );
+      expect(pickers).toHaveLength(4);
+      expect(pickers.every((picker) => picker.disabled)).toBe(scenario !== "remembered refresh");
+      if (scenario === "comparison before totals") {
+        const dimension = document.querySelector<HTMLButtonElement>(
+          'button[aria-label^="Left comparison dimension:"]',
+        );
+        expect(dimension).toBeTruthy();
+        dimension?.click();
+        await tick();
+        expect(document.querySelector('li[role="option"]')).toBeNull();
+        expect(spy).not.toHaveBeenCalled();
+      }
+      if (scenario !== "remembered refresh") {
+        usage.summary = usageSummary();
+        await tick();
+        if (scenario === "first default") {
+          expect(pickers.every((picker) => picker.disabled)).toBe(true);
+        }
+        usage.pairwiseSelection = {
+          left: { dimension: "model", value: "claude-sonnet-4-20250514" },
+          right: { dimension: "project", value: "pl1:sha256:beta" },
+        };
+        usage.pairwiseComparison = pairwiseComparison();
+        usage.loading.pairwise = false;
+        await tick();
+        expect(pickers.every((picker) => !picker.disabled)).toBe(true);
+        expect(document.querySelector("tbody tr")).toBeTruthy();
+        expect(document.body.textContent).not.toContain("Not enough data");
+      }
+      unmount(component);
+    },
+  );
 
   it("routes selector changes through the usage store", async () => {
     const spy = vi.spyOn(usage, "setPairwiseSide");
@@ -154,16 +220,16 @@ describe("UsagePairwiseComparisonPanel", () => {
     await tick();
 
     const trigger = document.querySelector<HTMLButtonElement>(
-      'button[aria-label="Left comparison dimension"]',
+      'button[aria-label^="Left comparison dimension:"]',
     );
     expect(trigger).toBeTruthy();
     if (!trigger) return;
     trigger.click();
     await tick();
 
-    const option = Array.from(
-      document.querySelectorAll<HTMLLIElement>('li[role="option"]'),
-    ).find((item) => item.textContent?.includes("Project"));
+    const option = Array.from(document.querySelectorAll<HTMLLIElement>('li[role="option"]')).find(
+      (item) => item.textContent?.includes("Project"),
+    );
     expect(option).toBeTruthy();
     option?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
     await tick();
@@ -209,4 +275,40 @@ describe("UsagePairwiseComparisonPanel", () => {
 
     unmount(component);
   });
+
+  it("compares aggregate output tokens when Output is selected", async () => {
+    usage.mode = "token";
+    usage.setSelectedTokenTypes(["output"]);
+    const component = mount(UsagePairwiseComparisonPanel, {
+      target: document.body,
+    });
+    await tick();
+
+    const firstRow = document.querySelector("tbody tr");
+    const cells = Array.from(firstRow?.querySelectorAll("th, td") ?? []).map((cell) =>
+      cell.textContent?.replace(/\s+/g, " ").trim(),
+    );
+    expect(cells).toEqual(["Total Tokens", "100", "50", "-50 -50.0%"]);
+
+    unmount(component);
+  });
+
+  it.each(["cost", "token"] as const)(
+    "labels the input row as uncached input in %s mode",
+    async (mode) => {
+      usage.mode = mode;
+      const component = mount(UsagePairwiseComparisonPanel, {
+        target: document.body,
+      });
+      await tick();
+
+      const headers = Array.from(document.querySelectorAll("tbody th")).map((cell) =>
+        cell.textContent?.trim(),
+      );
+      expect(headers).toContain("Uncached Input");
+      expect(headers).not.toContain("Input Tokens");
+
+      unmount(component);
+    },
+  );
 });

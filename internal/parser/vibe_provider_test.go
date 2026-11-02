@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,14 +28,16 @@ func TestVibeProviderSourceMethods(t *testing.T) {
 	})
 	require.True(t, ok)
 
-	plan, err := provider.WatchPlan(context.Background())
+	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
 	require.Len(t, plan.Roots, 1)
 	assert.Equal(t, root, plan.Roots[0].Path)
 	assert.True(t, plan.Roots[0].Recursive)
-	assert.Equal(t, []string{"messages.jsonl", "meta.json"}, plan.Roots[0].IncludeGlobs)
+	assert.Equal(t, []string{
+		"messages.jsonl", "meta.json", "CURRENT", "[0-9]*.jsonl",
+	}, plan.Roots[0].IncludeGlobs)
 
-	discovered, err := provider.Discover(context.Background())
+	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
 	source := discovered[0]
@@ -45,21 +46,21 @@ func TestVibeProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, messagesPath, source.FingerprintKey)
 	assert.Equal(t, sessionDir, source.ProjectHint)
 
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		FullSessionID: "remote~vibe:uuid-1234",
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, messagesPath, found.DisplayPath)
 
-	found, ok, err = provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err = provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: sessionDir,
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, messagesPath, found.DisplayPath)
 
-	found, ok, err = provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err = provider.FindSource(t.Context(), FindSourceRequest{
 		StoredFilePath: messagesPath,
 	})
 	require.NoError(t, err)
@@ -70,12 +71,11 @@ func TestVibeProviderSourceMethods(t *testing.T) {
 	require.NoError(t, err)
 	metaInfo, err := os.Stat(metaPath)
 	require.NoError(t, err)
-	fingerprint, err := provider.Fingerprint(context.Background(), found)
+	fingerprint, err := provider.Fingerprint(t.Context(), found)
 	require.NoError(t, err)
 	assert.Equal(t, messagesPath, fingerprint.Key)
 	assert.Equal(t, messageInfo.Size()+metaInfo.Size(), fingerprint.Size)
-	assert.Equal(
-		t,
+	assert.Equal(t,
 		max(messageInfo.ModTime().UnixNano(), metaInfo.ModTime().UnixNano()),
 		fingerprint.MTimeNS,
 	)
@@ -91,7 +91,7 @@ func TestVibeProviderSourceMethods(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			changed, err := provider.SourcesForChangedPath(
-				context.Background(),
+				t.Context(),
 				ChangedPathRequest{Path: tc.path, EventKind: "write", WatchRoot: root},
 			)
 			require.NoError(t, err)
@@ -102,7 +102,7 @@ func TestVibeProviderSourceMethods(t *testing.T) {
 
 	require.NoError(t, os.Remove(metaPath))
 	changed, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: metaPath, EventKind: "remove", WatchRoot: root},
 	)
 	require.NoError(t, err)
@@ -110,7 +110,7 @@ func TestVibeProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, messagesPath, changed[0].DisplayPath)
 
 	ignored, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{
 			Path:      filepath.Join(root, "scratch", "messages.jsonl"),
 			EventKind: "write",
@@ -121,7 +121,7 @@ func TestVibeProviderSourceMethods(t *testing.T) {
 	assert.Empty(t, ignored)
 
 	nested, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: nestedPath, EventKind: "write", WatchRoot: root},
 	)
 	require.NoError(t, err)
@@ -129,7 +129,7 @@ func TestVibeProviderSourceMethods(t *testing.T) {
 
 	require.NoError(t, os.Remove(messagesPath))
 	changed, err = provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: messagesPath, EventKind: "remove", WatchRoot: root},
 	)
 	require.NoError(t, err)
@@ -138,7 +138,7 @@ func TestVibeProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, sessionDir, changed[0].ProjectHint)
 
 	wrongRoot, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{
 			Path:      messagesPath,
 			EventKind: "write",
@@ -171,12 +171,12 @@ func TestVibeProviderDiscoversSymlinkedSessionDirectory(t *testing.T) {
 	})
 	require.True(t, ok)
 
-	discovered, err := provider.Discover(context.Background())
+	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
 	assert.Equal(t, sourcePath, discovered[0].DisplayPath)
 
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: sessionDir,
 	})
 	require.NoError(t, err)
@@ -227,9 +227,9 @@ func TestVibeProviderStreamingDiscoveryPropagatesSessionSymlinkErrors(t *testing
 		_, err := discoverEach(t, root)
 
 		require.Error(t, err)
-		assert.ErrorIs(t, err, os.ErrNotExist)
+		require.ErrorIs(t, err, os.ErrNotExist)
 		var incomplete DiscoveryIncompleteError
-		assert.ErrorAs(t, err, &incomplete)
+		require.ErrorAs(t, err, &incomplete)
 
 		require.NoError(t, os.Remove(link))
 		yielded, err := discoverEach(t, root)
@@ -259,9 +259,9 @@ func TestVibeProviderStreamingDiscoveryPropagatesSessionSymlinkErrors(t *testing
 		_, err := discoverEach(t, root)
 
 		require.Error(t, err)
-		assert.ErrorIs(t, err, os.ErrPermission)
+		require.ErrorIs(t, err, os.ErrPermission)
 		var incomplete DiscoveryIncompleteError
-		assert.ErrorAs(t, err, &incomplete)
+		require.ErrorAs(t, err, &incomplete)
 
 		require.NoError(t, os.Chmod(targetParent, 0o755))
 		yielded, err := discoverEach(t, root)
@@ -283,13 +283,13 @@ func TestVibeProviderParse(t *testing.T) {
 		Machine: "devbox",
 	})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
-	fingerprint, err := provider.Fingerprint(context.Background(), sources[0])
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      sources[0],
 		Fingerprint: fingerprint,
 	})
@@ -331,13 +331,13 @@ func TestVibeProviderParseEmitsUsageEvents(t *testing.T) {
 		Machine: "devbox",
 	})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
-	fingerprint, err := provider.Fingerprint(context.Background(), sources[0])
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      sources[0],
 		Fingerprint: fingerprint,
 	})

@@ -1,13 +1,11 @@
 <script lang="ts">
   import { SegmentedControl, TextInput } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
-  import SettingsSection from "./SettingsSection.svelte";
   import { settings } from "../../stores/settings.svelte.js";
   import {
     ConfigService,
-    TerminalConfigBody,
+    type TerminalConfigBody,
   } from "../../api/generated/index";
-  import { configureGeneratedClient } from "../../api/runtime.js";
 
   const MODES = $derived([
     { value: "auto", label: m.settings_terminal_mode_auto() },
@@ -26,15 +24,15 @@
   });
 
   async function saveTerminal() {
-    configureGeneratedClient();
-    await ConfigService.postApiV1ConfigTerminal({
-      requestBody: {
-        mode: localMode as TerminalConfigBody.mode,
+    if (settings.saving) return;
+    await settings.runMutation(async () => {
+      await ConfigService.postApiV1ConfigTerminal({
+        mode: localMode as TerminalConfigBody["mode"],
         custom_bin: localBin || undefined,
         custom_args: localArgs || undefined,
-      },
+      });
     });
-    // Reload settings to pick up the saved values
+    // Reload settings after the mutation so hydration sees the saved config.
     await settings.load();
   }
 
@@ -45,10 +43,7 @@
   );
 </script>
 
-<SettingsSection
-  title={m.settings_terminal_title()}
-  description={m.settings_terminal_description()}
->
+<div class="terminal-settings">
   <div class="setting-row">
     <span class="setting-label">{m.settings_terminal_launch_mode()}</span>
     <SegmentedControl
@@ -100,9 +95,15 @@
       </button>
     </div>
   {/if}
-</SettingsSection>
+</div>
 
 <style>
+  .terminal-settings {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+  }
+
   .setting-row {
     display: flex;
     align-items: center;
@@ -154,7 +155,7 @@
   }
 
   .save-btn:disabled {
-    opacity: 0.6;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 </style>

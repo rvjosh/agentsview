@@ -2,18 +2,53 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/apiclient"
 	"go.kenn.io/agentsview/internal/db"
+	"go.yaml.in/yaml/v3"
 )
+
+func TestCLIArchiveStaleWarning(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		t.Run(strconv.FormatBool(stale), func(t *testing.T) {
+			newAgentDataDir(t)
+			ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+				if stale {
+					w.Header().Set(apiclient.ArchiveStaleHeader, "true")
+				}
+				switch r.URL.Path {
+				case "/api/v1/sessions":
+					writeJSONResponse(w, `{"sessions":[],"total":0}`)
+				default:
+					assert.Fail(t, "unexpected request", r.URL.Path)
+					http.NotFound(w, r)
+				}
+			})
+			var stdout, stderr bytes.Buffer
+			require.NoError(t, executeCLIWithLegacyFlagCompat([]string{"session", "list", "--server", ts.URL, "--json"}, &stdout, &stderr))
+			decodeCLIJSON[cliSessionList](t, stdout.String())
+			assert.NotContains(t, stdout.String(), apiclient.ArchiveStaleWarning)
+			wantWarnings := 0
+			if stale {
+				wantWarnings = 1
+			}
+			assert.Equal(t, wantWarnings, strings.Count(stderr.String(), apiclient.ArchiveStaleWarning))
+		})
+	}
+}
 
 func executeCommand(root *cobra.Command, args ...string) (string, error) {
 	_, output, err := executeCommandC(root, args...)
@@ -39,14 +74,18 @@ func TestRootHelpShowsKeySectionsAndCommands(t *testing.T) {
 		"Data Commands:",
 		"Usage Commands:",
 		"Other Commands:",
-		"serve                  Start server",
-		"duckdb status          Show DuckDB sync status",
-		"pg push                Push local data to PostgreSQL",
-		"duckdb quack           Quack remote protocol commands",
-		"usage daily            Daily cost summary",
+		"serve                  Start the web UI and sync server",
+		"replica                Sync and serve database replicas",
+		"source                 Discover and ingest session sources",
+		"report                 Report activity, usage, and workspace statistics",
+		"index                  Build and manage derived search indexes",
 		"completion             Generate the autocompletion script for the specified shell",
 		"Flags:",
 		"--version",
+		"[agents.claude]",
+		"dirs = [\"/path/one\", \"/path/two\"]",
+		"[agents.codex]",
+		"dirs = [\"/codex/a\", \"/codex/b\"]",
 	} {
 		assert.Contains(t, help, want, "help missing %q", want)
 	}
@@ -59,75 +98,60 @@ func TestRootHelpShowsKeySectionsAndCommands(t *testing.T) {
 	}
 }
 
-func TestRootHelpShowsDuckDBEnvironment(t *testing.T) {
-	help, err := executeCommand(newRootCommand(), "--help")
-	require.NoError(t, err, "Execute")
-	for _, want := range []string{
-		"AGENTSVIEW_DUCKDB_PATH",
-		"AGENTSVIEW_DUCKDB_URL",
-		"AGENTSVIEW_DUCKDB_TOKEN",
-		"AGENTSVIEW_DUCKDB_MACHINE",
+func TestPruneCommandAgentFilter(t *testing.T) {
+	var got []PruneConfig
+	cmd := newPruneCommandWithRunner(func(ctx context.Context, cfg PruneConfig) {
+		got = append(got, cfg)
+	})
+	_, err := executeCommand(cmd,
+		"--agent", "mimocode", "--project", "project-a", "--max-messages", "0",
+		"--before", "2025-01-01", "--first-message", "hello", "--dry-run", "--yes")
+	require.NoError(t, err)
+	assert.Equal(t, []PruneConfig{{
+		Filter: db.PruneFilter{Agent: "mimocode", Project: "project-a", MaxMessages: new(0), Before: "2025-01-01", FirstMessage: "hello"},
+		DryRun: true, Yes: true,
+	}}, got)
+}
+
+func TestPruneCommandRejectsEmptyAgent(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+	}{
+		{"agent only", []string{"--agent="}},
+		{"with project", []string{"--agent=", "--project", "project-a"}},
 	} {
-		assert.Contains(t, help, want, "help missing %q", want)
-	}
-	assert.NotContains(t, help, "env-token")
-}
-
-func TestRootHelpShowsQuackEnvironment(t *testing.T) {
-	help, err := executeCommand(newRootCommand(), "--help")
-	require.NoError(t, err, "Execute")
-	assert.NotContains(t, help, "AGENTSVIEW_QUACK_URL")
-	assert.NotContains(t, help, "AGENTSVIEW_QUACK_TOKEN")
-}
-
-func TestRootHelpDocumentsCopilotExportDir(t *testing.T) {
-	help, err := executeCommand(newRootCommand(), "--help")
-	require.NoError(t, err, "Execute")
-	assert.Contains(t, help,
-		"COPILOT_DIR             Copilot sessions or exported JetBrains Copilot directory")
-}
-
-func TestDuckDBPushHelpShowsProjectFlags(t *testing.T) {
-	help, err := executeCommand(newRootCommand(), "duckdb", "push", "--help")
-	require.NoError(t, err, "Execute")
-	for _, want := range []string{
-		"--full",
-		"--projects",
-		"--exclude-projects",
-		"--all-projects",
-		"--watch",
-		"--debounce",
-		"--interval",
-	} {
-		assert.Contains(t, help, want)
+		t.Run(tt.name, func(t *testing.T) {
+			called := false
+			cmd := newPruneCommandWithRunner(func(context.Context, PruneConfig) {
+				called = true
+			})
+			_, err := executeCommand(cmd, tt.args...)
+			require.EqualError(t, err, "--agent must not be empty")
+			assert.False(t, called, "runner must not be called")
+		})
 	}
 }
 
-func TestPGStatusHelpShowsProjectFlags(t *testing.T) {
-	help, err := executeCommand(newRootCommand(), "pg", "status", "--help")
-	require.NoError(t, err, "Execute")
+func TestRawSyncCommandsKeepCredentialOutOfArguments(t *testing.T) {
+	help, err := executeCommand(newRootCommand(), "raw-sync", "watch", "--help")
+	require.NoError(t, err)
 	for _, want := range []string{
-		"--projects",
-		"--exclude-projects",
-		"--all-projects",
+		"--server", "--device-id", "--allow-insecure-http", "--debounce", "--interval",
+		"AGENTSVIEW_RAW_SYNC_CREDENTIAL",
 	} {
 		assert.Contains(t, help, want)
 	}
-}
-
-func TestDuckDBQuackServeHelpShowsSafetyFlags(t *testing.T) {
-	help, err := executeCommand(newRootCommand(), "duckdb", "quack", "serve", "--help")
-	require.NoError(t, err, "Execute")
-	for _, want := range []string{
-		"--bind",
-		"--path",
-		"--token",
-		"required",
-		"--allow-insecure",
-	} {
-		assert.Contains(t, help, want)
-	}
-	assert.NotContains(t, help, "generated if omitted")
+	assert.NotContains(t, help, "--credential")
+	_, err = executeCommand(
+		newRootCommand(), "raw-sync", "watch", "--credential=private-value",
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown flag: --credential")
+	assert.NotContains(t, err.Error(), "private-value")
+	status, err := executeCommand(newRootCommand(), "raw-sync", "status", "--help")
+	require.NoError(t, err)
+	assert.Contains(t, status, "Show durable laptop raw-sync status")
 }
 
 func TestOpenAPICommandEmitsSpec(t *testing.T) {
@@ -146,18 +170,31 @@ func TestOpenAPICommandEmitsSpec(t *testing.T) {
 	assert.Contains(t, spec.Paths["/api/v1/sessions/{id}/rename"], "patch")
 }
 
+func TestOpenAPICommandEmitsYAML(t *testing.T) {
+	out, err := executeCommand(newRootCommand(), "openapi", "--yaml")
+	require.NoError(t, err)
+	var spec struct {
+		OpenAPI string                    `yaml:"openapi"`
+		Paths   map[string]map[string]any `yaml:"paths"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(out), &spec))
+	assert.Equal(t, "3.1.0", spec.OpenAPI)
+	require.Contains(t, spec.Paths, "/api/v1/sessions")
+	assert.Contains(t, spec.Paths["/api/v1/sessions"], "get")
+}
+
 func TestServeCheckDataVersionRejectsNewerDatabase(t *testing.T) {
 	dataDir := testDataDir(t)
 	dbPath := filepath.Join(dataDir, "sessions.db")
 
-	database, err := db.Open(dbPath)
+	database, err := db.Open(t.Context(), dbPath)
 	require.NoError(t, err, "open db")
 	require.NoError(t, database.Close(), "close db")
 
 	futureVersion := db.CurrentDataVersion() + 10
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "raw sqlite open")
-	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
+	_, err = conn.ExecContext(t.Context(), fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err, "set future user_version")
 	require.NoError(t, conn.Close(), "close raw sqlite")
 
@@ -194,7 +231,7 @@ func TestRootNoArgsShowsHelp(t *testing.T) {
 	for _, want := range []string{
 		"Usage:\n  agentsview [flags]\n  agentsview <command> [flags]",
 		"Core Commands:",
-		"serve                  Start server",
+		"serve                  Start the web UI and sync server",
 	} {
 		assert.Contains(t, out, want, "output missing %q", want)
 	}
@@ -341,28 +378,4 @@ func TestExecuteCLIWithLegacyFlagCompatWarnsOnce(t *testing.T) {
 		"version output = %q", stdout.String())
 	want := "warning: deprecated single-dash long flags detected; use GNU-style long flags instead: -version -> --version\n"
 	assert.Equal(t, want, stderr.String())
-}
-
-func TestRootHelpDocumentsRemoteHosts(t *testing.T) {
-	help, err := executeCommand(newRootCommand(), "--help")
-	require.NoError(t, err, "Execute")
-	for _, want := range []string{
-		"remote_hosts",
-		"passwordless",
-		"transport = \"http\"",
-		"daemon_idle_timeout",
-		"Top-level daemon_idle_timeout",
-		"Tailscale",
-	} {
-		assert.Contains(t, help, want,
-			"root help should document %q", want)
-	}
-}
-
-func TestSyncHelpMentionsConfiguredHosts(t *testing.T) {
-	help, err := executeCommand(newRootCommand(), "sync", "--help")
-	require.NoError(t, err, "Execute")
-	for _, want := range []string{"remote_hosts", "--host", "passwordless"} {
-		assert.Contains(t, help, want, "sync help missing %q", want)
-	}
 }

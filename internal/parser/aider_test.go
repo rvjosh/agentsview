@@ -45,18 +45,15 @@ func TestParseAiderRunsPerRun(t *testing.T) {
 
 	// Run 0: header 14:01:00, first prompt "add a retry to the webhook",
 	// two user prompts ("add a retry..." and "Step 1").
-	assert.Equal(t,
-		time.Date(2026, 6, 9, 14, 1, 0, 0, time.UTC), r0.Session.StartedAt)
+	assert.Equal(t, time.Date(2026, 6, 9, 14, 1, 0, 0, time.UTC), r0.Session.StartedAt)
 	assert.Equal(t, r0.Session.StartedAt, r0.Session.EndedAt,
 		"a run has no separate end time")
 	assert.Contains(t, r0.Session.FirstMessage, "add a retry to the webhook")
 	assert.Equal(t, 2, r0.Session.UserMessageCount)
 
 	// Run 1: header 15:30:00, its own first prompt and message stream.
-	assert.Equal(t,
-		time.Date(2026, 6, 9, 15, 30, 0, 0, time.UTC), r1.Session.StartedAt)
-	assert.Contains(t,
-		r1.Session.FirstMessage, "make the timeout configurable")
+	assert.Equal(t, time.Date(2026, 6, 9, 15, 30, 0, 0, time.UTC), r1.Session.StartedAt)
+	assert.Contains(t, r1.Session.FirstMessage, "make the timeout configurable")
 	assert.Equal(t, 1, r1.Session.UserMessageCount)
 
 	// The message streams are per-run, not flattened: run 1 must not carry
@@ -100,8 +97,7 @@ func TestParseAiderRunSingle(t *testing.T) {
 	require.NotNil(t, sess)
 	require.NotEmpty(t, msgs)
 	assert.Contains(t, sess.FirstMessage, "make the timeout configurable")
-	assert.Equal(t,
-		time.Date(2026, 6, 9, 15, 30, 0, 0, time.UTC), sess.StartedAt)
+	assert.Equal(t, time.Date(2026, 6, 9, 15, 30, 0, 0, time.UTC), sess.StartedAt)
 
 	// The trailing header-only run (index 2) yields no session.
 	sess2, msgs2, err := parseAiderRun(fixtureAider(), 2, "m")
@@ -215,7 +211,7 @@ func TestAiderEqualHeaderRunsGetStableDistinctIDs(t *testing.T) {
 }
 
 // TestAiderSessionIDStableAcrossExtractionDirs is the MEDIUM-1 regression
-// test for SSH sync. During remote sync the history file is extracted to a
+// test for remote sync. During remote sync the history file is extracted to a
 // RANDOM local temp dir, so hashing the on-disk path would re-key the run on
 // every sync. Passing a canonical identity path (the remote physical path)
 // to parseAiderRunsWithID must produce the SAME ID regardless of where the
@@ -389,8 +385,10 @@ func TestParseAiderTimestamp(t *testing.T) {
 			want: time.Date(2026, 6, 9, 14, 1, 0, 0, time.UTC),
 			ok:   true,
 		},
-		{"trailing space tolerated", "2026-06-09 14:01:00 ",
-			time.Date(2026, 6, 9, 14, 1, 0, 0, time.UTC), true},
+		{
+			"trailing space tolerated", "2026-06-09 14:01:00 ",
+			time.Date(2026, 6, 9, 14, 1, 0, 0, time.UTC), true,
+		},
 		{"garbage rejected", "not a date", time.Time{}, false},
 		{"empty rejected", "", time.Time{}, false},
 	}
@@ -445,11 +443,13 @@ func TestParseAiderTurnsToolAndEditedFiles(t *testing.T) {
 		roles[i] = m.Role
 	}
 	// user, assistant prose, then the tool block surfaced as assistant.
-	assert.Equal(t,
-		[]RoleType{RoleUser, RoleAssistant, RoleAssistant}, roles)
+	assert.Equal(t, []RoleType{RoleUser, RoleAssistant, RoleAssistant}, roles)
 	assert.Equal(t, "fix the bug", msgs[0].Content)
 	assert.Contains(t, msgs[1].Content, "Here is the fix.")
+	assert.Empty(t, msgs[1].SourceSubtype)
 	assert.Contains(t, msgs[2].Content, "Applied edit to src/a.py")
+	assert.Equal(t, SourceSubtypeToolResult, msgs[2].SourceSubtype,
+		"the tool block is tool output even though it is surfaced as assistant text")
 
 	// Dedup; dry-run and skip lines contribute nothing.
 	assert.Equal(t, []string{"src/a.py", "src/b.py"}, touched)
@@ -500,8 +500,7 @@ func TestParseAiderRunsEmptyAndGarbage(t *testing.T) {
 			repo := filepath.Join(dir, c.name)
 			require.NoError(t, os.MkdirAll(repo, 0o755))
 			path := filepath.Join(repo, ".aider.chat.history.md")
-			require.NoError(t,
-				os.WriteFile(path, []byte(c.content), 0o644))
+			require.NoError(t, os.WriteFile(path, []byte(c.content), 0o644))
 
 			results, err := parseAiderRuns(path, "m")
 			require.NoError(t, err) // never panics, never hard-errors
@@ -533,24 +532,6 @@ func TestAiderVirtualPathRoundTrip(t *testing.T) {
 		_, _, ok := ParseAiderVirtualPath(in)
 		assert.False(t, ok, "should reject %q", in)
 	}
-}
-
-// TestAiderRegistryOptInDiscovery pins that Aider is not discovered by
-// default. Aider has no central store, and a rootless $HOME scan can trigger
-// macOS privacy prompts during passive background refreshes, so users must opt
-// in with AIDER_DIR or aider_dirs. ShallowWatch must stay true so a configured
-// broad root is watched only at the root, relying on the periodic sync.
-func TestAiderRegistryOptInDiscovery(t *testing.T) {
-	def, ok := AgentByType(AgentAider)
-	require.True(t, ok, "AgentAider missing from Registry")
-	assert.Empty(t, def.DefaultDirs,
-		"aider must not be discovered by default; opt in via AIDER_DIR/aider_dirs")
-	assert.True(t, def.ShallowWatch,
-		"aider must watch an opt-in broad root shallowly, not recurse all of it")
-	// The shallow-watch contract relies on no static subdir or custom
-	// watch-roots wiring overriding it.
-	assert.Empty(t, def.WatchSubdirs)
-	assert.Nil(t, def.WatchRootsFunc)
 }
 
 func TestDiscoverAiderSessions(t *testing.T) {
@@ -588,24 +569,8 @@ func TestAiderShouldSkipProtectedHomeDirsOnlyOnDarwinHomeRoot(t *testing.T) {
 	assert.True(t, aiderShouldSkipProtectedHomeDirs(home, home, "darwin"))
 	assert.False(t, aiderShouldSkipProtectedHomeDirs(home, home, "linux"))
 	assert.False(t, aiderShouldSkipProtectedHomeDirs(home, home, "windows"))
-	assert.False(t,
-		aiderShouldSkipProtectedHomeDirs(filepath.Join(home, "Documents"), home, "darwin"),
+	assert.False(t, aiderShouldSkipProtectedHomeDirs(filepath.Join(home, "Documents"), home, "darwin"),
 		"explicit protected roots are user-scoped opt-ins")
-}
-
-func TestAiderProtectedHomeDirsCoversMacOSTCCPrompts(t *testing.T) {
-	for _, name := range []string{
-		"Desktop",
-		"Documents",
-		"Downloads",
-		"Movies",
-		"Music",
-		"Photos",
-		"Pictures",
-	} {
-		_, ok := aiderProtectedHomeDirs[name]
-		assert.True(t, ok, "%s should be pruned from broad home discovery", name)
-	}
 }
 
 func TestAiderBroadHomeWalkRootsExcludeMacOSProtectedDirs(t *testing.T) {

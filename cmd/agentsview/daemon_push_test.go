@@ -1,15 +1,22 @@
 package main
 
 import (
-	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/apiclient"
+	"go.kenn.io/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 func TestParseDaemonPushSSE(t *testing.T) {
@@ -22,10 +29,9 @@ func TestParseDaemonPushSSE(t *testing.T) {
 		`data: {"SessionsPushed":10,"MessagesPushed":42}` + "\n\n"
 
 	t.Run("progress then done", func(t *testing.T) {
-		var progress []postgres.PushProgress
-		result, err := parseDaemonPushSSE[postgres.PushResult](
-			strings.NewReader(stream(progressEvent, doneEvent)),
-			func(p postgres.PushProgress) { progress = append(progress, p) },
+		var progress []storage.PushProgress
+		result, err := consumeDaemonPushEvents[storage.PushResult](daemonEventStream(strings.NewReader(stream(progressEvent, doneEvent))),
+			func(p storage.PushProgress) { progress = append(progress, p) },
 		)
 		require.NoError(t, err)
 		assert.Equal(t, 10, result.SessionsPushed)
@@ -36,28 +42,60 @@ func TestParseDaemonPushSSE(t *testing.T) {
 	})
 
 	t.Run("nil onProgress is safe", func(t *testing.T) {
-		result, err := parseDaemonPushSSE[postgres.PushResult, postgres.PushProgress](
-			strings.NewReader(stream(progressEvent, doneEvent)), nil,
-		)
+		result, err := consumeDaemonPushEvents[storage.PushResult, storage.PushProgress](daemonEventStream(strings.NewReader(stream(progressEvent, doneEvent))), nil)
 		require.NoError(t, err)
 		assert.Equal(t, 10, result.SessionsPushed)
 	})
 
 	t.Run("error event fails the push", func(t *testing.T) {
 		errEvent := "event: error\n" + `data: {"error":"schema: boom"}` + "\n\n"
-		_, err := parseDaemonPushSSE[postgres.PushResult, postgres.PushProgress](
-			strings.NewReader(stream(progressEvent, errEvent)), nil,
-		)
+		_, err := consumeDaemonPushEvents[storage.PushResult, storage.PushProgress](daemonEventStream(strings.NewReader(stream(progressEvent, errEvent))), nil)
 		require.Error(t, err)
 		assert.Equal(t, "schema: boom", err.Error())
 	})
 
 	t.Run("stream without done event fails", func(t *testing.T) {
-		_, err := parseDaemonPushSSE[postgres.PushResult, postgres.PushProgress](
-			strings.NewReader(stream(progressEvent)), nil,
-		)
+		_, err := consumeDaemonPushEvents[storage.PushResult, storage.PushProgress](daemonEventStream(strings.NewReader(stream(progressEvent))), nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "missing done event")
+	})
+
+	// A dropped stream keeps a --full request unless the daemon rebuilt the
+	// archive, after which every mirror pushes in full.
+	t.Run("stream that ends tells whether the archive was rebuilt", func(t *testing.T) {
+		waitingEvent := "event: progress\n" + `data: {"Phase":"waiting"}` + "\n\n"
+		rebuiltEvent := "event: progress\n" + `data: {"Phase":"rebuilt"}` + "\n\n"
+		for _, tt := range []struct {
+			name    string
+			events  []string
+			started bool
+		}{
+			{"while waiting", []string{waitingEvent}, false},
+			{"during a copy", []string{waitingEvent, progressEvent}, false},
+			{"after a rebuild", []string{waitingEvent, rebuiltEvent, progressEvent}, true},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := consumeDaemonPushEvents[storage.PushResult, storage.PushProgress](
+					daemonEventStream(strings.NewReader(stream(tt.events...))), nil,
+				)
+				require.ErrorContains(t, err, "missing done event")
+				_, notStarted := errors.AsType[storage.PushNotStartedError](err)
+				assert.Equal(t, tt.started, !notStarted)
+			})
+		}
+	})
+
+	t.Run("terminal report can exceed ten mebibytes", func(t *testing.T) {
+		type largeReport struct {
+			ProjectMetadata string `json:"project_metadata"`
+		}
+		metadata := strings.Repeat("x", 10*1024*1024+1)
+		reportEvent := "event: report\ndata: {\"project_metadata\":\"" +
+			metadata + "\"}\n\n"
+
+		result, err := consumeDaemonPushEvents[largeReport, struct{}](daemonEventStream(strings.NewReader(reportEvent)), nil)
+		require.NoError(t, err)
+		assert.Equal(t, metadata, result.ProjectMetadata)
 	})
 }
 
@@ -67,8 +105,8 @@ func TestParseDaemonPushSSE(t *testing.T) {
 func TestPostDaemonPushConsumesSSE(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			require.Equal(t, "/api/v1/push/pg", r.URL.Path)
-			require.Contains(t, r.Header.Get("Accept"), "text/event-stream")
+			assert.Equal(t, "/api/v1/push/pg", r.URL.Path)
+			assert.Contains(t, r.Header.Get("Accept"), "text/event-stream")
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte(
 				"event: progress\ndata: {\"SessionsDone\":1,\"SessionsTotal\":2}\n\n" +
@@ -76,11 +114,11 @@ func TestPostDaemonPushConsumesSSE(t *testing.T) {
 		}))
 	t.Cleanup(ts.Close)
 
-	var progress []postgres.PushProgress
-	result, err := postDaemonPush[postgres.PushResult](
-		context.Background(), transport{URL: ts.URL}, "", "/api/v1/push/pg",
-		daemonPushRequest{},
-		func(p postgres.PushProgress) { progress = append(progress, p) },
+	var progress []storage.PushProgress
+	result, err := postDaemonPush[storage.PushResult](
+		t.Context(), transport{URL: ts.URL}, "", replicaPushOperations["pg"],
+		apiclient.DaemonPushRequest{},
+		func(p storage.PushProgress) { progress = append(progress, p) },
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.SessionsPushed)
@@ -98,10 +136,131 @@ func TestPostDaemonPushJSONFallback(t *testing.T) {
 		}))
 	t.Cleanup(ts.Close)
 
-	result, err := postDaemonPush[postgres.PushResult, postgres.PushProgress](
-		context.Background(), transport{URL: ts.URL}, "", "/api/v1/push/pg",
-		daemonPushRequest{}, nil,
+	result, err := postDaemonPush[storage.PushResult, storage.PushProgress](
+		t.Context(), transport{URL: ts.URL}, "", replicaPushOperations["pg"],
+		apiclient.DaemonPushRequest{}, nil,
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 7, result.SessionsPushed)
+}
+
+func TestDaemonPushWatchTransportRetriesWithoutScopeForOlderSchema(t *testing.T) {
+	attempts := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var body map[string]jsontext.Value
+		if !assert.NoError(t, json.UnmarshalRead(r.Body, &body)) {
+			return
+		}
+		if attempts == 1 {
+			assert.Contains(t, body, "watch_batch")
+			assert.Contains(t, body, "watch_recovery")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(
+				`{"errors":[{"location":"body.watch_batch","message":"unexpected property"}]}`,
+			))
+			return
+		}
+		assert.NotContains(t, body, "watch_batch")
+		assert.NotContains(t, body, "watch_recovery")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"SessionsPushed":1}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	batch := apiclient.SyncWatchBatch{Paths: []string{"/sessions/changed.jsonl"}}
+	recovery := apiclient.SyncWatchRecoveryScope{
+		AvailableRoots: []string{"/sessions"},
+		DeferredRoots:  []string{"/offline"},
+	}
+	result, err := postDaemonPush[storage.PushResult, storage.PushProgress](
+		t.Context(), transport{URL: ts.URL}, "", replicaPushOperations["pg"],
+		apiclient.DaemonPushRequest{WatchBatch: &batch, WatchRecovery: &recovery}, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.SessionsPushed)
+	assert.Equal(t, 2, attempts)
+}
+
+func TestDaemonPushWatchTransportOmitsScopeForKnownOlderDaemon(t *testing.T) {
+	attempts := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		var body map[string]jsontext.Value
+		if !assert.NoError(t, json.UnmarshalRead(r.Body, &body)) {
+			return
+		}
+		assert.NotContains(t, body, "watch_batch")
+		assert.NotContains(t, body, "watch_recovery")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"SessionsPushed":1}`))
+	}))
+	t.Cleanup(ts.Close)
+
+	batch := apiclient.SyncWatchBatch{Paths: []string{"/sessions/changed.jsonl"}}
+	result, err := postDaemonPush[storage.PushResult, storage.PushProgress](
+		t.Context(), transport{
+			URL: ts.URL,
+			Runtime: &DaemonRuntime{
+				API: server.ScopedWatchPushAPIVersion - 1,
+			},
+		}, "", replicaPushOperations["pg"],
+		apiclient.DaemonPushRequest{WatchBatch: &batch}, nil,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.SessionsPushed)
+	assert.Equal(t, 1, attempts)
+}
+
+func daemonEventStream(body io.Reader) *runtime.Stream[[]byte] {
+	return runtime.NewEventStream[[]byte](&http.Response{Body: io.NopCloser(body)})
+}
+
+// A push the daemon refused, never received, or reports as not started
+// leaves nothing to resume, so a push watch keeps its --full request for the
+// retry. An error from an older daemon that accepted the push may come from a
+// push that already started.
+func TestPostDaemonPushReportsWhetherThePushStarted(t *testing.T) {
+	serve := func(handler http.HandlerFunc) string {
+		ts := httptest.NewServer(handler)
+		t.Cleanup(ts.Close)
+		return ts.URL
+	}
+	streamError := func(data string) string {
+		return serve(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("event: error\ndata: " + data + "\n\n"))
+		})
+	}
+	unreachable := httptest.NewServer(http.NotFoundHandler())
+	unreachable.Close()
+
+	for _, tt := range []struct {
+		name    string
+		url     string
+		started bool
+	}{
+		{"daemon refused", serve(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}), false},
+		{"daemon unreachable", unreachable.URL, false},
+		{"older daemon streamed an error", streamError(`{"error":"push: conn reset"}`), true},
+		{"pre-push resync failed", streamError(
+			`{"error":"resync failed","push_started":false}`), false},
+		{"copy failed without a stream", serve(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"push: conn reset","push_started":true}`))
+		}), true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := postDaemonPush[storage.PushResult, storage.PushProgress](
+				t.Context(), transport{URL: tt.url}, "", replicaPushOperations["pg"],
+				apiclient.DaemonPushRequest{}, nil,
+			)
+			require.Error(t, err)
+			_, notStarted := errors.AsType[storage.PushNotStartedError](err)
+			assert.Equal(t, !tt.started, notStarted)
+		})
+	}
 }

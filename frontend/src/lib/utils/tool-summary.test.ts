@@ -1,18 +1,24 @@
-// ABOUTME: Table-driven unit tests for summarizeToolCall.
+// ABOUTME: Table-driven unit tests for summarizeToolCall and summarizeToolInputPreview.
 import { describe, it, expect } from "vite-plus/test";
-import type { ToolCall } from "../api/types.js";
-import { summarizeToolCall } from "./tool-summary.js";
+import type { DbToolCall as ToolCall } from "../api/generated/index.js";
+import {
+  summarizeToolCall,
+  summarizeToolCallPath,
+  summarizeToolInputPreview,
+} from "./tool-summary.js";
 
 function call(partial: Partial<ToolCall>): ToolCall {
-  return { tool_name: "Tool", ...partial };
+  return {
+    category: "",
+    tool_name: "Tool",
+    ...partial,
+  };
 }
 
 describe("summarizeToolCall", () => {
   it("returns null for malformed input_json", () => {
     expect(
-      summarizeToolCall(
-        call({ tool_name: "Read", category: "Read", input_json: "{not json" }),
-      ),
+      summarizeToolCall(call({ tool_name: "Read", category: "Read", input_json: "{not json" })),
     ).toBeNull();
   });
 
@@ -23,7 +29,11 @@ describe("summarizeToolCall", () => {
   it("returns null when no structured fields are present", () => {
     expect(
       summarizeToolCall(
-        call({ tool_name: "mystery", input_json: JSON.stringify({ foo: 1 }) }),
+        call({
+          category: "",
+          tool_name: "mystery",
+          input_json: JSON.stringify({ foo: 1 }),
+        }),
       ),
     ).toBeNull();
   });
@@ -344,6 +354,68 @@ describe("summarizeToolCall", () => {
         ),
       ).toBe("TODO");
     });
+
+    it.each([
+      ["Found 1 file\nsrc/a.go", "TODO (1 files)"],
+      ["Found 2 files\nsrc/a.go\nsrc/b.go", "TODO (2 files)"],
+      ["Found 2 files limit: 2, offset: 0\nsrc/a.go\nsrc/b.go", "TODO (2 files)"],
+    ])("reads the file total from files_with_matches output %j", (result_content, expected) => {
+      expect(
+        summarizeToolCall(
+          call({
+            tool_name: "Grep",
+            category: "Grep",
+            input_json: JSON.stringify({ pattern: "TODO" }),
+            result_content,
+          }),
+        ),
+      ).toBe(expected);
+    });
+
+    it("reads the match total from OpenCode output", () => {
+      expect(
+        summarizeToolCall(
+          call({
+            tool_name: "grep",
+            category: "Grep",
+            input_json: JSON.stringify({ pattern: "TODO" }),
+            result_content:
+              "Found 2 matches\n/repo/a.go:\n  Line 1: TODO\n\n/repo/b.go:\n  Line 7: TODO",
+          }),
+        ),
+      ).toBe("TODO (2 matches)");
+    });
+
+    it("leaves the pagination note out of the count", () => {
+      expect(
+        summarizeToolCall(
+          call({
+            tool_name: "Grep",
+            category: "Grep",
+            input_json: JSON.stringify({ pattern: "TODO", output_mode: "content", head_limit: 2 }),
+            result_content:
+              "a.go:1:TODO\nb.go:2:TODO\n\n[Showing results with pagination = limit: 2, offset: 0]",
+          }),
+        ),
+      ).toBe("TODO (2 matches)");
+    });
+
+    it.each([
+      "No files found",
+      "No matches found",
+      "No matches found\n\n[Showing results with pagination = limit: 15, offset: 0]",
+    ])("omits the count for the empty reply %j", (result_content) => {
+      expect(
+        summarizeToolCall(
+          call({
+            tool_name: "Grep",
+            category: "Grep",
+            input_json: JSON.stringify({ pattern: "TODO" }),
+            result_content,
+          }),
+        ),
+      ).toBe("TODO");
+    });
   });
 
   describe("Glob", () => {
@@ -372,6 +444,19 @@ describe("summarizeToolCall", () => {
         ),
       ).toBe("**/*.ts");
     });
+
+    it("omits the count when no files are found", () => {
+      expect(
+        summarizeToolCall(
+          call({
+            tool_name: "Glob",
+            category: "Glob",
+            input_json: JSON.stringify({ pattern: "**/*.ts" }),
+            result_content: "No files found",
+          }),
+        ),
+      ).toBe("**/*.ts");
+    });
   });
 
   describe("special tools", () => {
@@ -379,6 +464,7 @@ describe("summarizeToolCall", () => {
       expect(
         summarizeToolCall(
           call({
+            category: "",
             tool_name: "TodoWrite",
             input_json: JSON.stringify({
               todos: [
@@ -395,6 +481,7 @@ describe("summarizeToolCall", () => {
       expect(
         summarizeToolCall(
           call({
+            category: "",
             tool_name: "TodoWrite",
             input_json: JSON.stringify({
               todos: [
@@ -411,6 +498,7 @@ describe("summarizeToolCall", () => {
       expect(
         summarizeToolCall(
           call({
+            category: "",
             tool_name: "TaskUpdate",
             input_json: JSON.stringify({
               taskId: 29,
@@ -426,6 +514,7 @@ describe("summarizeToolCall", () => {
       expect(
         summarizeToolCall(
           call({
+            category: "",
             tool_name: "Skill",
             input_json: JSON.stringify({ skill: "review-branch" }),
           }),
@@ -461,5 +550,103 @@ describe("summarizeToolCall", () => {
         ),
       ).toBe("/etc/hosts");
     });
+
+    it("uses a trailing display form for long absolute paths", () => {
+      const path =
+        "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte";
+      expect(
+        summarizeToolCall(
+          call({
+            tool_name: "custom",
+            category: "Other",
+            input_json: JSON.stringify({ file_path: path }),
+          }),
+        ),
+      ).toBe("content/ToolBlock.svelte");
+    });
+
+    it("does not title a Grep summary from its path argument", () => {
+      expect(
+        summarizeToolCallPath(
+          call({
+            tool_name: "Grep",
+            category: "Grep",
+            input_json: JSON.stringify({ pattern: "TODO", path: "/workspace/packages/agentsview" }),
+          }),
+        ),
+      ).toBeNull();
+    });
+
+    it("does not title special summaries from path-like extra fields", () => {
+      for (const tool_name of ["Task", "Skill", "TodoWrite"]) {
+        expect(
+          summarizeToolCallPath(
+            call({
+              tool_name,
+              category: tool_name === "Task" ? "Task" : undefined,
+              input_json: JSON.stringify({
+                path: "/workspace/packages/agentsview/frontend/src/lib/components/content/ToolBlock.svelte",
+                description: "Inspect the task",
+                skill: "review-branch",
+                todos: [{ content: "Inspect the task", status: "in_progress" }],
+              }),
+            }),
+          ),
+        ).toBeNull();
+      }
+    });
+
+    it("caps long relative path summaries", () => {
+      const path = "src/" + "nested/".repeat(30) + "file.ts";
+      expect(
+        summarizeToolCall(
+          call({
+            tool_name: "Read",
+            category: "Read",
+            input_json: JSON.stringify({ file_path: path }),
+          }),
+        ),
+      ).toBe(path.slice(0, 100) + "…");
+    });
+
+    it("preserves short and root-marked absolute paths", () => {
+      for (const path of [
+        "/" + "a".repeat(90),
+        "C:\\" + "a".repeat(85),
+        "\\\\server\\share\\" + "a".repeat(75),
+      ]) {
+        expect(
+          summarizeToolCall(
+            call({
+              tool_name: "Read",
+              category: "Read",
+              input_json: JSON.stringify({ file_path: path }),
+            }),
+          ),
+        ).toBe(path);
+      }
+    });
+  });
+});
+
+describe("summarizeToolInputPreview", () => {
+  it("prefers the command over other arguments", () => {
+    expect(
+      summarizeToolInputPreview(JSON.stringify({ description: "list", command: "ls -la\npwd" })),
+    ).toBe("ls -la");
+  });
+
+  it("reads the search pattern from JSON cut mid-string", () => {
+    expect(summarizeToolInputPreview('{"pattern": "load\\"Config", "path": "/very/long')).toBe(
+      'load"Config',
+    );
+  });
+
+  it("keeps the raw text of a value cut mid-escape", () => {
+    expect(summarizeToolInputPreview(String.raw`{"query": "a\u00`)).toBe(String.raw`a\u00`);
+  });
+
+  it("falls back to the collapsed preview", () => {
+    expect(summarizeToolInputPreview('{"other":\n  1')).toBe('{"other": 1');
   });
 });

@@ -7,6 +7,24 @@
   padding: 0;
 }
 
+/* Keep fixed overlay shells in viewport coordinates; scale their contents
+ * with the interface. kit-ui measures shell dimensions when positioning. */
+.kit-typeahead__panel,
+.kit-select-dropdown__list,
+.kit-filter-dropdown__panel,
+.kit-date-range-picker__panel,
+.kit-mention__menu,
+.context-menu,
+.tooltip {
+  zoom: var(--agentsview-zoom-compensation, 1);
+
+  /* ponytail: DateRangePicker fixes its shell at 360px; keep its current
+   * scale until kit-ui sizes and positions that shell for zoom. */
+  &:not(.kit-date-range-picker__panel) > * {
+    zoom: calc(1 / var(--agentsview-zoom-compensation, 1));
+  }
+}
+
 /*
  * Shared design tokens (backgrounds, text, borders, the core accent set,
  * shadows, radii, fonts, type scale, spacing ladder, chrome heights, and the
@@ -54,11 +72,11 @@
   --accent-cyan-foreground: #07111f; /* kit-ui-check-ignore: app token definition */
   --accent-violet-foreground: #ffffff; /* kit-ui-check-ignore: app token definition */
   /* Tool-category color map (see internal/parser/taxonomy.go for normalized values) */
-  --cat-read:  #4a7ba8; /* Read, Grep, Glob */ /* kit-ui-check-ignore: app token definition */
-  --cat-edit:  #5a8b3a; /* Edit, Write */ /* kit-ui-check-ignore: app token definition */
-  --cat-bash:  #d4a35a; /* Bash */ /* kit-ui-check-ignore: app token definition */
-  --cat-task:  #c45a5a; /* Task / sub-agents */ /* kit-ui-check-ignore: app token definition */
-  --cat-tool:  #7a5fa8; /* Tool: Skills, MCP, misc */ /* kit-ui-check-ignore: app token definition */
+  --cat-read: #4a7ba8; /* Read, Grep, Glob */ /* kit-ui-check-ignore: app token definition */
+  --cat-edit: #5a8b3a; /* Edit, Write */ /* kit-ui-check-ignore: app token definition */
+  --cat-bash: #d4a35a; /* Bash */ /* kit-ui-check-ignore: app token definition */
+  --cat-task: #c45a5a; /* Task / sub-agents */ /* kit-ui-check-ignore: app token definition */
+  --cat-tool: #7a5fa8; /* Tool: Skills, MCP, misc */ /* kit-ui-check-ignore: app token definition */
   --cat-other: #888888; /* Other */ /* kit-ui-check-ignore: app token definition */
   --cat-mixed: #4a4a4a; /* Mixed: parallel-group rail, no-dominant */ /* kit-ui-check-ignore: app token definition */
   /* Categorical chart series (skill trend and similar stacked charts).
@@ -73,9 +91,9 @@
   --chart-series-6: #e34948; /* kit-ui-check-ignore: app token definition */
   --chart-series-other: #898781; /* kit-ui-check-ignore: app token definition */
   /* Duration UX state colors */
-  --slow-fg:    #f29070; /* kit-ui-check-ignore: app token definition */
-  --slow-bg:    rgba(242, 144, 112, 0.12); /* kit-ui-check-ignore: app token definition */
-  --slow-ring:  rgba(242, 144, 112, 0.20); /* kit-ui-check-ignore: app token definition */
+  --slow-fg: #f29070; /* kit-ui-check-ignore: app token definition */
+  --slow-bg: rgba(242, 144, 112, 0.12); /* kit-ui-check-ignore: app token definition */
+  --slow-ring: rgba(242, 144, 112, 0.2); /* kit-ui-check-ignore: app token definition */
   --running-fg: #6ad0a8; /* kit-ui-check-ignore: app token definition */
   --running-bg: rgba(106, 208, 168, 0.12); /* kit-ui-check-ignore: app token definition */
   --running-ring: rgba(106, 208, 168, 0.22); /* kit-ui-check-ignore: app token definition */
@@ -86,6 +104,9 @@
   --code-bg: #1e1e2e; /* kit-ui-check-ignore: app token definition */
   --code-text: #cdd6f4; /* kit-ui-check-ignore: app token definition */
   --viewport-indicator: rgba(0, 0, 0, 0.08); /* kit-ui-check-ignore: app token definition */
+  /* How much a custom role color tints its message background. Mirrored
+     as ROLE_TINT in utils/messageColors.ts, which checks contrast. */
+  --message-role-tint: 8%;
 }
 
 /* Dark theme — app-specific tokens */
@@ -133,6 +154,54 @@
   --code-bg: #0d0d14; /* kit-ui-check-ignore: app token definition */
   --code-text: #cdd6f4; /* kit-ui-check-ignore: app token definition */
   --viewport-indicator: rgba(255, 255, 255, 0.08); /* kit-ui-check-ignore: app token definition */
+  --message-role-tint: 14%;
+}
+
+/*
+ * Message role colors. Each role has an accent (bar, icon fill), an
+ * accent foreground (icon letter), and an ink (label text). Defaults follow
+ * the theme accents in every mode. Settings > Appearance can override a
+ * role; stores/messageColors.svelte.ts then writes the role's tokens and its
+ * background token (--user-bg and so on) on the root element.
+ */
+:root {
+  --role-user-accent: var(--accent-blue);
+  --role-user-accent-foreground: var(--accent-blue-foreground);
+  --role-user-ink: var(--role-user-accent);
+  --role-assistant-accent: var(--accent-purple);
+  --role-assistant-accent-foreground: var(--accent-purple-foreground);
+  --role-assistant-ink: var(--role-assistant-accent);
+  --role-thinking-accent: var(--accent-purple);
+  --role-thinking-ink: var(--role-thinking-accent);
+  --role-tool-accent: var(--accent-amber);
+  --role-tool-ink: var(--role-tool-accent);
+  --role-code-accent: var(--code-bg);
+  --role-code-frame-width: 0px;
+  /* Bar line styles and widths. Pattern mode gives every role its own line
+     so the roles differ by shape as well as color. */
+  --role-user-bar-style: solid;
+  --role-user-bar-width: 4px;
+  --role-assistant-bar-style: solid;
+  --role-assistant-bar-width: 4px;
+  --role-thinking-bar-style: solid;
+  --role-thinking-bar-width: 2px;
+  --role-tool-bar-style: solid;
+  --role-tool-bar-width: 2px;
+  /* Parallel tool calls share one rail. It stays neutral until the reader
+     picks a tool color or turns on patterns. */
+  --role-tool-group-rail: var(--cat-mixed);
+  --role-code-frame-style: solid;
+}
+
+:root[data-message-role-patterns] {
+  --role-assistant-bar-style: double;
+  --role-assistant-bar-width: 6px;
+  --role-thinking-bar-style: dotted;
+  --role-thinking-bar-width: 3px;
+  --role-tool-bar-style: dashed;
+  --role-tool-bar-width: 3px;
+  --role-tool-group-rail: var(--role-tool-accent);
+  --role-code-frame-style: dashed;
 }
 
 html,
@@ -223,6 +292,17 @@ pre {
   word-wrap: break-word;
 }
 
+/* Literal XML uses the active app theme, independently of code fences. */
+pre.unknown-xml-block {
+  background: var(--bg-inset);
+  color: var(--text-primary);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  margin: 0.5em 0;
+  overflow-x: auto;
+}
+
 /* Mark tag (search highlights) */
 mark {
   background: var(--accent-amber);
@@ -231,22 +311,12 @@ mark {
   padding: 0 2px;
 }
 
-/* In-session find highlights */
-mark.search-highlight {
-  background: color-mix(in srgb, var(--accent-amber) 35%, transparent);
-  color: inherit;
-  border-radius: 2px;
-  padding: 0 1px;
-}
-
-mark.search-highlight--current {
-  background: var(--accent-amber);
-  color: var(--text-primary);
-  outline: 1px solid color-mix(in srgb, var(--accent-amber) 80%, var(--text-primary));
-  outline-offset: 1px;
-}
-
 @keyframes duration-pulse {
-  0%, 100% { opacity: 1; }
-  50%      { opacity: 0.55; }
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
 }

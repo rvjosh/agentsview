@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -20,12 +21,18 @@ func validateProviderOutcome(
 	for _, result := range outcome.Results {
 		session := result.Result.Session
 		if session.Agent != def.Type {
-			return fmt.Errorf(
-				"%s: provider result session agent mismatch for %q: got %s",
-				def.Type,
-				session.ID,
-				session.Agent,
-			)
+			// The Codebuff provider may emit Freebuff sessions based on
+			// the agentType field in run-state.json. Both agents share
+			// the same on-disk layout and are discovered by one provider.
+			if def.Type != parser.AgentCodebuff ||
+				session.Agent != parser.AgentFreebuff {
+				return fmt.Errorf(
+					"%s: provider result session agent mismatch for %q: got %s",
+					def.Type,
+					session.ID,
+					session.Agent,
+				)
+			}
 		}
 		if err := validateProviderParseResultSessionIDs(def, result.Result); err != nil {
 			return err
@@ -59,6 +66,75 @@ func validateProviderOutcome(
 	return nil
 }
 
+// providerResultAdmission is where a parse result becomes the engine's to
+// hold: admit runs the per-result publication gates as each result arrives,
+// keeping only members it will write plus every member's identity.
+type providerResultAdmission struct {
+	engine          *Engine
+	ctx             context.Context
+	def             parser.AgentDef
+	file            parser.DiscoveredFile
+	source          parser.SourceRef
+	fingerprint     parser.SourceFingerprint
+	policy          parser.UnchangedResultPolicy
+	codexIdentities bool
+
+	kept []parser.ParseResult
+	// emitted holds only Session.ID and Session.File.Path of every admitted result.
+	emitted                []parser.ParseResult
+	retryIDs               []string
+	firstHash              string
+	truncationVerifyFailed bool
+	validationErr          error
+}
+
+func (a *providerResultAdmission) admit(r parser.ParseResultOutcome) error {
+	if err := validateProviderOutcome(
+		a.def, a.source, a.fingerprint,
+		parser.ParseOutcome{Results: []parser.ParseResultOutcome{r}},
+	); err != nil {
+		a.validationErr = err
+		return err
+	}
+	if a.codexIdentities {
+		prepareCodexResultIdentities(r.Result.Messages, nil)
+	}
+	one := []parser.ParseResultOutcome{r}
+	applyProviderFingerprintFileInfo(a.file.Agent, a.fingerprint, one)
+	r = one[0]
+	if a.firstHash == "" {
+		a.firstHash = r.Result.Session.File.Hash
+	}
+	a.emitted = append(a.emitted, parser.ParseResult{Session: parser.ParsedSession{
+		ID:   r.Result.Session.ID,
+		File: parser.FileInfo{Path: r.Result.Session.File.Path},
+	}})
+	if r.DataVersion == parser.DataVersionNeedsRetry {
+		a.retryIDs = append(a.retryIDs, r.Result.Session.ID)
+	}
+	kept := a.engine.dropUnchangedSharedSQLiteResults(
+		a.ctx, a.file, []parser.ParseResult{r.Result}, a.policy,
+	)
+	kept, verifyFailed := a.engine.dropShrinkingTruncatedCursorIDEResults(a.ctx, a.file, kept)
+	a.truncationVerifyFailed = a.truncationVerifyFailed || verifyFailed
+	a.kept = append(a.kept, kept...)
+	if a.engine.parseAdmissionObserver != nil {
+		a.engine.parseAdmissionObserver(len(a.emitted), len(a.kept))
+	}
+	return nil
+}
+
+// admitAll admits every result of an already collected outcome in order.
+func (a *providerResultAdmission) admitAll(outcome parser.ParseOutcome) (parser.ParseOutcome, error) {
+	for _, r := range outcome.Results {
+		if err := a.admit(r); err != nil {
+			return parser.ParseOutcome{}, err
+		}
+	}
+	outcome.Results = nil
+	return outcome, nil
+}
+
 func validateProviderParseResultSessionIDs(def parser.AgentDef, result parser.ParseResult) error {
 	sessionIDs := []struct {
 		field string
@@ -69,6 +145,11 @@ func validateProviderParseResultSessionIDs(def parser.AgentDef, result parser.Pa
 	}
 	for _, sessionID := range sessionIDs {
 		if err := validateProviderSessionID(def, sessionID.id, sessionID.field); err != nil {
+			return err
+		}
+	}
+	if plan := result.Session.PlanUsage; plan != nil {
+		if err := validateProviderSessionID(def, plan.CountedUnder, "plan usage counted-under session id"); err != nil {
 			return err
 		}
 	}
@@ -102,6 +183,12 @@ func validateProviderSessionID(def parser.AgentDef, sessionID, field string) err
 		return nil
 	}
 	if strings.HasPrefix(sessionID, def.IDPrefix) {
+		return nil
+	}
+	// The Codebuff provider may emit Freebuff sessions whose IDs use
+	// the "freebuff:" prefix rather than the provider's "codebuff:" prefix.
+	if def.Type == parser.AgentCodebuff &&
+		strings.HasPrefix(sessionID, string(parser.AgentFreebuff)+":") {
 		return nil
 	}
 	return fmt.Errorf(

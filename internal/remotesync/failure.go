@@ -4,31 +4,61 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"syscall"
 )
 
-// FailureSummary maps an HTTP remote sync error to a short,
+// Transports outside this package classify their own errors through these
+// interfaces; remotesync cannot import them.
+type hostAvailabilityError interface {
+	error
+	HostUnavailable() bool
+}
+
+type failureSummaryError interface {
+	error
+	FailureSummary() string
+}
+
+type remoteRefusalError interface {
+	error
+	RemoteRefused() bool
+}
+
+// isRemoteRefusal reports a remote that understood the request and refused
+// it, which prepareMirror answers by retrying a delta as a full archive.
+func isRemoteRefusal(err error) bool {
+	if _, ok := errors.AsType[*StatusError](err); ok {
+		return true
+	}
+	refusal, ok := errors.AsType[remoteRefusalError](err)
+	return ok && refusal.RemoteRefused()
+}
+
+// FailureSummary maps a remote sync error to a short,
 // actionable message that is safe to surface through the API and
 // CLI. Raw errors can embed the full remote URL and response
 // bodies, so callers log the raw error locally and hand users this
 // summary instead. Unrecognized errors collapse to the generic
 // message rather than leaking their text.
 func FailureSummary(err error) string {
-	const generic = "HTTP remote sync failed"
+	const generic = "remote sync failed"
 	if err == nil {
 		return generic
 	}
-	var pending *PendingCleanupError
-	if errors.As(err, &pending) {
-		return "HTTP remote sync blocked: cleanup from an earlier sync " +
+	if _, ok := errors.AsType[*PendingCleanupError](err); ok {
+		return "remote sync blocked: cleanup from an earlier sync " +
 			"still owns resources"
 	}
+	if summary, ok := errors.AsType[failureSummaryError](err); ok {
+		return summary.FailureSummary()
+	}
 
-	var statusErr *StatusError
-	if errors.As(err, &statusErr) {
+	if statusErr, ok := errors.AsType[*StatusError](err); ok {
 		// statusLabel derives the display text locally from the
 		// numeric code: the response status line (and Detail) are
 		// remote-controlled and must never reach the summary.
@@ -46,12 +76,19 @@ func FailureSummary(err error) string {
 					"remote-sync endpoints (%s); upgrade agentsview on "+
 					"the remote host", statusLabel(statusErr.Code),
 			)
+		case http.StatusUpgradeRequired:
+			return "HTTP remote sync failed: collector and remote daemon use " +
+				"incompatible remote-sync protocol versions; upgrade agentsview " +
+				"on both hosts"
 		default:
-			return fmt.Sprintf(
-				"HTTP remote sync failed: remote daemon returned %s",
-				statusLabel(statusErr.Code),
-			)
+			return "HTTP remote sync failed: remote daemon returned " + statusLabel(statusErr.Code)
 		}
+	}
+
+	if _, ok := errors.AsType[*IncompatibleProtocolError](err); ok {
+		return "HTTP remote sync failed: collector and remote daemon use " +
+			"incompatible remote-sync protocol versions; upgrade agentsview " +
+			"on both hosts"
 	}
 
 	if errors.Is(err, syscall.ECONNREFUSED) {
@@ -61,20 +98,74 @@ func FailureSummary(err error) string {
 			"config.toml), and that the url port matches"
 	}
 
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
 		return "HTTP remote sync failed: cannot resolve the remote " +
 			"host name; check the url in this [[remote_hosts]] entry"
 	}
 
-	var netErr net.Error
+	netErr, hasNetErr := errors.AsType[net.Error](err)
 	if errors.Is(err, context.DeadlineExceeded) ||
-		(errors.As(err, &netErr) && netErr.Timeout()) {
+		(hasNetErr && netErr.Timeout()) {
 		return "HTTP remote sync failed: connection timed out; check " +
 			"that the remote host is reachable and the url is correct"
 	}
 
 	return generic
+}
+
+// IsHostUnavailable reports transport failures that mean the configured
+// remote cannot currently be reached. Callers use this to treat optional fleet
+// members as absent while preserving authentication, protocol, response, and
+// import failures as actionable errors.
+func IsHostUnavailable(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if _, ok := errors.AsType[*PendingCleanupError](err); ok {
+		return false
+	}
+	if _, ok := errors.AsType[interface {
+		error
+		cleanupRetrier
+	}](err); ok {
+		return false
+	}
+	if availability, ok := errors.AsType[hostAvailabilityError](err); ok {
+		return availability.HostUnavailable()
+	}
+	// Private-network names may stop resolving while the network is offline.
+	// Treat this like an unreachable host so other sources can still sync.
+	if _, ok := errors.AsType[*net.DNSError](err); ok {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ETIMEDOUT) ||
+		errors.Is(err, syscall.EHOSTUNREACH) ||
+		errors.Is(err, syscall.ENETUNREACH) {
+		return true
+	}
+	if errors.Is(err, io.EOF) {
+		if _, ok := errors.AsType[*url.Error](err); ok {
+			return true
+		}
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		if _, ok := errors.AsType[*url.Error](err); ok {
+			return true
+		}
+		if _, ok := errors.AsType[*httpBodyReadError](err); ok {
+			return true
+		}
+	}
+	netErr, hasNetErr := errors.AsType[net.Error](err)
+	if !hasNetErr || netErr == nil {
+		return false
+	}
+	return netErr.Timeout()
 }
 
 // statusLabel renders an HTTP status for user-facing messages using

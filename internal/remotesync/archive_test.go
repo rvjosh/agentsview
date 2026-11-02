@@ -16,6 +16,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
@@ -29,7 +30,7 @@ func TestWriteArchivePreservesRootRelativePathAndMTime(t *testing.T) {
 	require.NoError(t, os.Chtimes(path, wantMTime, wantMTime))
 
 	var buf bytes.Buffer
-	err := WriteArchive(&buf, TargetSet{
+	err := WriteArchive(t.Context(), &buf, TargetSet{
 		Dirs: map[parser.AgentType][]string{parser.AgentClaude: {dir}},
 	})
 	require.NoError(t, err)
@@ -60,7 +61,7 @@ func TestWriteArchiveDoesNotFollowSymlink(t *testing.T) {
 	require.NoError(t, os.Symlink(target, link))
 
 	var buf bytes.Buffer
-	require.NoError(t, WriteArchive(&buf, TargetSet{
+	require.NoError(t, WriteArchive(t.Context(), &buf, TargetSet{
 		Dirs: map[parser.AgentType][]string{parser.AgentClaude: {dir}},
 	}))
 
@@ -83,7 +84,7 @@ func TestWriteArchiveIgnoresBytesAppendedAfterHeader(t *testing.T) {
 	writer := newBlockAfterFirstTarHeaderWriter()
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- WriteArchive(writer, TargetSet{
+		errCh <- WriteArchive(t.Context(), writer, TargetSet{
 			ExtraFiles: []string{path},
 		})
 	}()
@@ -113,7 +114,7 @@ func TestWriteArchiveToleratesMissingExtraFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("body"), 0o644))
 
 	var buf bytes.Buffer
-	require.NoError(t, WriteArchive(&buf, TargetSet{
+	require.NoError(t, WriteArchive(t.Context(), &buf, TargetSet{
 		ExtraFiles: []string{path, missing},
 	}))
 	archiveBytes := slices.Clone(buf.Bytes())
@@ -125,7 +126,7 @@ func TestWriteArchiveToleratesMissingExtraFile(t *testing.T) {
 	_, err = io.ReadAll(tr)
 	require.NoError(t, err)
 	_, err = tr.Next()
-	assert.ErrorIs(t, err, io.EOF)
+	require.ErrorIs(t, err, io.EOF)
 	assert.True(t, hasTarEndMarker(archiveBytes))
 }
 
@@ -138,7 +139,7 @@ func TestWriteArchiveSkipsDirectoryValuedExtraFile(t *testing.T) {
 	))
 
 	var buf bytes.Buffer
-	require.NoError(t, WriteArchive(&buf, TargetSet{
+	require.NoError(t, WriteArchive(t.Context(), &buf, TargetSet{
 		ExtraFiles: []string{extraDir},
 	}))
 
@@ -146,15 +147,16 @@ func TestWriteArchiveSkipsDirectoryValuedExtraFile(t *testing.T) {
 	assert.ErrorIs(t, err, io.EOF)
 }
 
-func TestHermesArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
+func TestArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
 	tests := []struct {
-		name  string
-		write func(io.Writer, string) error
+		name        string
+		antigravity bool
+		write       func(io.Writer, string) error
 	}{
 		{
 			name: "full archive",
 			write: func(w io.Writer, stateDB string) error {
-				return WriteArchive(w, TargetSet{
+				return WriteArchive(t.Context(), w, TargetSet{
 					Dirs: map[parser.AgentType][]string{
 						parser.AgentHermes: {stateDB},
 					},
@@ -172,7 +174,19 @@ func TestHermesArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
 					},
 					ExtraFiles: hermesTestSidecars(stateDB),
 				}
-				return WriteArchiveFiles(w, allowed, []string{stateDB, wal})
+				return WriteArchiveFiles(t.Context(), w, allowed, []string{stateDB, wal})
+			},
+		},
+		{
+			name: "Antigravity full archive", antigravity: true,
+			write: func(w io.Writer, stateDB string) error {
+				return WriteArchive(t.Context(), w, TargetSet{Dirs: map[parser.AgentType][]string{parser.AgentAntigravity: {filepath.Dir(stateDB)}}})
+			},
+		},
+		{
+			name: "Antigravity WAL-only delta", antigravity: true,
+			write: func(w io.Writer, stateDB string) error {
+				return WriteArchiveFiles(t.Context(), w, TargetSet{Dirs: map[parser.AgentType][]string{parser.AgentAntigravity: {filepath.Dir(stateDB)}}}, []string{stateDB + "-wal"})
 			},
 		},
 	}
@@ -180,21 +194,22 @@ func TestHermesArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			stateDB := filepath.Join(t.TempDir(), "profile", "state.db")
 			require.NoError(t, os.MkdirAll(filepath.Dir(stateDB), 0o755))
-			writeHermesImportStateDB(t, stateDB)
+			table, idColumn, id := "sessions", "id", "database-only"
+			if tt.antigravity {
+				stateDB = dbtest.SetAntigravityTitle(t, filepath.Dir(stateDB), "First")
+				table, idColumn, id = "conversation_summaries", "conversation_id", dbtest.AntigravityTitleID
+			} else {
+				writeHermesImportStateDB(t, stateDB)
+			}
 			writer, err := sql.Open("sqlite3", stateDB)
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = writer.Close() })
 			var journalMode string
-			require.NoError(t,
-				writer.QueryRow(`PRAGMA journal_mode = WAL`).Scan(&journalMode))
+			require.NoError(t, writer.QueryRowContext(t.Context(), `PRAGMA journal_mode = WAL`).Scan(&journalMode))
 			assert.Equal(t, "wal", journalMode)
-			_, err = writer.Exec(`PRAGMA wal_autocheckpoint = 0`)
+			_, err = writer.ExecContext(t.Context(), `PRAGMA wal_autocheckpoint = 0`)
 			require.NoError(t, err)
-			_, err = writer.Exec(`
-				UPDATE sessions
-				SET title = 'Committed in WAL'
-				WHERE id = 'database-only'
-			`)
+			_, err = writer.ExecContext(t.Context(), "UPDATE "+table+" SET title = 'Committed in WAL' WHERE "+idColumn+" = ?", id)
 			require.NoError(t, err)
 			wal := stateDB + "-wal"
 			require.FileExists(t, wal)
@@ -210,7 +225,7 @@ func TestHermesArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
 			case <-time.After(backgroundWaitTimeout):
 				require.FailNow(t, "archive did not finish its first database entry")
 			}
-			_, checkpointErr := writer.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+			_, checkpointErr := writer.ExecContext(t.Context(), `PRAGMA wal_checkpoint(TRUNCATE)`)
 			require.NoError(t, checkpointErr)
 			require.NoError(t, writer.Close())
 			if removeErr := os.Remove(wal); !os.IsNotExist(removeErr) {
@@ -221,7 +236,7 @@ func TestHermesArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
 
 			extracted := t.TempDir()
 			_, err = ExtractTarStream(
-				context.Background(), bytes.NewReader(archiveWriter.Bytes()), extracted,
+				t.Context(), bytes.NewReader(archiveWriter.Bytes()), extracted,
 			)
 			require.NoError(t, err)
 			extractedDB, err := safeRemappedRemotePath(extracted, stateDB)
@@ -230,12 +245,105 @@ func TestHermesArchivesSnapshotWALCommitBeforeCheckpoint(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, snapshot.Close()) })
 			var title string
-			require.NoError(t, snapshot.QueryRow(`
-				SELECT title FROM sessions WHERE id = 'database-only'
-			`).Scan(&title))
+			require.NoError(t, snapshot.QueryRowContext(t.Context(), "SELECT title FROM "+table+" WHERE "+idColumn+" = ?", id).Scan(&title))
 			assert.Equal(t, "Committed in WAL", title)
 			assert.NoFileExists(t, extractedDB+"-wal")
 			assert.NoFileExists(t, extractedDB+"-shm")
+		})
+	}
+}
+
+func TestWriteArchiveExcludesRemoteSyncExcludedAgentState(t *testing.T) {
+	root := t.TempDir()
+	chatDB := filepath.Join(root, "chat.db")
+	require.NoError(t, os.WriteFile(chatDB, []byte("authentication state"), 0o600))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(root, "credentials.json"), []byte("secret"), 0o600,
+	))
+
+	targets := TargetSet{
+		Dirs: map[parser.AgentType][]string{
+			parser.AgentTrae: {root},
+		},
+		Files: map[parser.AgentType][]string{
+			parser.AgentTrae: {chatDB},
+		},
+	}
+	for _, tt := range []struct {
+		name  string
+		write func(io.Writer) error
+	}{
+		{
+			name: "full",
+			write: func(w io.Writer) error {
+				return WriteArchive(t.Context(), w, targets)
+			},
+		},
+		{
+			name: "delta",
+			write: func(w io.Writer) error {
+				return WriteArchiveFiles(t.Context(), w, targets, []string{chatDB})
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var archive bytes.Buffer
+			require.NoError(t, tt.write(&archive))
+			_, err := tar.NewReader(&archive).Next()
+			assert.ErrorIs(t, err, io.EOF,
+				"a remote-sync-excluded agent's state must never enter a remote archive")
+		})
+	}
+}
+
+func TestWriteArchivePrunesForbiddenRootNestedInAllowedRoot(t *testing.T) {
+	root := t.TempDir()
+	allowed := filepath.Join(root, "sessions")
+	forbidden := filepath.Join(allowed, ".forbidden-provider")
+	keep := filepath.Join(allowed, "session.jsonl")
+	secret := filepath.Join(forbidden, "chat.db")
+	require.NoError(t, os.MkdirAll(forbidden, 0o755))
+	require.NoError(t, os.WriteFile(keep, []byte("session"), 0o644))
+	require.NoError(t, os.WriteFile(secret, []byte("authentication state"), 0o600))
+
+	targets := TargetSet{
+		Dirs:           map[parser.AgentType][]string{parser.AgentClaude: {allowed}},
+		ForbiddenRoots: []string{forbidden},
+	}
+	for _, tt := range []struct {
+		name  string
+		write func(io.Writer) error
+	}{
+		{
+			name: "full archive",
+			write: func(w io.Writer) error {
+				return WriteArchive(t.Context(), w, targets)
+			},
+		},
+		{
+			name: "delta archive",
+			write: func(w io.Writer) error {
+				return WriteArchiveFiles(t.Context(), w, targets, []string{keep, secret})
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var archive bytes.Buffer
+			require.NoError(t, tt.write(&archive))
+
+			var names []string
+			tr := tar.NewReader(&archive)
+			for {
+				hdr, err := tr.Next()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				require.NoError(t, err)
+				names = append(names, hdr.Name)
+			}
+			assert.Contains(t, names, archiveNameForTest(t, keep))
+			assert.NotContains(t, names, archiveNameForTest(t, secret),
+				"a forbidden nested root must not enter the transfer artifact")
 		})
 	}
 }
@@ -246,21 +354,45 @@ func TestWriteArchivePropagatesAdvertisedHermesSnapshotFailure(t *testing.T) {
 	writeHermesImportStateDB(t, stateDB)
 
 	wantErr := errors.New("forced sqlite backup failure")
-	originalSnapshot := writeHermesSnapshotFile
-	writeHermesSnapshotFile = func(dstPath, srcPath string) error {
+	originalSnapshot := writeSQLiteSnapshotFile
+	writeSQLiteSnapshotFile = func(_ context.Context, dstPath, srcPath string) error {
 		assert.NotEmpty(t, dstPath)
 		assert.Equal(t, stateDB, srcPath)
 		return wantErr
 	}
-	t.Cleanup(func() { writeHermesSnapshotFile = originalSnapshot })
+	t.Cleanup(func() { writeSQLiteSnapshotFile = originalSnapshot })
 
 	var archive bytes.Buffer
-	err := WriteArchive(&archive, TargetSet{
+	err := WriteArchive(t.Context(), &archive, TargetSet{
 		Dirs: map[parser.AgentType][]string{parser.AgentHermes: {stateDB}},
 	})
 	require.Error(t, err)
-	assert.ErrorIs(t, err, wantErr)
-	assert.Contains(t, err.Error(), "snapshot hermes database")
+	require.ErrorIs(t, err, wantErr)
+	assert.Contains(t, err.Error(), "snapshot sqlite database")
+}
+
+// A database that passes the identity probe but vanishes before the
+// online backup is a deletion race, not an archive failure: the entry
+// is omitted so the next manifest evicts the mirror's stale copy. The
+// propagation test above pins the complementary branch — a backup
+// failure with a still-usable source stays fatal.
+func TestWriteArchiveOmitsSnapshotWhenSourceVanishesMidBackup(t *testing.T) {
+	stateDB := filepath.Join(t.TempDir(), "profile", "state.db")
+	require.NoError(t, os.MkdirAll(filepath.Dir(stateDB), 0o755))
+	writeHermesImportStateDB(t, stateDB)
+
+	originalSnapshot := writeSQLiteSnapshotFile
+	writeSQLiteSnapshotFile = func(_ context.Context, dstPath, srcPath string) error {
+		require.NoError(t, os.Remove(srcPath))
+		return errors.New("open sqlite snapshot source: no such file")
+	}
+	t.Cleanup(func() { writeSQLiteSnapshotFile = originalSnapshot })
+
+	var archive bytes.Buffer
+	require.NoError(t, WriteArchive(t.Context(), &archive, TargetSet{
+		Dirs: map[parser.AgentType][]string{parser.AgentHermes: {stateDB}},
+	}))
+	assert.Empty(t, archiveEntries(t, archive.Bytes()))
 }
 
 func hermesTestSidecars(stateDB string) []string {
@@ -285,13 +417,13 @@ func TestExtractTarStreamRejectsArchiveWithoutEndMarker(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("body"), 0o644))
 
 	var buf bytes.Buffer
-	err := WriteArchive(&buf, TargetSet{
+	err := WriteArchive(t.Context(), &buf, TargetSet{
 		ExtraFiles: []string{path, invalid},
 	})
 	require.Error(t, err)
 	require.False(t, hasTarEndMarker(buf.Bytes()))
 
-	_, err = ExtractTarStream(context.Background(), &buf, t.TempDir())
+	_, err = ExtractTarStream(t.Context(), &buf, t.TempDir())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing tar end marker")
 }
@@ -308,7 +440,7 @@ func TestExtractTarStreamRejectsArchiveEndingWithZeroFilePayload(t *testing.T) {
 	_, err := tw.Write(make([]byte, 1024))
 	require.NoError(t, err)
 
-	_, err = ExtractTarStream(context.Background(), &buf, t.TempDir())
+	_, err = ExtractTarStream(t.Context(), &buf, t.TempDir())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "missing tar end marker")
 }
@@ -446,12 +578,12 @@ func TestWriteArchivePreservesNanosecondMtime(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	require.NoError(t, WriteArchive(&buf, TargetSet{
+	require.NoError(t, WriteArchive(t.Context(), &buf, TargetSet{
 		Dirs: map[parser.AgentType][]string{parser.AgentClaude: {srcDir}},
 	}))
 
 	dstDir := t.TempDir()
-	_, err = ExtractTarStream(context.Background(), &buf, dstDir)
+	_, err = ExtractTarStream(t.Context(), &buf, dstDir)
 	require.NoError(t, err)
 	extracted, err := safeRemappedRemotePath(dstDir, path)
 	require.NoError(t, err)
@@ -469,7 +601,7 @@ func TestWriteArchiveFilesSkipsVanishedAndSymlinks(t *testing.T) {
 	gone := filepath.Join(dir, "gone.jsonl")
 
 	var buf bytes.Buffer
-	require.NoError(t, WriteArchiveFiles(&buf, TargetSet{
+	require.NoError(t, WriteArchiveFiles(t.Context(), &buf, TargetSet{
 		Dirs: map[parser.AgentType][]string{parser.AgentClaude: {dir}},
 	}, []string{gone, link, keep}))
 
@@ -495,7 +627,7 @@ func TestWriteArchiveFilesSkipsFilesOutsideAllowedRoots(t *testing.T) {
 	require.NoError(t, os.WriteFile(outside, []byte("secret"), 0o644))
 
 	var buf bytes.Buffer
-	require.NoError(t, WriteArchiveFiles(&buf, TargetSet{
+	require.NoError(t, WriteArchiveFiles(t.Context(), &buf, TargetSet{
 		Dirs: map[parser.AgentType][]string{parser.AgentClaude: {allowed}},
 	}, []string{inside, outside}))
 
@@ -520,7 +652,7 @@ func TestWriteArchiveFilesPreservesNonHermesStateDB(t *testing.T) {
 	require.NoError(t, os.WriteFile(stateDB, []byte("raw non-Hermes state"), 0o644))
 
 	var buf bytes.Buffer
-	require.NoError(t, WriteArchiveFiles(&buf, TargetSet{
+	require.NoError(t, WriteArchiveFiles(t.Context(), &buf, TargetSet{
 		Dirs:       map[parser.AgentType][]string{parser.AgentClaude: {root}},
 		ExtraFiles: []string{stateDB},
 	}, []string{stateDB}))
@@ -542,15 +674,30 @@ func TestResolveDeltaFilePath(t *testing.T) {
 		want  string
 		ok    bool
 	}{
-		{"exact root", []string{"/srv/extra.jsonl"}, "/srv/extra.jsonl",
-			"/srv/extra.jsonl", true},
-		{"nested under root", []string{"/srv/claude"}, "/srv/claude/p/s.jsonl",
-			"/srv/claude/p/s.jsonl", true},
+		{
+			"exact root",
+			[]string{"/srv/extra.jsonl"},
+			"/srv/extra.jsonl",
+			"/srv/extra.jsonl", true,
+		},
+		{
+			"nested under root",
+			[]string{"/srv/claude"},
+			"/srv/claude/p/s.jsonl",
+			"/srv/claude/p/s.jsonl", true,
+		},
 		{"outside all roots", []string{"/srv/claude"}, "/etc/passwd", "", false},
-		{"traversal escapes root", []string{"/srv/claude"},
-			"/srv/claude/../secret", "", false},
-		{"prefix sibling", []string{"/srv/claude"}, "/srv/claude-evil/x",
-			"", false},
+		{
+			"traversal escapes root",
+			[]string{"/srv/claude"},
+			"/srv/claude/../secret", "", false,
+		},
+		{
+			"prefix sibling",
+			[]string{"/srv/claude"},
+			"/srv/claude-evil/x",
+			"", false,
+		},
 		{"no roots", nil, "/srv/claude/p/s.jsonl", "", false},
 	}
 	fromSlashAll := func(paths []string) []string {
@@ -563,7 +710,7 @@ func TestResolveDeltaFilePath(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, ok := resolveDeltaFilePath(
-				fromSlashAll(tt.roots), filepath.FromSlash(tt.path))
+				fromSlashAll(tt.roots), forbiddenRootMatcher{}, filepath.FromSlash(tt.path))
 			require.Equal(t, tt.ok, ok)
 			assert.Equal(t, filepath.FromSlash(tt.want), got)
 		})

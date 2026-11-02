@@ -16,7 +16,14 @@ import (
 )
 
 type RecursiveWatchResult struct {
-	Watched   int
+	Watched int
+	// Allocated counts the native watches this registration installed. Watched
+	// counts every directory the root covers, which includes directories an
+	// earlier root already watches natively. Charging those to the shared
+	// budget again spends capacity the process is not paying for, so a later
+	// root that overlaps an earlier one can be refused coverage the kernel
+	// already provides.
+	Allocated int
 	Unwatched int
 	Err       error
 	// MissingRootLifecycleOwned reports that the backend has durable native
@@ -45,10 +52,10 @@ const (
 )
 
 type WatchRename struct {
-	Path     string
-	Root     string
-	Agent    string
-	ItemType WatchItemType
+	Path     string        `json:"path"`
+	Root     string        `json:"root,omitempty"`
+	Agent    string        `json:"agent,omitempty"`
+	ItemType WatchItemType `json:"item_type,omitempty"`
 }
 
 // WatchBatch describes one serialized watcher callback. FullSync is an
@@ -57,28 +64,37 @@ type WatchRename struct {
 // LostEvents distinguishes overflow recovery from an ordinary authoritative
 // reconciliation so freshness shortcuts can be invalidated only when needed.
 type WatchBatch struct {
-	Paths           []string
-	Renames         []WatchRename
-	ReconcileRoots  []string
-	FullSync        bool
-	LostEvents      bool
+	Paths           []string      `json:"paths,omitempty"`
+	Renames         []WatchRename `json:"renames,omitempty"`
+	ReconcileRoots  []string      `json:"reconcile_roots,omitempty"`
+	FullSync        bool          `json:"full_sync,omitzero"`
+	LostEvents      bool          `json:"lost_events,omitzero"`
 	lifecycleTokens []backendLifecycleToken
 }
 
 type WatchCallback func(context.Context, WatchBatch) error
 
+// PollingScope identifies one configured provider root within a polling obligation.
+type PollingScope struct {
+	Agent string
+	Root  string
+}
+
+const FSNotifyFolderPollingPrefix = "fsnotify-folder:"
+
 // PollingObligation identifies one independently releasable reason that a set
-// of configured roots needs authoritative polling coverage.
+// of configured scopes needs authoritative polling coverage.
 type PollingObligation struct {
-	Key   string
-	Roots []string
+	Key           string
+	Scopes        []PollingScope
+	ReleaseScopes []PollingScope // Original scopes reconciled once before folder polling ends.
 	// Probe is the physical watcher path whose availability gates this
-	// obligation's reconciliation Roots. For nested provider roots (e.g.
+	// obligation's reconciliation Scopes. For nested provider roots (e.g.
 	// Gemini's <root>/tmp) the physical path differs from the configured
 	// reconciliation scope; probing the scope instead would let polling
 	// authoritatively reconcile a present <root> while the missing physical
 	// subtree holds every session, tombstoning all of them. Empty means the
-	// Roots themselves are the physical paths to probe.
+	// Scopes' roots themselves are the physical paths to probe.
 	Probe string
 }
 
@@ -91,9 +107,9 @@ type WatcherOptions struct {
 }
 
 // WatchRetryError carries the authoritative reconciliation scope selected by a
-// callback after it classifies a batch. The watcher consumes only FullSync and
-// ReconcileRoots from WatchRetryBatch; ordinary paths and rename metadata are
-// never replayed through this protocol.
+// callback after it classifies a batch. The watcher consumes the retry scope
+// from WatchRetryBatch; ordinary paths are replayed only when no narrower
+// typed retry scope is available.
 type WatchRetryError interface {
 	error
 	WatchRetryBatch() WatchBatch
@@ -115,7 +131,8 @@ type pendingWatchBatch struct {
 	maxPathBytes   int
 	fullSync       bool
 	lostEvents     bool
-	onOverflow     func()
+	immediate      bool // Keep control urgency with the batch it belongs to.
+	onOverflow     func(WatchBatchPromotionReason)
 }
 
 type pendingBackendRename struct {
@@ -180,7 +197,7 @@ func (p *pendingWatchBatch) AddRename(rename WatchRename) {
 		return
 	}
 	if len(p.renames)+1 > p.maxEntries {
-		p.overflow()
+		p.overflow(WatchBatchPromotionEntryLimit)
 		return
 	}
 	if !p.retainStrings(rename.Path, rename.Root, rename.Agent) {
@@ -256,7 +273,7 @@ func (p *pendingWatchBatch) AddLifecycle(token backendLifecycleToken) {
 		return
 	}
 	if len(p.strings)+len(p.lifecycle)+1 > p.maxEntries {
-		p.overflow()
+		p.overflow(WatchBatchPromotionEntryLimit)
 		if len(p.lifecycle)+1 > p.maxEntries {
 			return
 		}
@@ -281,6 +298,7 @@ func (p *pendingWatchBatch) merge(other *pendingWatchBatch) {
 	if other == nil {
 		return
 	}
+	p.immediate = p.immediate || other.immediate
 	if other.fullSync {
 		p.makeFullSync(other.lostEvents)
 	}
@@ -306,9 +324,12 @@ func (p *pendingWatchBatch) merge(other *pendingWatchBatch) {
 
 func (p *pendingWatchBatch) retainStrings(values ...string) bool {
 	additionalEntries, additionalBytes := p.retainedStringCost(values...)
-	if len(p.strings)+additionalEntries > p.maxEntries ||
-		p.pathBytes+additionalBytes > p.maxPathBytes {
-		p.overflow()
+	if len(p.strings)+additionalEntries > p.maxEntries {
+		p.overflow(WatchBatchPromotionEntryLimit)
+		return false
+	}
+	if p.pathBytes+additionalBytes > p.maxPathBytes {
+		p.overflow(WatchBatchPromotionByteLimit)
 		return false
 	}
 	for _, value := range values {
@@ -346,9 +367,9 @@ func (p *pendingWatchBatch) retainedStringCost(values ...string) (int, int) {
 	return additionalEntries, additionalBytes
 }
 
-func (p *pendingWatchBatch) overflow() {
+func (p *pendingWatchBatch) overflow(reason WatchBatchPromotionReason) {
 	if !p.fullSync && p.onOverflow != nil {
-		p.onOverflow()
+		p.onOverflow(reason)
 	}
 	p.makeFullSync(true)
 }
@@ -374,6 +395,7 @@ func (p *pendingWatchBatch) TakeWithRootAgents(
 	if p.Empty() {
 		return WatchBatch{}, false
 	}
+	p.immediate = false
 	if p.fullSync {
 		p.fullSync = false
 		lostEvents := p.lostEvents
@@ -464,8 +486,11 @@ func (p *pendingWatchBatch) takeLifecycleTokens() []backendLifecycleToken {
 }
 
 type watchEventSink struct {
-	mu        sync.Mutex
-	pending   *pendingWatchBatch
+	mu      sync.Mutex
+	pending *pendingWatchBatch
+	// retry holds failed work apart from pending so fresh events neither wait
+	// for nor reset the failed work's backoff.
+	retry     *pendingWatchBatch
 	handoff   atomic.Pointer[pendingWatchBatch]
 	overflows boundedCounter
 	wake      chan struct{}
@@ -498,15 +523,21 @@ func newWatchEventSink(maxEntries, maxPathBytes int) *watchEventSink {
 		pending: newPendingWatchBatch(maxEntries, maxPathBytes),
 		wake:    make(chan struct{}, 1),
 	}
-	sink.pending.onOverflow = sink.overflows.Inc
+	sink.pending.onOverflow = func(WatchBatchPromotionReason) { sink.overflows.Inc() }
+	sink.resetRetry()
 	return sink
+}
+
+func (s *watchEventSink) resetRetry() {
+	s.retry = newPendingWatchBatch(s.pending.maxEntries, s.pending.maxPathBytes)
+	s.retry.onOverflow = func(WatchBatchPromotionReason) { s.overflows.Inc() }
 }
 
 func (s *watchEventSink) TryAccumulate(
 	accumulate func(add func(backendEvent) bool) bool,
 ) bool {
 	batch := newPendingWatchBatch(s.pending.maxEntries, s.pending.maxPathBytes)
-	batch.onOverflow = s.overflows.Inc
+	batch.onOverflow = func(WatchBatchPromotionReason) { s.overflows.Inc() }
 	meaningful := accumulate(batch.AddBackendEvent)
 	if batch.Empty() {
 		return true
@@ -538,6 +569,7 @@ func (s *watchEventSink) RetainAuthoritative(token backendLifecycleToken) {
 	batch := newPendingWatchBatch(s.pending.maxEntries, s.pending.maxPathBytes)
 	batch.AddFullSync()
 	batch.AddLifecycle(token)
+	batch.immediate = true
 	s.publishHandoff(batch)
 	s.signal()
 }
@@ -548,23 +580,85 @@ func (s *watchEventSink) Empty() bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.pending.Empty() && s.retry.Empty()
+}
+
+// PendingEmpty reports whether fresh work, excluding retained retries, waits.
+func (s *watchEventSink) PendingEmpty() bool {
+	if s.handoff.Load() != nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.pending.Empty()
 }
 
+func (s *watchEventSink) RetryEmpty() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.retry.Empty()
+}
+
+// Take drains fresh work together with any retained retry.
 func (s *watchEventSink) Take(
 	agentsForRoot func(string) []string,
+) (WatchBatch, bool) {
+	return s.take(agentsForRoot, true)
+}
+
+// TakePending drains fresh work and leaves retained retries for their backoff.
+func (s *watchEventSink) TakePending(
+	agentsForRoot func(string) []string,
+) (WatchBatch, bool) {
+	return s.take(agentsForRoot, false)
+}
+
+func (s *watchEventSink) take(
+	agentsForRoot func(string) []string, includeRetry bool,
 ) (WatchBatch, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.absorbHandoff()
+	if includeRetry && !s.retry.Empty() {
+		retry := s.retry
+		s.resetRetry()
+		if retry.fullSync {
+			// merge would clear fresh paths that a full sync may not cover, such
+			// as files under an outer root beside an unavailable nested root.
+			s.pending.retainFullSync()
+			retry.fullSync = false
+		}
+		s.pending.merge(retry)
+		// merge carries lostEvents only with a full sync; a scoped retry keeps it too.
+		s.pending.lostEvents = s.pending.lostEvents || retry.lostEvents
+	}
 	return s.pending.TakeWithRootAgents(agentsForRoot)
 }
 
+// RetainRetry keeps failed work in the retry slot until its backoff expires.
 func (s *watchEventSink) RetainRetry(retry WatchBatch) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.absorbHandoff()
+	retainWatchRetry(s.retry, retry)
+}
+
+func (s *watchEventSink) RetainRetryImmediate(retry WatchBatch) {
+	s.mu.Lock()
+	s.absorbHandoff()
 	retainWatchRetry(s.pending, retry)
+	s.pending.immediate = true
+	s.mu.Unlock()
+	s.signal()
+}
+
+func (s *watchEventSink) MarkImmediate() {
+	s.mu.Lock()
+	s.absorbHandoff()
+	if !s.pending.Empty() {
+		s.pending.immediate = true
+	}
+	s.mu.Unlock()
 }
 
 func (s *watchEventSink) publishHandoff(batch *pendingWatchBatch) {
@@ -608,22 +702,35 @@ func (s *watchEventSink) signal() {
 	}
 }
 
+func (s *watchEventSink) immediatePending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.absorbHandoff()
+	return s.pending.immediate && !s.pending.Empty()
+}
+
 // Watcher schedules backend changes into serialized callbacks with short-burst
 // batching and a dispatch floor.
 type Watcher struct {
-	onChange            WatchCallback
-	onCoverageDegraded  func([]string) error
-	callbackCtx         context.Context
-	callbackCancel      context.CancelFunc
-	backend             watchBackend
-	eventSink           *watchEventSink
-	batchDelay          time.Duration
-	minInterval         time.Duration
-	maxEntries          int
-	dispatchEnabled     atomic.Bool
-	dispatchMu          sync.Mutex
-	rootAgentsMu        sync.RWMutex
-	rootAgents          map[string][]string
+	onChange           WatchCallback
+	onCoverageDegraded func([]string) error
+	onPollingRequired  func(PollingObligation) error
+	callbackCtx        context.Context
+	callbackCancel     context.CancelFunc
+	backend            watchBackend
+	eventSink          *watchEventSink
+	batchDelay         time.Duration
+	minInterval        time.Duration
+	maxEntries         int
+	dispatchEnabled    atomic.Bool
+	dispatchMu         sync.Mutex
+	rootAgentsMu       sync.RWMutex
+	rootAgents         map[string][]string
+	// rootScopes retains the full WatchScope set per physical root path,
+	// including scopes with empty Agent strings. The start-failure path uses
+	// this to emit PollingScope{Root: scope.SyncDir} rather than the physical
+	// path, so the coordinator's overlap check can match the configured dir.
+	rootScopes          map[string][]WatchScope
 	registeredSyncRoots []string
 	stopping            bool
 	lifecycleMu         sync.Mutex
@@ -631,6 +738,7 @@ type Watcher struct {
 	startErr            error
 	stop                chan struct{}
 	done                chan struct{}
+	flushRequests       chan chan error
 	backendStopOnce     sync.Once
 	doneOnce            sync.Once
 }
@@ -750,6 +858,7 @@ func newWatcherWithBackendOptions(
 	w := &Watcher{
 		onChange:           onChange,
 		onCoverageDegraded: options.OnCoverageDegraded,
+		onPollingRequired:  options.OnPollingRequired,
 		callbackCtx:        callbackCtx,
 		callbackCancel:     callbackCancel,
 		backend:            backend,
@@ -758,8 +867,10 @@ func newWatcherWithBackendOptions(
 		minInterval:        minInterval,
 		maxEntries:         maxEntries,
 		rootAgents:         make(map[string][]string),
+		rootScopes:         make(map[string][]WatchScope),
 		stop:               make(chan struct{}),
 		done:               make(chan struct{}),
+		flushRequests:      make(chan chan error),
 	}
 	if direct, ok := backend.(directEventBackend); ok {
 		direct.bindEventSink(w.eventSink)
@@ -791,6 +902,17 @@ func (w *Watcher) agentsForRoot(root string) []string {
 	w.rootAgentsMu.RLock()
 	defer w.rootAgentsMu.RUnlock()
 	return append([]string(nil), w.rootAgents[filepath.Clean(root)]...)
+}
+
+// setRootScopes records the complete WatchScope set for a physical root,
+// including scopes with empty Agent strings. It is called from RegisterRoots
+// alongside SetRootAgents so the start-failure emission can use scope.SyncDir
+// rather than the physical path.
+func (w *Watcher) setRootScopes(root string, scopes []WatchScope) {
+	w.rootAgentsMu.Lock()
+	defer w.rootAgentsMu.Unlock()
+	stored := append([]WatchScope(nil), scopes...)
+	w.rootScopes[filepath.Clean(root)] = stored
 }
 
 // WatchRecursive walks a directory tree and adds all
@@ -832,34 +954,132 @@ func (w *Watcher) StartCollecting() error {
 
 func (w *Watcher) start(openDispatch bool) error {
 	w.lifecycleMu.Lock()
-	defer w.lifecycleMu.Unlock()
+
 	if w.lifecycle == watcherCollecting && openDispatch {
 		w.lifecycle = watcherDispatching
 		w.dispatchEnabled.Store(true)
+		w.lifecycleMu.Unlock()
 		w.eventSink.signal()
 		return nil
 	}
 	if w.lifecycle != watcherNew {
-		return w.startErr
+		err := w.startErr
+		w.lifecycleMu.Unlock()
+		return err
 	}
-	if err := w.backend.Start(); err != nil {
+
+	backendErr := w.backend.Start()
+	if backendErr != nil {
 		w.lifecycle = watcherStopped
 		w.beginStopping()
 		w.stopBackend()
 		w.finish()
-		if w.onCoverageDegraded != nil && len(w.registeredSyncRoots) > 0 {
-			err = errors.Join(err, w.onCoverageDegraded(w.registeredSyncRoots))
+
+		// Snapshot the callback obligations under the lock so the external
+		// callbacks run after lifecycleMu is released. A callback that calls
+		// w.Stop(), w.Start(), or w.OpenDispatch() must be able to re-acquire
+		// lifecycleMu without deadlocking.
+		//
+		// Lock order: lifecycleMu → rootAgentsMu.RLock is safe; rootAgentsMu
+		// is never acquired while lifecycleMu is held by other callers.
+		type startFailureEntry struct {
+			path   string
+			scopes []WatchScope
 		}
-		w.startErr = fmt.Errorf("starting %s backend: %w", w.backend.Name(), err)
-		log.Printf("watcher: %v", w.startErr)
-		return w.startErr
+		var obligations []PollingObligation
+		var fallbackRoots []string
+		if w.onPollingRequired != nil {
+			// Backend start failed while onPollingRequired is set. The
+			// caller's pre-start obligations (watchPollingObligations) only
+			// cover roots with known problems; cleanly-registered roots have
+			// none and would otherwise go dark. Emit one obligation per
+			// registered root so native-backend failure never silently drops
+			// clean roots.
+			//
+			// Use the full WatchScope set from rootScopes (not just agent
+			// names from rootAgents) so each scope's SyncDir becomes the
+			// PollingScope Root. The physical path is used only for the
+			// obligation Key and Probe; when the two differ (the common case
+			// for nested provider roots), using the physical path would leave
+			// the configured dir with no authoritative polling coverage.
+			//
+			// Preserve the invariant that a root whose scopes genuinely have
+			// no agent still gets one empty-agent scope so coverage is never
+			// silently dropped, but do NOT synthesise an extra empty-agent
+			// scope for a root that already has named scopes.
+			w.rootAgentsMu.RLock()
+			entries := make([]startFailureEntry, 0, len(w.rootScopes))
+			for path, scopes := range w.rootScopes {
+				entries = append(entries, startFailureEntry{
+					path:   path,
+					scopes: append([]WatchScope(nil), scopes...),
+				})
+			}
+			w.rootAgentsMu.RUnlock()
+			for _, e := range entries {
+				var pollScopes []PollingScope
+				for _, scope := range e.scopes {
+					root := scope.SyncDir
+					if root == "" {
+						root = e.path
+					}
+					pollScopes = append(pollScopes, PollingScope{
+						Agent: scope.Agent,
+						Root:  root,
+					})
+				}
+				if len(pollScopes) == 0 {
+					// No scopes at all: emit a synthetic empty-agent scope so
+					// this root is not silently dropped by the coordinator.
+					pollScopes = []PollingScope{{Root: e.path}}
+				}
+				obligations = append(obligations, PollingObligation{
+					Key:    "startfailure:" + e.path,
+					Scopes: pollScopes,
+					Probe:  e.path,
+				})
+			}
+		} else if w.onCoverageDegraded != nil && len(w.registeredSyncRoots) > 0 {
+			fallbackRoots = append([]string(nil), w.registeredSyncRoots...)
+		}
+
+		// Set startErr to a preliminary value before releasing lifecycleMu so
+		// any concurrent Start()/Stop() call observes failure and returns a
+		// non-nil error rather than seeing a nil startErr.
+		prelimErr := fmt.Errorf("starting %s backend: %w", w.backend.Name(), backendErr)
+		w.startErr = prelimErr
+		log.Printf("watcher: %v", prelimErr)
+		w.lifecycleMu.Unlock()
+
+		// Invoke all external callbacks after releasing lifecycleMu.
+		var callbackErr error
+		for _, ob := range obligations {
+			callbackErr = errors.Join(callbackErr, w.onPollingRequired(ob))
+		}
+		if len(fallbackRoots) > 0 {
+			callbackErr = errors.Join(callbackErr, w.onCoverageDegraded(fallbackRoots))
+		}
+
+		if callbackErr == nil {
+			return prelimErr
+		}
+		// Incorporate callback errors into the final startErr so callers that
+		// retry Start() see the complete failure reason.
+		finalErr := fmt.Errorf("starting %s backend: %w",
+			w.backend.Name(), errors.Join(backendErr, callbackErr))
+		w.lifecycleMu.Lock()
+		w.startErr = finalErr
+		w.lifecycleMu.Unlock()
+		return finalErr
 	}
+
 	w.lifecycle = watcherCollecting
 	go w.loop()
 	if openDispatch {
 		w.lifecycle = watcherDispatching
 		w.dispatchEnabled.Store(true)
 	}
+	w.lifecycleMu.Unlock()
 	return nil
 }
 
@@ -877,8 +1097,7 @@ func (w *Watcher) QueueRetryBatch(batch WatchBatch) {
 		len(batch.Paths) == 0 {
 		return
 	}
-	w.eventSink.RetainRetry(batch)
-	w.eventSink.signal()
+	w.eventSink.RetainRetryImmediate(batch)
 }
 
 // OpenDispatch transitions a collecting watcher to callback dispatch. It is
@@ -891,7 +1110,36 @@ func (w *Watcher) OpenDispatch() {
 	}
 	w.lifecycle = watcherDispatching
 	w.dispatchEnabled.Store(true)
+	w.eventSink.MarkImmediate()
 	w.eventSink.signal()
+}
+
+// FlushPending waits for the current callback and a snapshot of fresh work,
+// including backend deliveries already ready when the request is handled.
+// The dispatch loop owns both callbacks; retained retries keep their backoff.
+func (w *Watcher) FlushPending(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !w.dispatchEnabled.Load() {
+		return errors.New("watcher dispatch is not open")
+	}
+	result := make(chan error, 1)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return os.ErrClosed
+	case w.flushRequests <- result:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-w.done:
+		return os.ErrClosed
+	case err := <-result:
+		return err
+	}
 }
 
 // Stop stops the watcher and waits for it to finish.
@@ -968,6 +1216,15 @@ func (w *Watcher) loop() {
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	callbackBusy := false
+	immediatePending := false
+	// retryDueAt gates the sink's retained retry; fresh work keeps its own delay.
+	var retryDueAt time.Time
+	dispatchedRetry := false
+	var flush chan error
+	var flushBatch WatchBatch
+	var flushHasBatch bool
+	var flushErr error
+	flushStarted := false
 
 	stopTimer := func() {
 		if timer != nil {
@@ -984,11 +1241,20 @@ func (w *Watcher) loop() {
 	}()
 
 	schedule := func() {
-		if !w.dispatchEnabled.Load() || callbackBusy ||
-			w.eventSink.Empty() || timerC != nil {
+		if !w.dispatchEnabled.Load() || callbackBusy || timerC != nil || flush != nil {
 			return
 		}
-		deadline := firstPendingAt.Add(pendingDelay)
+		var deadline time.Time
+		if !w.eventSink.PendingEmpty() {
+			deadline = firstPendingAt.Add(pendingDelay)
+		}
+		if !w.eventSink.RetryEmpty() &&
+			(deadline.IsZero() || retryDueAt.Before(deadline)) {
+			deadline = retryDueAt
+		}
+		if deadline.IsZero() {
+			return
+		}
 		if !lastDispatch.IsZero() {
 			floor := lastDispatch.Add(w.minInterval)
 			if floor.After(deadline) {
@@ -1000,7 +1266,7 @@ func (w *Watcher) loop() {
 	}
 
 	dispatch := func() bool {
-		if !w.dispatchEnabled.Load() || callbackBusy || w.eventSink.Empty() {
+		if !w.dispatchEnabled.Load() || callbackBusy || w.eventSink.Empty() || flush != nil {
 			return true
 		}
 		w.dispatchMu.Lock()
@@ -1008,18 +1274,50 @@ func (w *Watcher) loop() {
 		if w.stopping {
 			return false
 		}
-		batch, ok := w.eventSink.Take(w.agentsForRoot)
+		// Urgent work carries any retained retry with it, as before the split.
+		includeRetry := !time.Now().Before(retryDueAt) ||
+			w.eventSink.immediatePending()
+		take := w.eventSink.TakePending
+		if includeRetry {
+			take = w.eventSink.Take
+		}
+		retryWaiting := !w.eventSink.RetryEmpty()
+		batch, ok := take(w.agentsForRoot)
 		if !ok {
+			schedule()
 			return true
 		}
+		dispatchedRetry = includeRetry && retryWaiting
 		firstPendingAt = time.Time{}
 		pendingDelay = w.batchDelay
+		immediatePending = false
 		callbackBusy = true
 		batches <- batch
 		return true
 	}
 
 	for {
+		if flush != nil && !callbackBusy {
+			if flushStarted || !flushHasBatch {
+				flush <- flushErr
+				flush, flushErr = nil, nil
+				flushStarted = false
+				schedule()
+			} else {
+				w.dispatchMu.Lock()
+				if w.stopping {
+					w.dispatchMu.Unlock()
+					return
+				}
+				callbackBusy, flushStarted, dispatchedRetry = true, true, false
+				batches <- flushBatch
+				w.dispatchMu.Unlock()
+			}
+		}
+		requests := w.flushRequests
+		if flush != nil {
+			requests = nil
+		}
 		// Give shutdown priority over ready event and timer channels. Pending
 		// changes are recovered by the next startup sync.
 		select {
@@ -1031,6 +1329,32 @@ func (w *Watcher) loop() {
 		case <-w.stop:
 			return
 
+		case flush = <-requests:
+			stopTimer()
+			// A ready backend send can lose the select to this request. Include
+			// the buffered snapshot, or one waiting unbuffered sender, before
+			// taking the sink. Later deliveries must not extend the handoff.
+			events := w.backend.Events()
+		drainReady:
+			for range max(1, len(events)) {
+				select {
+				case event, ok := <-events:
+					if !ok {
+						return
+					}
+					if event.Op != backendOpUnknown &&
+						(event.Path != "" || event.Op&backendOpFullSync != 0) {
+						w.accumulateBackendEvent(event)
+					}
+				default:
+					break drainReady
+				}
+			}
+			flushBatch, flushHasBatch = w.eventSink.TakePending(w.agentsForRoot)
+			firstPendingAt = time.Time{}
+			pendingDelay = w.batchDelay
+			immediatePending = false
+
 		case event, ok := <-w.backend.Events():
 			if !ok {
 				return
@@ -1039,24 +1363,26 @@ func (w *Watcher) loop() {
 				(event.Path == "" && event.Op&backendOpFullSync == 0) {
 				continue
 			}
-			if w.eventSink.Empty() {
+			if w.eventSink.PendingEmpty() {
 				firstPendingAt = time.Now()
 				pendingDelay = w.batchDelay
+				// A running timer can only be the retained retry's; fresh work
+				// keeps the normal delay rather than waiting for that backoff.
+				stopTimer()
 			}
 			w.accumulateBackendEvent(event)
 			schedule()
 
 		case <-w.eventSink.wake:
-			if w.eventSink.Empty() {
+			immediatePending = immediatePending || w.eventSink.immediatePending()
+			if w.eventSink.PendingEmpty() {
 				continue
 			}
 			if firstPendingAt.IsZero() {
 				firstPendingAt = time.Now()
 			}
 			pendingDelay = 0
-			if timerC != nil {
-				stopTimer()
-			}
+			stopTimer()
 			schedule()
 
 		case err, ok := <-w.backend.Errors():
@@ -1079,11 +1405,15 @@ func (w *Watcher) loop() {
 
 		case result := <-callbackDone:
 			callbackBusy = false
+			if flush != nil {
+				flushErr = errors.Join(flushErr, result.err)
+			}
 			if result.err != nil {
 				lastDispatch = time.Now()
 				consecutiveFailures++
 				log.Printf("watcher callback: %v", result.err)
-				wasEmpty := w.eventSink.Empty()
+				wasEmpty := w.eventSink.PendingEmpty()
+				olderRetryWaiting := !w.eventSink.RetryEmpty()
 				retryRetained := false
 				if retry, ok := callbackRetryBatch(result.err); ok {
 					retry.lifecycleTokens = append(
@@ -1118,18 +1448,34 @@ func (w *Watcher) loop() {
 						retryRetained = true
 					}
 				}
-				if !retryRetained {
+				if !retryRetained && w.eventSink.RetryEmpty() {
 					consecutiveFailures = 0
 				}
-				if wasEmpty && !w.eventSink.Empty() {
+				switch {
+				case retryRetained:
+					immediatePending = immediatePending ||
+						w.eventSink.immediatePending()
+					dueAt := time.Now()
+					if !immediatePending {
+						dueAt = dueAt.Add(watcherRetryDelay(
+							max(w.batchDelay, w.minInterval), consecutiveFailures,
+						))
+					}
+					// A failing fresh batch must not postpone older retained work,
+					// or a source that keeps failing would starve it.
+					if !olderRetryWaiting || dueAt.Before(retryDueAt) {
+						retryDueAt = dueAt
+					}
+				case wasEmpty && !w.eventSink.PendingEmpty():
 					firstPendingAt = time.Now()
-					pendingDelay = watcherRetryDelay(
-						max(w.batchDelay, w.minInterval), consecutiveFailures,
-					)
+					pendingDelay = 0
 				}
 			} else {
 				lastDispatch = result.startedAt
-				consecutiveFailures = 0
+				// A fresh batch succeeding says nothing about the retry still waiting.
+				if dispatchedRetry || w.eventSink.RetryEmpty() {
+					consecutiveFailures = 0
+				}
 				for _, token := range result.batch.lifecycleTokens {
 					token.gate.acknowledgeLifecycle(token.generation)
 				}
@@ -1177,7 +1523,7 @@ func (w *Watcher) accumulateBackendEvent(event backendEvent) {
 		if path == event.Path {
 			return nil
 		}
-		if !filter.includeCreatedSubtreePath(root, path) {
+		if !filter.includeCreatedSubtreePath(root, path, entry.IsDir()) {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -1202,8 +1548,8 @@ func (w *Watcher) accumulateBackendEvent(event backendEvent) {
 }
 
 func callbackRetryBatch(err error) (WatchBatch, bool) {
-	var retryErr WatchRetryError
-	if !errors.As(err, &retryErr) {
+	retryErr, hasRetryErr := errors.AsType[WatchRetryError](err)
+	if !hasRetryErr {
 		return WatchBatch{}, false
 	}
 	retry := retryErr.WatchRetryBatch()

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { onDestroy } from "svelte";
   import { Button, Modal, Spinner } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
@@ -10,13 +11,12 @@
     SessionsService,
   } from "../../api/generated/index";
   import {
-    callGenerated,
-    configureGeneratedClient,
     isAbortError,
   } from "../../api/runtime.js";
-  import type { PublishResponse } from "../../api/types.js";
+  import type { PublishResponse } from "../../api/generated/index.js";
   import { copyToClipboard } from "../../utils/clipboard.js";
   import { LatestRead } from "../../utils/latest-read.js";
+  import { reportTelemetry } from "../../utils/telemetry.js";
 
   type View = "setup" | "progress" | "success" | "error";
 
@@ -45,11 +45,7 @@
   async function init() {
     const signal = configRead.begin();
     try {
-      configureGeneratedClient();
-      const config = await callGenerated(
-        () => ConfigService.getApiV1ConfigGithub(),
-        signal,
-      );
+      const config = await ConfigService.getApiV1ConfigGithub({ signal });
       if (isClosed() || !configRead.isCurrent(signal)) return;
       if (config.configured) {
         await doPublish();
@@ -70,10 +66,7 @@
 
     view = "progress";
     try {
-      configureGeneratedClient();
-      await ConfigService.postApiV1ConfigGithub({
-        requestBody: { token },
-      });
+      await ConfigService.postApiV1ConfigGithub({ token });
       if (isClosed()) return;
       await doPublish();
     } catch (err) {
@@ -91,16 +84,15 @@
       view = "error";
       return;
     }
+    reportTelemetry("export_run", { format: target.kind === "insight" ? "insight_gist" : "gist" });
 
     if (target.kind === "insight") {
       view = "progress";
       try {
-        configureGeneratedClient();
-        result =
-          await InsightsService.postApiV1InsightsIdPublish({
-            id: target.id,
-            secret: publishSecret,
-          }) as unknown as PublishResponse;
+        result = await InsightsService.postApiV1InsightsByIdPublish(
+          { id: target.id },
+          { secret: publishSecret },
+        );
         if (isClosed()) return;
         view = "success";
       } catch (err) {
@@ -114,12 +106,10 @@
 
     view = "progress";
     try {
-      configureGeneratedClient();
-      result =
-        await SessionsService.postApiV1SessionsIdPublish({
-          id: target.id,
-          secret: publishSecret,
-        }) as unknown as PublishResponse;
+      result = await SessionsService.postApiV1SessionsByIdPublish(
+        { id: target.id },
+        { secret: publishSecret },
+      );
       if (isClosed()) return;
       view = "success";
     } catch (err) {
@@ -186,6 +176,7 @@
 
 <Modal
   title={publishSecret ? m.publish_title_secret() : m.publish_title_public()}
+  closeLabel={m.publish_close()}
   width="440px"
   onclose={closeModal}
   footer={view === "progress" ? undefined : actions}
@@ -257,7 +248,7 @@
     </div>
 
   {:else if view === "error"}
-    <p class="modal-error-text">{errorMessage}</p>
+    <p class="modal-error-text" {@attach errorTelemetry("export")}>{errorMessage}</p>
   {/if}
 </Modal>
 

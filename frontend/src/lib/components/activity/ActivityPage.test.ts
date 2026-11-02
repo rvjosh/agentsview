@@ -1,19 +1,23 @@
 // @vitest-environment jsdom
-import {
-  afterEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vite-plus/test";
+import { reportErrorShown } from "../../utils/telemetry.js";
+vi.mock("../../utils/telemetry.js", () => ({
+  reportErrorShown: vi.fn(),
+  reportTelemetry: vi.fn(),
+}));
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import { fireEvent, screen } from "@testing-library/svelte";
 import { mount, tick, unmount } from "svelte";
+vi.mock("../../feature-flags.js", () => ({
+  PROJECT_MAPPING_WORKSPACE_ENABLED: true,
+}));
 import { activity } from "../../stores/activity.svelte.js";
+import { sessions } from "../../stores/sessions.svelte.js";
 import { router } from "../../stores/router.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
-import source from "./ActivityPage.svelte?raw";
 // @ts-ignore
 import ActivityPage from "./ActivityPage.svelte";
+import type { Report } from "../../api/types.js";
+import { testMoney } from "../../test/money.js";
 
 async function flushEffects() {
   await tick();
@@ -26,12 +30,13 @@ function stubActivityPageCollaborators() {
     "ResizeObserver",
     class {
       observe() {}
+      unobserve() {}
       disconnect() {}
     },
   );
   vi.spyOn(activity, "attach").mockReturnValue(() => {});
-  vi.spyOn(activity, "loadFilterOptions").mockResolvedValue();
-  vi.spyOn(activity, "load").mockResolvedValue();
+  vi.spyOn(activity, "loadFilterOptions").mockResolvedValue(true);
+  vi.spyOn(activity, "load").mockResolvedValue(true);
 }
 
 async function openCalendar(triggerLabel: string) {
@@ -39,54 +44,558 @@ async function openCalendar(triggerLabel: string) {
   await fireEvent.click(screen.getByRole("radio", { name: "Calendar" }));
 }
 
+function projectReport(): Report {
+  return {
+    timezone: "UTC",
+    range_start: "2026-07-01T00:00:00Z",
+    range_end: "2026-07-02T00:00:00Z",
+    bucket_unit: "hour",
+    bucket_seconds: 3600,
+    bucket_count: 24,
+    partial: false,
+    as_of: null,
+    effective_end: "2026-07-02T00:00:00Z",
+    elapsed_bucket_count: 24,
+    buckets: [],
+    peak: { agents: 0, at: null },
+    interactive_peak: { agents: 0, at: null },
+    subagent_peak: { agents: 0, at: null },
+    automated_peak: { agents: 0, at: null },
+    totals: {
+      active_minutes: 0,
+      idle_minutes: 0,
+      agent_minutes: 20,
+      sessions: 1,
+      untimed_sessions: 0,
+      distinct_projects: 1,
+      distinct_models: 0,
+      output_tokens: 0,
+      cost: testMoney(0),
+      subagent_agent_minutes: 0,
+      automated_agent_minutes: 0,
+      subagent_cost: testMoney(0),
+      automated_cost: testMoney(0),
+      automated_sessions: 0,
+      subagent_sessions: 0,
+      interactive_agent_minutes: 20,
+      interactive_cost: testMoney(0),
+      interactive_sessions: 1,
+    },
+    by_project: [
+      {
+        key: "wrong-project",
+        project_key: "pl1:sha256:wrong",
+        agent_minutes: 20,
+        cost: testMoney(0),
+        interactive_agent_minutes: 20,
+        subagent_agent_minutes: 0,
+        automated_agent_minutes: 0,
+        interactive_cost: testMoney(0),
+        subagent_cost: testMoney(0),
+        automated_cost: testMoney(0),
+      },
+    ],
+    by_model: [],
+    by_agent: [],
+    by_session: [],
+    sessions_total: 0,
+    projects: {},
+  } as Report;
+}
+
 function calendarDay(label: string): HTMLButtonElement {
   return screen.getByRole("button", { name: label }) as HTMLButtonElement;
 }
 
-describe("ActivityPage refresh control layout", () => {
-  it("keeps the shared refresh control inline with the toolbar filters", () => {
-    expect(source).toContain("<RefreshControl");
-    expect(source).toContain("activity.lastUpdatedAt");
-    expect(source).not.toContain("refresh-slot");
-    expect(source).not.toContain("margin-left: auto");
+async function selectFirstActivityRange() {
+  const target = screen.getByRole("button", {
+    name: "Filter sessions active in this time range",
+  });
+  await fireEvent.pointerDown(target, { button: 0 });
+  await fireEvent.pointerUp(window);
+}
+
+it("reports the analytics kind for a displayed report failure", async () => {
+  const { ActivityService } = await import("../../api/generated/index.js");
+  vi.mocked(reportErrorShown).mockClear();
+  vi.spyOn(activity, "attach").mockReturnValue(() => {});
+  vi.spyOn(activity, "loadFilterOptions").mockResolvedValue(true);
+  vi.spyOn(ActivityService, "getApiV1ActivityReport").mockRejectedValueOnce(
+    new Error("Report failed"),
+  );
+  const previousPreset = activity.preset;
+  activity.report = null;
+  activity.preset = "day";
+  const component = mount(ActivityPage, { target: document.body });
+  try {
+    await vi.waitFor(() =>
+      expect(document.querySelector(".status.error")?.textContent).toContain("Report failed"),
+    );
+    expect(reportErrorShown).toHaveBeenCalledExactlyOnceWith("analytics");
+  } finally {
+    await unmount(component);
+    activity.report = null;
+    activity.error = null;
+    activity.preset = previousPreset;
+    vi.restoreAllMocks();
+    document.body.innerHTML = "";
+  }
+});
+
+it("reloads empty machine choices when clearing a rejected selector", async () => {
+  stubActivityPageCollaborators();
+  activity.setMachine("unknown");
+  activity.machines = [];
+  const component = mount(ActivityPage, { target: document.body });
+  try {
+    await flushEffects();
+    vi.mocked(activity.loadFilterOptions).mockClear();
+    await fireEvent.click(screen.getByTitle("Filter by machine"));
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "All Machines" }));
+    expect(activity.machine).toBe("");
+    expect(activity.loadFilterOptions).toHaveBeenCalledTimes(1);
+  } finally {
+    unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.setMachine("");
+  }
+});
+
+it("shows machine labels without full IDs crowding the menu and filters by ID", async () => {
+  stubActivityPageCollaborators();
+  const machine = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  activity.machines = [machine];
+  sessions.machineLabels = { [machine]: "Workstation" };
+  const component = mount(ActivityPage, { target: document.body });
+  try {
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Filter by machine"));
+    const option = screen.getByRole("option", { name: "Workstation" });
+    await fireEvent.mouseDown(option);
+    expect(activity.machine).toBe(machine);
+  } finally {
+    unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.machines = [];
+    activity.setMachine("");
+    sessions.machineLabels = {};
+  }
+});
+
+it("distinguishes machines that share a label by a short ID and selects the right one", async () => {
+  stubActivityPageCollaborators();
+  const first = "aaaaaaaa111111111111111111111111";
+  const second = "bbbbbbbb222222222222222222222222";
+  const unique = "cccccccc333333333333333333333333";
+  activity.machines = [first, second, unique];
+  sessions.machineLabels = { [first]: "Workstation", [second]: "Workstation", [unique]: "Laptop" };
+  const component = mount(ActivityPage, { target: document.body });
+  try {
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Filter by machine"));
+    expect(screen.getByRole("option", { name: "Workstation aaaaaaaa" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Laptop" })).toBeTruthy();
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "Workstation bbbbbbbb" }));
+    expect(activity.machine).toBe(second);
+    await flushEffects();
+    expect(screen.getByTitle("Filter by machine").textContent).toContain("Workstation (bbbbbbbb)");
+  } finally {
+    await unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.machines = [];
+    activity.setMachine("");
+    sessions.machineLabels = {};
+  }
+});
+
+it("falls back to the ID tail when same-label machines share an ID prefix", async () => {
+  stubActivityPageCollaborators();
+  const first = "host-prod-east-00000001";
+  const second = "host-prod-east-00000002";
+  activity.machines = [first, second];
+  sessions.machineLabels = { [first]: "Build box", [second]: "Build box" };
+  const component = mount(ActivityPage, { target: document.body });
+  try {
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Filter by machine"));
+    expect(screen.getByRole("option", { name: "Build box …00000001" })).toBeTruthy();
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "Build box …00000002" }));
+    expect(activity.machine).toBe(second);
+  } finally {
+    await unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.machines = [];
+    activity.setMachine("");
+    sessions.machineLabels = {};
+  }
+});
+
+describe("ActivityPage refresh control", () => {
+  it("shows report progress in the refresh status instead of the report body", async () => {
+    stubActivityPageCollaborators();
+    activity.report = projectReport();
+    activity.lastUpdatedAt = Date.now() - 3 * 60_000;
+    activity.loading = true;
+    activity.progress = { phase: "scanning_activity", rows_processed: 120 };
+
+    const component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+
+    const refresh = document.body.querySelector(".activity-refresh");
+    expect(refresh?.textContent).toContain("Processing activity… 120 rows");
+    expect(refresh?.textContent).not.toContain("Updated 3m ago");
+    expect(document.body.querySelector(".activity-content")?.textContent).not.toContain(
+      "Processing activity",
+    );
+
+    activity.progress = { phase: "loading_usage" };
+    await flushEffects();
+    expect(refresh?.textContent).toContain("Loading usage…");
+
+    activity.progress = { phase: "finalizing", sessions_processed: 2 };
+    await flushEffects();
+    expect(refresh?.textContent).toContain("Finalizing report…");
+
+    unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.report = null;
+    activity.loading = false;
+    activity.progress = null;
+    activity.lastUpdatedAt = null;
+  });
+
+  it("shows the in-progress note in the toolbar only while the period is in progress", async () => {
+    stubActivityPageCollaborators();
+    activity.report = {
+      ...projectReport(),
+      timezone: "America/New_York",
+      partial: true,
+      as_of: "2026-07-01T12:03:00Z",
+    };
+
+    const component = mount(ActivityPage, { target: document.body });
+    try {
+      await flushEffects();
+      const toolbar = document.body.querySelector(".activity-toolbar");
+      expect(toolbar?.textContent).toContain("In progress, as of 08:03");
+
+      activity.report = projectReport();
+      await flushEffects();
+      expect(document.body.textContent).not.toContain("In progress");
+    } finally {
+      await unmount(component);
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+      document.body.innerHTML = "";
+      activity.report = null;
+    }
   });
 });
 
-describe("ActivityPage date yoke controls", () => {
-  it("updates shared yoke state from the unified range picker", () => {
-    expect(source).toContain("<RangePicker");
-    expect(source).toContain("seedActivityYoke");
-    expect(source).toContain("yokedDates.updateFromPanel");
+describe("ActivityPage breakdown links", () => {
+  let component: ReturnType<typeof mount> | undefined;
+
+  afterEach(() => {
+    if (component) unmount(component);
+    component = undefined;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.report = null;
   });
 
-  it("yokes week and month selections using resolved period starts", () => {
-    expect(source).toContain("startOfIsoWeek(activity.date)");
-    expect(source).toContain("startOfMonth(activity.date)");
-    expect(source).not.toContain(
-      "panelDateState(activity.date, addDays(activity.date, 6)",
-    );
-    expect(source).not.toContain(
-      "panelDateState(activity.date, endOfMonth(activity.date)",
-    );
+  it("renders project rows as Data links with no reclassify controls", async () => {
+    stubActivityPageCollaborators();
+    activity.report = projectReport();
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+
+    expect(document.body.querySelector('button[aria-label^="Reclassify"]')).toBeNull();
+    const link = document.body.querySelector("a.bar-label") as HTMLAnchorElement;
+    expect(link).toBeTruthy();
+    expect(link.getAttribute("href")).toBe("/data?project_key=pl1%3Asha256%3Awrong");
+    expect(link.getAttribute("title")).toBe("View wrong-project in Data");
+  });
+});
+
+describe("ActivityPage bucket drill-down", () => {
+  let component: ReturnType<typeof mount> | undefined;
+
+  afterEach(() => {
+    if (component) unmount(component);
+    component = undefined;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.report = null;
+    activity.reportGeneration = 0;
+    activity.sessionsError = null;
   });
 
-  it("preserves relative range selections as rolling yoke state", () => {
-    const applyIndex = source.indexOf("function applyRange");
-    const helperIndex = source.indexOf("function yokeStateForSelection");
-    const applyBlock = source.slice(applyIndex, helperIndex);
+  it("clears a selected bucket after a same-ID report refresh", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockResolvedValue(true);
+    activity.reportGeneration = 1;
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [
+        {
+          start: "2026-07-01T00:00:00Z",
+          end: "2026-07-01T01:00:00Z",
+          max_agents: 1,
+          user_messages: 0,
+          assistant_messages: 0,
+          max_interactive_agents: 1,
+          max_subagent_agents: 0,
+          max_automated_agents: 0,
+          subagent_at_peak: 0,
+          interactive_at_peak: 1,
+          automated_at_peak: 0,
+          agent_minutes: 20,
+          output_tokens: 0,
+          cost: testMoney(0),
+        },
+      ],
+    } as Report;
 
-    expect(helperIndex).toBeGreaterThan(applyIndex);
-    expect(source).toContain('mode: "rolling"');
-    expect(source).toContain("windowDays: sel.days");
-    expect(applyBlock).toContain("yokeStateForSelection(sel, range)");
-    expect(applyBlock).toContain("lastActivityDateSignature = dateSignature");
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await selectFirstActivityRange();
+    await flushEffects();
+    expect(activity.loadSessionPage).toHaveBeenCalledWith({
+      bucketRange: { start: 0, end: 1 },
+    });
+    expect(screen.getByTitle("Clear time filter")).toBeTruthy();
+
+    activity.reportGeneration = 2;
+    await flushEffects();
+    expect(screen.queryByTitle("Clear time filter")).toBeNull();
   });
 
-  it("preserves rolling window intent in activity URLs", () => {
-    expect(source).toContain("activity.rollingWindowDays");
-    expect(source).toContain("activity.setCustomRange");
-    expect(source).toContain("params.window_days");
-    expect(source).toContain('mode: "relative", days: activity.rollingWindowDays');
+  it("does not show a bucket selection when its page request fails", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockResolvedValue(false);
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [
+        {
+          start: "2026-07-01T00:00:00Z",
+          end: "2026-07-01T01:00:00Z",
+          max_agents: 1,
+          user_messages: 0,
+          assistant_messages: 0,
+          max_interactive_agents: 1,
+          max_subagent_agents: 0,
+          max_automated_agents: 0,
+          subagent_at_peak: 0,
+          interactive_at_peak: 1,
+          automated_at_peak: 0,
+          agent_minutes: 20,
+          output_tokens: 0,
+          cost: testMoney(0),
+        },
+      ],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await selectFirstActivityRange();
+    await flushEffects();
+
+    expect(screen.queryByTitle("Clear time filter")).toBeNull();
+  });
+
+  it("does not restore a bucket selection after a report-generation refresh", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockImplementation(async () => {
+      activity.reportGeneration++;
+      return true;
+    });
+    activity.reportGeneration = 1;
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [
+        {
+          start: "2026-07-01T00:00:00Z",
+          end: "2026-07-01T01:00:00Z",
+          max_agents: 1,
+          user_messages: 0,
+          assistant_messages: 0,
+          max_interactive_agents: 1,
+          max_subagent_agents: 0,
+          max_automated_agents: 0,
+          subagent_at_peak: 0,
+          interactive_at_peak: 1,
+          automated_at_peak: 0,
+          agent_minutes: 20,
+          output_tokens: 0,
+          cost: testMoney(0),
+        },
+      ],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await selectFirstActivityRange();
+    await flushEffects();
+
+    expect(screen.queryByTitle("Clear time filter")).toBeNull();
+  });
+
+  it("retries a failed time-range selection instead of loading the next page", async () => {
+    stubActivityPageCollaborators();
+    const loadPage = vi
+      .spyOn(activity, "loadSessionPage")
+      .mockImplementationOnce(async () => {
+        activity.sessionsError = "temporarily unavailable";
+        return false;
+      })
+      .mockImplementationOnce(async () => {
+        activity.sessionsError = null;
+        return true;
+      });
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      sessions_next_cursor: "next-page",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [
+        {
+          start: "2026-07-01T00:00:00Z",
+          end: "2026-07-01T01:00:00Z",
+          max_agents: 1,
+          user_messages: 0,
+          assistant_messages: 0,
+          max_interactive_agents: 1,
+          max_subagent_agents: 0,
+          max_automated_agents: 0,
+          subagent_at_peak: 0,
+          interactive_at_peak: 1,
+          automated_at_peak: 0,
+          agent_minutes: 20,
+          output_tokens: 0,
+          cost: testMoney(0),
+        },
+      ],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await selectFirstActivityRange();
+    await flushEffects();
+    expect(screen.queryByTitle("Clear time filter")).toBeNull();
+
+    await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await flushEffects();
+
+    expect(loadPage).toHaveBeenCalledTimes(2);
+    expect(loadPage).toHaveBeenLastCalledWith({
+      bucketRange: { start: 0, end: 1 },
+    });
+    expect(screen.getByTitle("Clear time filter")).toBeTruthy();
+  });
+
+  it("retries a failed sort with the requested order", async () => {
+    stubActivityPageCollaborators();
+    const loadPage = vi.spyOn(activity, "loadSessionPage").mockImplementation(async () => {
+      activity.sessionsError = "temporarily unavailable";
+      return false;
+    });
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      by_session: [
+        {
+          session_id: "only",
+          title: "Only session",
+          project: "proj",
+          project_key: "pl1:sha256:proj",
+          agent: "claude",
+          primary_model: "opus",
+          models: ["opus"],
+          agent_minutes: 10,
+          cost: testMoney(1),
+          output_tokens: 0,
+          first_active: "2026-07-01T00:00:00Z",
+          last_active: "2026-07-01T00:10:00Z",
+          timing_quality: "high",
+          is_automated: false,
+          is_subagent: false,
+        },
+      ],
+      sessions_total: 400,
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await fireEvent.click(document.querySelector("th.sort-cost button")!);
+    await flushEffects();
+    await fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await flushEffects();
+
+    expect(loadPage.mock.calls).toEqual([
+      [{ sort: "cost", direction: "desc" }],
+      [{ sort: "cost", direction: "desc" }],
+    ]);
+  });
+
+  it("keeps the active badge when clearing its page request fails", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [
+        {
+          start: "2026-07-01T00:00:00Z",
+          end: "2026-07-01T01:00:00Z",
+          max_agents: 1,
+          user_messages: 0,
+          assistant_messages: 0,
+          max_interactive_agents: 1,
+          max_subagent_agents: 0,
+          max_automated_agents: 0,
+          subagent_at_peak: 0,
+          interactive_at_peak: 1,
+          automated_at_peak: 0,
+          agent_minutes: 20,
+          output_tokens: 0,
+          cost: testMoney(0),
+        },
+      ],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await selectFirstActivityRange();
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Clear time filter"));
+    await flushEffects();
+
+    expect(screen.getByTitle("Clear time filter")).toBeTruthy();
   });
 });
 
@@ -127,14 +636,14 @@ describe("ActivityPage date yoke integration", () => {
       },
     );
     vi.spyOn(activity, "attach").mockReturnValue(() => {});
-    vi.spyOn(activity, "loadFilterOptions").mockResolvedValue();
+    vi.spyOn(activity, "loadFilterOptions").mockResolvedValue(true);
     vi.spyOn(activity, "load").mockImplementation(() => {
       loadStates.push({
         preset: activity.preset,
         from: activity.from,
         to: activity.to,
       });
-      return Promise.resolve();
+      return Promise.resolve(true);
     });
     router.route = "activity";
     router.params = {};
@@ -240,8 +749,9 @@ describe("ActivityPage calendar day rollover", () => {
     expect(activity.date).toBe("2026-06-19");
 
     expect(vi.getTimerCount()).toBeGreaterThan(0);
-    unmount(component);
+    await unmount(component);
     component = undefined;
+    await vi.runOnlyPendingTimersAsync();
     expect(vi.getTimerCount()).toBe(0);
   });
 

@@ -15,16 +15,38 @@ func (f importOnlyProviderFactory) Definition() AgentDef {
 }
 
 func (f importOnlyProviderFactory) Capabilities() Capabilities {
-	return Capabilities{}
+	return Capabilities{Content: importOnlyContentCapabilities(f.def.Type)}
+}
+
+// importOnlyContentCapabilities declares what each export parser extracts.
+// Chat app exports have no working directory or git branch.
+func importOnlyContentCapabilities(agent AgentType) ContentCapabilities {
+	caps := ContentCapabilities{
+		FirstMessage: CapabilitySupported,
+		SessionName:  CapabilitySupported,
+		Cwd:          CapabilityNotApplicable,
+		GitBranch:    CapabilityNotApplicable,
+	}
+	switch agent {
+	case AgentChatGPT:
+		caps.Thinking = CapabilitySupported
+		caps.ToolCalls = CapabilitySupported
+		caps.ToolResultEvents = CapabilitySupported
+		caps.Model = CapabilitySupported
+	case AgentClaudeAI:
+		caps.Thinking = CapabilitySupported
+	default:
+		// Gemini Apps activity records hold only the prompt.
+	}
+	return caps
 }
 
 func (f importOnlyProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	base := importOnlyProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Config: cfg,
-		},
+		Def:    cloneAgentDef(f.def),
+		Caps:   f.Capabilities(),
+		Config: cfg,
 	}
 
 	switch f.def.Type {
@@ -32,6 +54,8 @@ func (f importOnlyProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 		return &chatGPTImportOnlyProvider{importOnlyProvider: base}
 	case AgentClaudeAI:
 		return &claudeAIImportOnlyProvider{importOnlyProvider: base}
+	case AgentGeminiApps:
+		return &geminiAppsImportOnlyProvider{importOnlyProvider: base}
 	default:
 		return &base
 	}
@@ -53,5 +77,9 @@ type chatGPTImportOnlyProvider struct {
 }
 
 type claudeAIImportOnlyProvider struct {
+	importOnlyProvider
+}
+
+type geminiAppsImportOnlyProvider struct {
 	importOnlyProvider
 }

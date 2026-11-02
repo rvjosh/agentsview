@@ -10,16 +10,114 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestProviderCapabilitiesWatchRootsDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).WatchRoots)
+func TestProviderCapabilitiesS3DiscoveryMatchConsumers(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).S3Discovery,
+		"new providers must opt in explicitly")
+
+	supported := map[AgentType]bool{
+		AgentClaude:    true,
+		AgentCodex:     true,
+		AgentCursor:    true,
+		AgentIcodemate: true,
+	}
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		got := factory.Capabilities().Source.S3Discovery
+		if supported[agent] {
+			assert.Equal(t, CapabilitySupported, got)
+			provider := factory.NewProvider(ProviderConfig{
+				Roots: []string{t.TempDir()},
+			})
+			assert.Implements(t, (*S3Provider)(nil), provider)
+			continue
+		}
+		assert.Equalf(t, CapabilityUnsupported, got,
+			"%s must not opt into S3 discovery", agent)
+	}
 }
 
-func TestProviderCapabilitiesStreamingDiscoveryDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).StreamingDiscovery)
+func TestProviderCapabilitiesAppOwnedStorePaths(t *testing.T) {
+	for _, agent := range []AgentType{AgentHermes, AgentAugureDesktop, AgentPi, AgentClaude, AgentType("unknown")} {
+		for _, path := range []string{"state.db", "state.db#one", "profile#one/state.db#two", "sessions/one.jsonl", "session_one.json", ""} {
+			want := (agent == AgentHermes || agent == AgentAugureDesktop) && (path == "state.db" || path == "state.db#one" || path == "profile#one/state.db#two")
+			assert.Equalf(t, want, OwnsAppStore(agent, path), "%s: %s", agent, path)
+		}
+	}
 }
 
-func TestProviderCapabilitiesPersistentArchiveDefaultUnsupported(t *testing.T) {
-	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).PersistentArchive)
+func TestProviderCapabilitiesActivityHintsMatchConsumers(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).ActivityHints,
+		"new providers must opt in explicitly")
+
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		got := factory.Capabilities().Source.ActivityHints
+		// TraeX and Augure Code inherit the Codex hint reader through the
+		// shared provider. A fork that writes no history.jsonl (none has been
+		// observed for Augure) simply yields no hints; the capability claim
+		// itself must stay consistent with the shared factory.
+		if agent == AgentCodex || agent == AgentTraeX || agent == AgentAugureCode {
+			assert.Equal(t, CapabilitySupported, got)
+			provider := factory.NewProvider(ProviderConfig{
+				Roots: []string{t.TempDir()},
+			})
+			assert.Implements(t, (*ActivityHintProvider)(nil), provider)
+			continue
+		}
+		assert.Equalf(t, CapabilityUnsupported, got,
+			"%s must not schedule activity hints", agent)
+	}
+}
+
+func TestProviderCapabilitiesChangedPathRelevanceMatchConsumers(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).ChangedPathRelevance,
+		"new providers must opt in explicitly")
+
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		got := factory.Capabilities().Source.ChangedPathRelevance
+		if agent == AgentOpenCode || agent == AgentKilo ||
+			agent == AgentMiMoCode || agent == AgentIcodemate || agent == AgentJunie ||
+			agent == AgentCodebuff || agent == AgentVibe ||
+			agent == AgentAntigravityCLI || agent == AgentAntigravity ||
+			agent == AgentGemini {
+			assert.Equal(t, CapabilitySupported, got)
+			provider := factory.NewProvider(ProviderConfig{
+				Roots: []string{t.TempDir()},
+			})
+			assert.Implements(t, (*ChangedPathRelevanceProvider)(nil), provider)
+			continue
+		}
+		assert.Equalf(t, CapabilityUnsupported, got,
+			"%s must not classify watch path relevance", agent)
+	}
+}
+
+func TestProviderCapabilitiesStoredMemberFreshnessListingMatchConsumers(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).StoredMemberFreshnessListing,
+		"new providers must opt in explicitly")
+
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		got := factory.Capabilities().Source.StoredMemberFreshnessListing
+		root := t.TempDir()
+		provider := factory.NewProvider(ProviderConfig{Roots: []string{root}})
+		// Every SourceSetProvider forwards the resolver method, so the capability is the gate.
+		if agent == AgentCursorIDE {
+			assert.Equal(t, CapabilitySupported, got)
+			dbPath := filepath.Join(root, CursorIDEDBRelPath)
+			container, ok := ResolveStoredMemberFreshnessContainer(provider, dbPath)
+			assert.True(t, ok)
+			assert.Equal(t, dbPath, container)
+			continue
+		}
+		assert.Equalf(t, CapabilityUnsupported, got,
+			"%s must not declare a stored member freshness listing", agent)
+		_, ok := ResolveStoredMemberFreshnessContainer(
+			provider, filepath.Join(root, "x.db"),
+		)
+		assert.Falsef(t, ok, "%s must not resolve a stored freshness container", agent)
+	}
 }
 
 func TestWatchSourceProvidersDiscoverEachDirectly(t *testing.T) {
@@ -53,8 +151,8 @@ func TestWatchSourceProvidersDiscoverEachDirectly(t *testing.T) {
 func TestSourceSetProviderDiscoverEachDoesNotCallCollectingDiscover(t *testing.T) {
 	sources := &streamingSourceSetTestDouble{}
 	provider := &SourceSetProvider{
-		ProviderBase: ProviderBase{Def: AgentDef{Type: "stream-test"}},
-		sources:      sources,
+		Def:     AgentDef{Type: "stream-test"},
+		sources: sources,
 	}
 
 	var got []SourceRef
@@ -123,6 +221,27 @@ func TestProviderMigrationRejectsStreamingCapabilityWithoutInterface(t *testing.
 	assert.Contains(t, err.Error(), "StreamingDiscoverer")
 }
 
+func TestProviderMigrationRejectsS3DiscoveryWithoutInterface(t *testing.T) {
+	factory := testProviderFactory{
+		def: AgentDef{Type: "invalid-s3-provider"},
+		caps: Capabilities{Source: SourceCapabilities{
+			DiscoverSources: CapabilitySupported,
+			FindSource:      CapabilitySupported,
+			S3Discovery:     CapabilitySupported,
+		}},
+	}
+
+	err := ValidateProviderMigrationModes(
+		[]ProviderFactory{factory},
+		map[AgentType]ProviderMigrationMode{
+			"invalid-s3-provider": ProviderMigrationProviderAuthoritative,
+		},
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "S3Provider")
+}
+
 func TestProviderMigrationRejectsSharedContainerWithoutExactRehydration(t *testing.T) {
 	factory := streamingWithoutExactFactory{testProviderFactory{
 		def: AgentDef{Type: "invalid-shared-container-provider"}, caps: Capabilities{Source: SourceCapabilities{
@@ -171,25 +290,23 @@ func TestSourceSetFactoryDowngradesAndRejectsMissingExactRehydration(t *testing.
 
 func TestProviderCapabilitiesRequireWatchRootPlanner(t *testing.T) {
 	provider := &watchRootCapabilityTestProvider{
-		ProviderBase: ProviderBase{
-			Def: AgentDef{Type: "watch-root-test"},
-			Caps: Capabilities{Source: SourceCapabilities{
-				WatchRoots: CapabilitySupported,
-			}},
-		},
+		Def: AgentDef{Type: "watch-root-test"},
+		Caps: Capabilities{Source: SourceCapabilities{
+			WatchRoots: CapabilitySupported,
+		}},
 		plan: WatchPlan{Roots: []WatchRoot{{Path: "/fallback"}}},
 	}
 
-	_, err := ResolveWatchRoots(context.Background(), provider)
+	_, err := ResolveWatchRoots(t.Context(), provider)
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrUnsupportedProviderFeature)
+	require.ErrorIs(t, err, ErrUnsupportedProviderFeature)
 	assert.Zero(t, provider.watchPlanCalls,
 		"a false capability advertisement must not silently take the legacy path")
 }
 
 func TestProviderCapabilitiesFallbackWatchPlanRetainsOnlyRootMetadata(t *testing.T) {
 	provider := &watchRootCapabilityTestProvider{
-		ProviderBase: ProviderBase{Def: AgentDef{Type: "legacy-watch-root-test"}},
+		Def: AgentDef{Type: "legacy-watch-root-test"},
 		plan: WatchPlan{Roots: []WatchRoot{{
 			Path:         "/sessions",
 			Recursive:    true,
@@ -199,7 +316,7 @@ func TestProviderCapabilitiesFallbackWatchPlanRetainsOnlyRootMetadata(t *testing
 		}}},
 	}
 
-	roots, err := ResolveWatchRoots(context.Background(), provider)
+	roots, err := ResolveWatchRoots(t.Context(), provider)
 	require.NoError(t, err)
 	assert.Equal(t, []WatchRoot{{
 		Path:        "/sessions",
@@ -223,7 +340,7 @@ func TestProviderCapabilitiesSourceSetAdapterImplementsWatchRootPlanner(t *testi
 	assert.Equal(t, CapabilitySupported, provider.Capabilities().Source.WatchRoots)
 	planner, ok := provider.(WatchRootPlanner)
 	require.True(t, ok)
-	roots, err := planner.WatchRoots(context.Background())
+	roots, err := planner.WatchRoots(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, []WatchRoot{{
 		Path:        root,
@@ -244,9 +361,9 @@ type streamingSourceSetTestDouble struct {
 type streamingWithoutExactFactory struct{ testProviderFactory }
 
 func (factory streamingWithoutExactFactory) NewProvider(cfg ProviderConfig) Provider {
-	return &streamingWithoutExactProvider{testProvider: testProvider{ProviderBase: ProviderBase{
+	return &streamingWithoutExactProvider{
 		Def: factory.def, Caps: factory.caps, Config: cfg.Clone(),
-	}}}
+	}
 }
 
 type streamingWithoutExactProvider struct{ testProvider }

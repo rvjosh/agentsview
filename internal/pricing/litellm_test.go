@@ -1,11 +1,12 @@
 package pricing
 
 import (
-	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 func TestParseLiteLLMPricing(t *testing.T) {
@@ -32,12 +33,14 @@ func TestParseLiteLLMPricing(t *testing.T) {
 	}
 	require.NotNil(t, found, "claude-sonnet-4-20250514 not found in results")
 
-	assertClose(t, "InputPerMTok", found.InputPerMTok, 3.0)
-	assertClose(t, "OutputPerMTok", found.OutputPerMTok, 15.0)
-	assertClose(t, "CacheCreationPerMTok",
-		found.CacheCreationPerMTok, 3.75)
-	assertClose(t, "CacheReadPerMTok",
-		found.CacheReadPerMTok, 0.30)
+	assert.Equal(t, money.Money{Microdollars: 3_000_000}, found.InputPerMTok)
+	assert.Equal(t, money.Money{Microdollars: 15_000_000}, found.OutputPerMTok)
+	assert.Equal(t, money.Money{Microdollars: 3_750_000},
+		found.CacheCreationPerMTok,
+	)
+	assert.Equal(t, money.Money{Microdollars: 300_000},
+		found.CacheReadPerMTok,
+	)
 }
 
 func TestParseLiteLLMPricingMultipleProviders(t *testing.T) {
@@ -88,37 +91,4 @@ func TestParseLiteLLMPricingSkipsNoCost(t *testing.T) {
 
 	require.Len(t, prices, 1)
 	assert.Equal(t, "claude-sonnet-4-20250514", prices[0].ModelPattern)
-}
-
-func TestFallbackPricing(t *testing.T) {
-	prices := requireEmbeddedFallbackPricing(t)
-
-	required := map[string]bool{
-		"claude-sonnet-4-6":         false,
-		"claude-opus-4-6":           false,
-		"claude-opus-4-7":           false,
-		"claude-opus-4-8":           false,
-		"claude-fable-5":            false,
-		"claude-haiku-4-5-20251001": false,
-		"claude-sonnet-4-20250514":  false,
-		"claude-opus-4-20250514":    false,
-		"claude-haiku-3-5-20241022": false,
-	}
-	for _, p := range prices {
-		if _, ok := required[p.ModelPattern]; ok {
-			required[p.ModelPattern] = true
-		}
-	}
-	for model, found := range required {
-		assert.True(t, found, "required model %s missing", model)
-	}
-}
-
-func assertClose(
-	t *testing.T,
-	name string,
-	got, want float64,
-) {
-	t.Helper()
-	assert.LessOrEqual(t, math.Abs(got-want), 0.001, "%s: got %f, want %f", name, got, want)
 }

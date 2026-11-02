@@ -18,6 +18,7 @@ import (
 // <root>/<repo> and returns the derived session ID.
 func writeAiderRepoSession(t *testing.T, root, repo, prompt string) (path, id string) {
 	t.Helper()
+
 	repoDir := filepath.Join(root, repo)
 	require.NoError(t, os.MkdirAll(repoDir, 0o755))
 	path = filepath.Join(repoDir, parser.AiderHistoryFileName())
@@ -79,8 +80,8 @@ func TestReconcileProviderRootsDoesNotExpandAcrossProviders(t *testing.T) {
 	}
 	base := t.TempDir()
 	aiderRoot := filepath.Join(base, "aider")
-	// claudeDir is a descendant of aiderRoot: the overlap that
-	// logicalRootsForWatchRoots would otherwise expand across providers.
+	// claudeDir is a descendant of aiderRoot: the overlap an unscoped root
+	// expansion would otherwise widen across providers.
 	claudeDir := filepath.Join(aiderRoot, "claude")
 	require.NoError(t, os.MkdirAll(claudeDir, 0o755))
 
@@ -97,7 +98,7 @@ func TestReconcileProviderRootsDoesNotExpandAcrossProviders(t *testing.T) {
 	claudeIDs := writeClaudeCorpus(t, claudeDir, 100)
 
 	database := openTestDB(t)
-	engine := NewEngine(database, EngineConfig{
+	engine := NewEngine(t.Context(), database, EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentAider:  {aiderRoot},
 			parser.AgentClaude: {claudeDir},
@@ -122,9 +123,7 @@ func TestReconcileProviderRootsDoesNotExpandAcrossProviders(t *testing.T) {
 	// Deletion within scope is preserved.
 	deleted, err := database.GetSessionFull(t.Context(), aiderIDs[2])
 	require.NoError(t, err)
-	require.NotNil(t, deleted)
-	require.NotNil(t, deleted.DeletionCause)
-	assert.Equal(t, "source_missing", *deleted.DeletionCause)
+	assertSourceMissingState(t, deleted)
 
 	// Surviving Aider sources stay active.
 	for i, id := range aiderIDs {

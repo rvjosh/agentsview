@@ -40,7 +40,7 @@ func TestForkDetection_LinearSession(t *testing.T) {
 	assertMessageCount(t, len(results[0].Messages), 4)
 }
 
-func TestForkDetection_LargeGapFork(t *testing.T) {
+func TestForkDetection_LargeGapForkPropagatesPRLinks(t *testing.T) {
 	// Main branch: a->b->c->d->e->f->g->h (4+ user turns after fork)
 	// Fork from b: i->j
 	// Fork point is at node b, which has children c (first) and i.
@@ -74,6 +74,10 @@ func TestForkDetection_LargeGapFork(t *testing.T) {
 		AddClaudeUserWithUUID("2024-01-01T10:01:00Z", "fork q1", "i", "b").
 		AddClaudeAssistantWithUUID("2024-01-01T10:01:01Z", "fork a1", "j", "i").
 		String()
+	content = testjsonl.JoinJSONL(content,
+		`{"type":"pr-link","prNumber":7,`+
+			`"prUrl":"https://github.com/owner/repo/pull/7",`+
+			`"prRepository":"owner/repo","timestamp":"2024-01-01T10:01:02Z"}`)
 
 	results := parseTestContent(t, "fork.jsonl", content, 2)
 
@@ -90,6 +94,11 @@ func TestForkDetection_LargeGapFork(t *testing.T) {
 	assert.Equal(t, "fork", fork.Session.ParentSessionID, "fork ParentSessionID")
 	assert.Equal(t, RelFork, fork.Session.RelationshipType, "fork RelationshipType")
 	assert.Equal(t, "fork q1", fork.Session.FirstMessage, "fork FirstMessage")
+
+	for _, r := range results {
+		require.Len(t, r.Session.PRLinks, 1, r.Session.ID)
+		assert.Equal(t, 7, r.Session.PRLinks[0].Number, r.Session.ID)
+	}
 }
 
 func TestForkDetection_SmallGapRetry(t *testing.T) {
@@ -153,6 +162,37 @@ func TestForkDetection_ReminderPrefixedIDEContextDoesNotPromoteObsoleteBranch(
 		String()
 
 	results := parseTestContent(t, "ide-context-fork.jsonl", content, 1)
+	require.Len(t, results[0].Messages, 4)
+	assert.Equal(t, "real retry", results[0].Messages[2].Content)
+	assert.Equal(t, "retry answer", results[0].Messages[3].Content)
+}
+
+func TestForkDetection_IDEEnvelopeWithDiscardedRemainderDoesNotPromoteObsoleteBranch(
+	t *testing.T,
+) {
+	const discardedRemainder = "<ide_opened_file>context</ide_opened_file>\n" +
+		"<command-name></command-name>"
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "start", "a", "").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "ok", "b", "a").
+		AddClaudeUserWithUUID("2024-01-01T10:00:02Z", "q1", "c", "b").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:03Z", "a1", "d", "c").
+		AddClaudeUserWithUUID("2024-01-01T10:00:04Z", "q2", "e", "d").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:05Z", "a2", "f", "e").
+		AddClaudeUserWithUUID("2024-01-01T10:00:06Z", "q3", "g", "f").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:07Z", "a3", "h", "g").
+		AddClaudeUserWithUUID(
+			"2024-01-01T10:00:08Z", discardedRemainder, "i", "h",
+		).
+		AddClaudeUserWithUUID(
+			"2024-01-01T10:01:00Z", "real retry", "z", "b",
+		).
+		AddClaudeAssistantWithUUID(
+			"2024-01-01T10:01:01Z", "retry answer", "zz", "z",
+		).
+		String()
+
+	results := parseTestContent(t, "ide-command-fork.jsonl", content, 1)
 	require.Len(t, results[0].Messages, 4)
 	assert.Equal(t, "real retry", results[0].Messages[2].Content)
 	assert.Equal(t, "retry answer", results[0].Messages[3].Content)

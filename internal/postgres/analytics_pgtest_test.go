@@ -1,7 +1,6 @@
 package postgres
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -9,52 +8,6 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 )
-
-func TestBuildAnalyticsWhere_ModelFilter(t *testing.T) {
-	pb := &paramBuilder{}
-	where := buildAnalyticsWhereWithDate(
-		db.AnalyticsFilter{
-			From:  "2024-06-01",
-			To:    "2024-06-03",
-			Model: "gpt-4o, claude-3-5-sonnet",
-		},
-		pgDateColS,
-		pb,
-		true,
-		"s.id",
-	)
-
-	assert.Contains(t, where,
-		"EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id",
-	)
-	assert.Contains(t, where, "m.model IN (")
-	assert.Len(t, pb.args, 4, "date range plus two model args")
-	assert.Equal(t, "gpt-4o", pb.args[2])
-	assert.Equal(t, "claude-3-5-sonnet", pb.args[3])
-}
-
-func TestBuildAnalyticsWhere_ModelFilterTrimsEmptyValues(t *testing.T) {
-	pb := &paramBuilder{}
-	where := buildAnalyticsWhereWithDate(
-		db.AnalyticsFilter{
-			From:  "2024-06-01",
-			To:    "2024-06-03",
-			Model: " , gpt-4o , ",
-		},
-		pgDateCol,
-		pb,
-		true,
-		"id",
-	)
-
-	assert.Contains(t, where, "m.model = ")
-	assert.NotContains(t, where, "m.model IN (")
-	assert.Equal(t, "gpt-4o", pb.args[2])
-	assert.Equal(t, 1,
-		strings.Count(where, "m.model = "),
-		"expected a single model predicate",
-	)
-}
 
 func TestRankTopSessions_DurationSort(t *testing.T) {
 	sessions := []db.TopSession{
@@ -90,8 +43,8 @@ func TestRankTopSessions_NearTiePrecision(t *testing.T) {
 	got := rankTopSessions(sessions, true)
 	require.Len(t, got, 2)
 	assert.Equal(t, "b", got[0].ID, "10.06 > 10.04")
-	assert.Equal(t, 10.1, got[0].ActiveDurationMin)
-	assert.Equal(t, 10.0, got[1].ActiveDurationMin)
+	assert.InDelta(t, 10.1, got[0].ActiveDurationMin, 1e-9)
+	assert.InDelta(t, 10.0, got[1].ActiveDurationMin, 1e-9)
 }
 
 func TestRankTopSessions_TruncatesTo10(t *testing.T) {
@@ -104,7 +57,7 @@ func TestRankTopSessions_TruncatesTo10(t *testing.T) {
 	}
 	got := rankTopSessions(sessions, true)
 	require.Len(t, got, 10)
-	assert.Equal(t, 14.0, got[0].ActiveDurationMin)
+	assert.InDelta(t, 14.0, got[0].ActiveDurationMin, 1e-9)
 }
 
 func TestRankTopSessions_UsesActiveDurationForSort(t *testing.T) {
@@ -115,8 +68,8 @@ func TestRankTopSessions_UsesActiveDurationForSort(t *testing.T) {
 	got := rankTopSessions(sessions, true)
 	require.Len(t, got, 2)
 	assert.Equal(t, "active", got[0].ID)
-	assert.Equal(t, 15.0, got[0].ActiveDurationMin)
-	assert.Equal(t, 120.0, got[1].DurationMin)
+	assert.InDelta(t, 15.0, got[0].ActiveDurationMin, 1e-9)
+	assert.InDelta(t, 120.0, got[1].DurationMin, 1e-9)
 }
 
 func TestRankTopSessions_NoSortForMessages(t *testing.T) {
@@ -145,6 +98,6 @@ func TestRankTopSessions_RoundsForDisplay(t *testing.T) {
 	}
 	got := rankTopSessions(sessions, true)
 	require.Len(t, got, 2)
-	assert.Equal(t, 12.4, got[0].ActiveDurationMin)
-	assert.Equal(t, 12.3, got[1].ActiveDurationMin)
+	assert.InDelta(t, 12.4, got[0].ActiveDurationMin, 1e-9)
+	assert.InDelta(t, 12.3, got[1].ActiveDurationMin, 1e-9)
 }

@@ -1,19 +1,20 @@
 package insight
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/friction"
+	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 const (
@@ -38,6 +39,7 @@ const (
 	CannedToolReliabilityReview        CannedKind = "tool_reliability_review"
 	CannedModelCostReview              CannedKind = "model_cost_review"
 	CannedInstructionOpportunityReview CannedKind = "instruction_opportunity_review"
+	CannedFrictionReview               CannedKind = "friction_review"
 )
 
 // ValidCannedKinds is the fixed template set for generated recommendations.
@@ -48,6 +50,7 @@ var ValidCannedKinds = map[CannedKind]bool{
 	CannedToolReliabilityReview:        true,
 	CannedModelCostReview:              true,
 	CannedInstructionOpportunityReview: true,
+	CannedFrictionReview:               true,
 }
 
 type cannedTemplate struct {
@@ -100,6 +103,13 @@ var cannedTemplates = map[CannedKind]cannedTemplate{
 		Focus: "Suggest instruction, skill, or process improvements using only the supplied deterministic aggregates and Coach-derived repeated workflow clusters. " +
 			"Label every suggestion as a draft opportunity, not a confirmed policy or installed skill.",
 	},
+	CannedFrictionReview: {
+		ID:      "friction_review",
+		Version: "2026-09-22",
+		Title:   "Friction Review",
+		Focus: "Summarize one Friction Log digest using only the supplied deterministic digest summary, pattern titles and counts, and P0 alerts. " +
+			"Focus on which friction patterns recur, which tools fail across sessions, and which process, instruction, or environment changes would reduce them.",
+	},
 }
 
 // CannedAggregatePayload is the deterministic input sent to the LLM.
@@ -115,6 +125,9 @@ type CannedAggregatePayload struct {
 	Usage          *CannedUsageSummary         `json:"usage,omitempty"`
 	Coach          *CannedCoachSummary         `json:"coach,omitempty"`
 	EvidenceRefs   []CannedEvidenceRef         `json:"evidence_refs"`
+	// Friction is set only for friction_review. Nil keeps the previous
+	// aggregate hashes for all existing session-signal templates.
+	Friction *CannedFrictionReviewInput `json:"friction,omitempty"`
 }
 
 type CannedSessionFilters struct {
@@ -156,19 +169,19 @@ type CannedUsageSummary struct {
 	OutputTokens        int                    `json:"output_tokens"`
 	CacheCreationTokens int                    `json:"cache_creation_tokens"`
 	CacheReadTokens     int                    `json:"cache_read_tokens"`
-	TotalCost           float64                `json:"total_cost"`
-	CacheSavings        float64                `json:"cache_savings"`
+	TotalCost           money.Money            `json:"total_cost"`
+	CacheSavings        money.Money            `json:"cache_savings"`
 	ModelBreakdowns     []CannedModelBreakdown `json:"model_breakdowns,omitempty"`
 	TopSessionsByCost   []db.TopSessionEntry   `json:"top_sessions_by_cost,omitempty"`
 }
 
 type CannedModelBreakdown struct {
-	ModelName           string  `json:"model_name"`
-	InputTokens         int     `json:"input_tokens"`
-	OutputTokens        int     `json:"output_tokens"`
-	CacheCreationTokens int     `json:"cache_creation_tokens"`
-	CacheReadTokens     int     `json:"cache_read_tokens"`
-	Cost                float64 `json:"cost"`
+	ModelName           string      `json:"model_name"`
+	InputTokens         int         `json:"input_tokens"`
+	OutputTokens        int         `json:"output_tokens"`
+	CacheCreationTokens int         `json:"cache_creation_tokens"`
+	CacheReadTokens     int         `json:"cache_read_tokens"`
+	Cost                money.Money `json:"cost"`
 }
 
 type CannedEvidenceRef struct {
@@ -268,8 +281,32 @@ func CannedTemplate(kind CannedKind) (cannedTemplate, bool) {
 	return t, ok
 }
 
+// cannedModelInput is the JSON the model sees and the aggregate hash covers.
+// Existing templates keep their full payload. friction_review sends only its
+// digest input, excluding empty session aggregates.
+func cannedModelInput(payload CannedAggregatePayload) any {
+	if payload.Kind != CannedFrictionReview {
+		return payload
+	}
+	return struct {
+		Kind         CannedKind                 `json:"kind"`
+		DateFrom     string                     `json:"date_from"`
+		DateTo       string                     `json:"date_to"`
+		Focus        string                     `json:"focus,omitempty"`
+		Friction     *CannedFrictionReviewInput `json:"friction"`
+		EvidenceRefs []CannedEvidenceRef        `json:"evidence_refs"`
+	}{
+		Kind:         payload.Kind,
+		DateFrom:     payload.DateFrom,
+		DateTo:       payload.DateTo,
+		Focus:        payload.Focus,
+		Friction:     payload.Friction,
+		EvidenceRefs: payload.EvidenceRefs,
+	}
+}
+
 func CannedAggregateHash(payload CannedAggregatePayload) (string, error) {
-	data, err := canonicalJSON(payload)
+	data, err := canonicalJSON(cannedModelInput(payload))
 	if err != nil {
 		return "", err
 	}
@@ -285,6 +322,7 @@ func CannedCacheKey(
 	dateFrom, dateTo, project, requestedAgent, focus, aggregateHash string,
 	automatedScope string,
 	filters CannedSessionFilters,
+	generation GenerateOptions,
 ) (string, error) {
 	t, ok := CannedTemplate(kind)
 	if !ok {
@@ -296,18 +334,37 @@ func CannedCacheKey(
 		return "", err
 	}
 	filterSum := sha256.Sum256(filterData)
+	generationBackend := requestedAgent
+	generationModel := ""
+	generationEndpointHash := ""
+	if generation.Endpoint != nil &&
+		strings.TrimSpace(generation.Endpoint.Endpoint) != "" &&
+		strings.TrimSpace(generation.Endpoint.Model) != "" {
+		generationBackend = "openai"
+		generationModel = strings.TrimSpace(generation.Endpoint.Model)
+		endpointSum := sha256.Sum256(
+			[]byte(strings.TrimSpace(generation.Endpoint.Endpoint)),
+		)
+		generationEndpointHash = hex.EncodeToString(endpointSum[:])
+		requestedAgent = ""
+	} else if requestedAgent == "gemini" {
+		generationModel = geminiInsightModel
+	}
 	input := map[string]string{
-		"kind":             string(kind),
-		"date_from":        dateFrom,
-		"date_to":          dateTo,
-		"project":          project,
-		"requested_agent":  requestedAgent,
-		"template_version": t.Version,
-		"schema_version":   CannedSchemaVersion,
-		"aggregate_hash":   aggregateHash,
-		"focus_hash":       hex.EncodeToString(focusSum[:]),
-		"automated_scope":  automatedScope,
-		"filter_hash":      hex.EncodeToString(filterSum[:]),
+		"kind":                     string(kind),
+		"date_from":                dateFrom,
+		"date_to":                  dateTo,
+		"project":                  project,
+		"requested_agent":          requestedAgent,
+		"template_version":         t.Version,
+		"schema_version":           CannedSchemaVersion,
+		"aggregate_hash":           aggregateHash,
+		"focus_hash":               hex.EncodeToString(focusSum[:]),
+		"automated_scope":          automatedScope,
+		"filter_hash":              hex.EncodeToString(filterSum[:]),
+		"generation_backend":       generationBackend,
+		"generation_model":         generationModel,
+		"generation_endpoint_hash": generationEndpointHash,
 	}
 	data, err := canonicalJSON(input)
 	if err != nil {
@@ -325,7 +382,7 @@ func BuildCannedPrompt(
 	if !ok {
 		return "", fmt.Errorf("unknown canned insight kind: %s", payload.Kind)
 	}
-	data, err := canonicalJSON(payload)
+	data, err := canonicalJSON(cannedModelInput(payload))
 	if err != nil {
 		return "", err
 	}
@@ -399,6 +456,16 @@ func writeCannedKindRules(
 			b.WriteString("- Context pressure coverage is present; pressure conclusions must cite the aggregate pressure fields and stay proportional to the covered session count.\n")
 		}
 		b.WriteString("\n")
+	case CannedFrictionReview:
+		b.WriteString("Friction review template rules:\n")
+		b.WriteString("- Friction findings are deterministic heuristics already computed by agentsview. Do not add, remove, re-classify, or dispute findings, and do not assign severities or scores.\n")
+		b.WriteString("- Do not propose filing, closing, reopening, or editing tracker issues.\n")
+		b.WriteString("- Cite friction:pattern:NN refs for pattern-specific recommendations and friction:p0_alerts for tools failing across sessions.\n")
+		b.WriteString("- frustration (user frustration markers) and interruption (user-interrupted turns) are detector kinds of their own; weigh them like corrections and deferrals respectively.\n")
+		b.WriteString("- Frustration pattern titles are withheld because they quote the user; reason about them from kind and counts only, and never guess their wording.\n")
+		b.WriteString("- Prefer recurring patterns (recurring=true) over first-seen ones when their counts are similar.\n\n")
+	default:
+		// Other templates need no context-setup rules.
 	}
 }
 
@@ -410,16 +477,10 @@ func ParseCannedEnvelope(raw string) (CannedRecommendationEnvelope, error) {
 	clean = strings.TrimSpace(clean)
 
 	var out CannedRecommendationEnvelope
-	dec := json.NewDecoder(strings.NewReader(clean))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&out); err != nil {
+	if err := json.Unmarshal(
+		[]byte(clean), &out, json.RejectUnknownMembers(true),
+	); err != nil {
 		return out, fmt.Errorf("parsing canned insight JSON: %w", err)
-	}
-	var extra struct{}
-	if err := dec.Decode(&extra); err == nil {
-		return out, errors.New("canned insight JSON contains trailing values")
-	} else if !errors.Is(err, io.EOF) {
-		return out, fmt.Errorf("canned insight JSON has trailing data: %w", err)
 	}
 	return out, nil
 }
@@ -479,7 +540,11 @@ func RenderCannedMarkdown(
 ) string {
 	var b strings.Builder
 	b.WriteString("# AI-generated recommendation\n\n")
-	b.WriteString("> Generated recommendation text. Deterministic health scores and signal rows were not modified.\n\n")
+	if out.Kind == CannedFrictionReview {
+		fmt.Fprintf(&b, "> Model-written summary of the Friction Log digest for %s. Findings, digests, and tracker issues were not modified.\n\n", prov.DateFrom)
+	} else {
+		b.WriteString("> Generated recommendation text. Deterministic health scores and signal rows were not modified.\n\n")
+	}
 	b.WriteString("## Summary\n\n")
 	b.WriteString(out.Summary)
 	b.WriteString("\n\n")
@@ -537,24 +602,27 @@ func NewCannedProvenance(
 		Filters:         payload.Filters.ProvenanceMap(payload.Project),
 		Agent:           agent,
 		Model:           model,
-		SourceVersions: map[string]string{
-			"signals_analytics": "v1",
-			"usage_analytics":   "v1",
-			"coach_insights":    "AI-Engineering-Coach-inspired.v1",
-		},
+		SourceVersions:  cannedSourceVersions(payload),
 	}, nil
 }
 
+func cannedSourceVersions(payload CannedAggregatePayload) map[string]string {
+	if payload.Kind == CannedFrictionReview && payload.Friction != nil {
+		return map[string]string{
+			"friction_rules":           payload.Friction.RulesVersion,
+			"friction_summary_schema":  strconv.Itoa(friction.SummarySchemaVersion),
+			"friction_digest_revision": strconv.Itoa(payload.Friction.Revision),
+		}
+	}
+	return map[string]string{
+		"signals_analytics": "v1",
+		"usage_analytics":   "v1",
+		"coach_insights":    "AI-Engineering-Coach-inspired.v1",
+	}
+}
+
 func canonicalJSON(v any) ([]byte, error) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, data); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return json.Marshal(v, json.Deterministic(true))
 }
 
 func validConfidence(v string) bool {
@@ -1100,11 +1168,11 @@ func sortedKeys(values map[string]bool) []string {
 }
 
 func truncateRunes(s string, maxRunes int) string {
-	runes := []rune(strings.TrimSpace(s))
-	if len(runes) <= maxRunes {
-		return string(runes)
+	s = string([]rune(strings.TrimSpace(s)))
+	if stringutil.TruncateRunes(s, maxRunes, "") == s {
+		return s
 	}
-	return string(runes[:maxRunes-3]) + "..."
+	return stringutil.TruncateRunes(s, maxRunes-3, "...")
 }
 
 func round1(v float64) float64 {
@@ -1124,8 +1192,8 @@ func CannedEvidenceRefs(
 			usage.OutputTokens > 0 ||
 			usage.CacheCreationTokens > 0 ||
 			usage.CacheReadTokens > 0 ||
-			usage.TotalCost != 0 ||
-			usage.CacheSavings != 0 ||
+			usage.TotalCost.Microdollars != 0 ||
+			usage.CacheSavings.Microdollars != 0 ||
 			len(usage.ModelBreakdowns) > 0 ||
 			len(usage.TopSessionsByCost) > 0)
 	refs := []CannedEvidenceRef{

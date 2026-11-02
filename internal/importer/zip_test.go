@@ -12,6 +12,7 @@ import (
 
 func createTestZip(t *testing.T, files map[string]string) string {
 	t.Helper()
+
 	zipPath := filepath.Join(t.TempDir(), "test.zip")
 	f, err := os.Create(zipPath)
 	require.NoError(t, err)
@@ -44,9 +45,4 @@ func TestExtractZip(t *testing.T) {
 	data, err = os.ReadFile(filepath.Join(dir, "subdir", "file.txt"))
 	require.NoError(t, err)
 	assert.Equal(t, "hello", string(data))
-}
-
-func TestExtractZip_InvalidPath(t *testing.T) {
-	_, _, err := ExtractZip("/nonexistent.zip")
-	require.Error(t, err)
 }

@@ -2,9 +2,11 @@
   import { onDestroy, onMount } from "svelte";
   import { m } from "../../i18n/index.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import { ui } from "../../stores/ui.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import SessionItem from "./SessionItem.svelte";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
+  import SidebarToggleButton from "../layout/SidebarToggleButton.svelte";
   import {
     ChevronDownIcon,
     ChevronRightIcon,
@@ -15,6 +17,7 @@
   import { TrashIcon, CheckIcon } from "../../icons.js";
   import { formatNumber } from "../../utils/format.js";
   import { agentColor } from "../../utils/agents.js";
+  import { registerSessionList } from "../../utils/arrow-target.js";
   import {
     type DisplayItem,
     type GroupMode,
@@ -22,6 +25,7 @@
     OVERSCAN,
     STORAGE_KEY_GROUP,
     getInitialGroupMode,
+    adjacentVisibleSessionId,
     buildGroupSections,
     buildDisplayItems,
     computeTotalSize,
@@ -47,8 +51,20 @@
   let expandedGroups: Set<string> = $state(new Set());
   let detachSidebar: (() => void) | null = null;
 
+  function navigateVisibleSession(delta: number) {
+    const id = adjacentVisibleSessionId(
+      renderDisplayItems,
+      sessions.activeSessionId,
+      delta,
+    );
+    if (id) sessions.selectSession(id);
+  }
+
   onMount(() => {
     detachSidebar = sessions.attachSidebar();
+    const element = containerRef;
+    if (!element) return;
+    return registerSessionList(element, navigateVisibleSession);
   });
 
   $effect(() => {
@@ -426,12 +442,14 @@
         const match = g.sessions.find((s) => s.id === activeId);
         if (!match) continue;
         if (match.id === g.primarySessionId) break; // already primary
-        const next = new Set(expandedGroups);
-        if (!next.has(g.key)) next.add(g.key);
-        // Auto-expand the correct sub-group.
-        next.add(`subagent:${g.key}`);
-        next.add(`team:${g.key}`);
-        expandedGroups = next;
+        // Auto-expand the group and its sub-groups. Assign only when a
+        // key is new: while the sidebar still paints its pre-hydration
+        // snapshot the child row cannot appear yet, and replacing the
+        // set with an equal one would re-run this effect forever.
+        const keys = [g.key, `subagent:${g.key}`, `team:${g.key}`];
+        if (keys.some((key) => !expandedGroups.has(key))) {
+          expandedGroups = new Set([...expandedGroups, ...keys]);
+        }
         return;
       }
       return;
@@ -494,6 +512,9 @@
       onClearExtra={() => sessions.setTerminationFilter("")}
       extraSections={statusFilterSection}
     />
+    {#if !ui.isMobileViewport}
+      <SidebarToggleButton placement="sidebar" />
+    {/if}
     {#snippet statusFilterSection()}
       <div class="filter-section">
         <div class="filter-section-label">{m.sidebar_status()}</div>
@@ -527,6 +548,10 @@
     {/snippet}
   </div>
 </div>
+
+{#if sessions.sidebarLoadError}
+  <div class="sidebar-load-error" role="alert">{sessions.sidebarLoadError}</div>
+{/if}
 
 {#if sessions.selectMode}
   <div class="batch-toolbar">
@@ -709,6 +734,12 @@
 
   .loading-indicator {
     color: var(--accent-green);
+  }
+
+  .sidebar-load-error {
+    padding: 4px 12px;
+    font-size: 11px;
+    color: var(--accent-red);
   }
 
   /* Snippet rendered inside SessionFilterControl carries this
@@ -987,7 +1018,7 @@
   }
 
   .batch-delete-btn:disabled {
-    opacity: 0.4;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 

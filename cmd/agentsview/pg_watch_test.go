@@ -2,9 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,12 +12,15 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/agentsview/internal/apiclient"
+	"go.kenn.io/agentsview/internal/archivepush"
 	"go.kenn.io/agentsview/internal/config"
-	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/storage"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
 func TestResolvePushProjects(t *testing.T) {
-	tests := []projectResolutionCase[PGPushConfig]{
+	tests := []projectResolutionCase[ReplicaPushConfig]{
 		{
 			name:        "config include used when no flags",
 			projects:    []string{"a", "b"},
@@ -27,22 +29,22 @@ func TestResolvePushProjects(t *testing.T) {
 		{
 			name:        "flag include overrides config exclude",
 			exclude:     []string{"x"},
-			cfg:         PGPushConfig{ProjectsFlag: "a,b"},
+			cfg:         ReplicaPushConfig{ProjectsFlag: "a,b"},
 			wantInclude: []string{"a", "b"},
 		},
 		{
 			name:     "all-projects clears both",
 			projects: []string{"a"},
-			cfg:      PGPushConfig{AllProjects: true},
+			cfg:      ReplicaPushConfig{AllProjects: true},
 		},
 		{
 			name:    "both flags is an error",
-			cfg:     PGPushConfig{ProjectsFlag: "a", ExcludeProjects: "b"},
+			cfg:     ReplicaPushConfig{ProjectsFlag: "a", ExcludeProjects: "b"},
 			wantErr: true,
 		},
 		{
 			name:    "all-projects with include is an error",
-			cfg:     PGPushConfig{AllProjects: true, ProjectsFlag: "a"},
+			cfg:     ReplicaPushConfig{AllProjects: true, ProjectsFlag: "a"},
 			wantErr: true,
 		},
 		{
@@ -53,13 +55,13 @@ func TestResolvePushProjects(t *testing.T) {
 		},
 		{
 			name:    "all-projects with exclude is an error",
-			cfg:     PGPushConfig{AllProjects: true, ExcludeProjects: "x"},
+			cfg:     ReplicaPushConfig{AllProjects: true, ExcludeProjects: "x"},
 			wantErr: true,
 		},
 	}
 	runProjectResolutionCases(t, tests,
-		func(projects, exclude []string, cfg PGPushConfig) ([]string, []string, error) {
-			return resolvePushProjects(config.PGConfig{
+		func(projects, exclude []string, cfg ReplicaPushConfig) ([]string, []string, error) {
+			return resolvePushProjects(storage.ConfiguredReplica{
 				Projects:        projects,
 				ExcludeProjects: exclude,
 			}, cfg)
@@ -74,19 +76,23 @@ func TestArchiveWriteBackendPGPushPostsToDaemon(t *testing.T) {
 		r *http.Request,
 	) {
 		gotAuth = r.Header.Get("Authorization")
-		var req daemonPushRequest
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		var req apiclient.DaemonPushRequest
+		if !assert.NoError(t, json.UnmarshalRead(r.Body, &req)) {
+			return
+		}
 		assert.True(t, req.Full)
 		assert.Equal(t, []string{"a"}, req.Projects)
 		assert.Equal(t, []string{"b"}, req.ExcludeProjects)
-		require.NotNil(t, req.PG)
-		assert.Equal(t, "postgres://user:pass@host/db", req.PG.URL)
-		assert.Equal(t, "mirror", req.PG.Schema)
-		assert.Equal(t, "laptop", req.PG.MachineName)
-		assert.True(t, req.PG.AllowInsecure)
-		assert.Equal(t, "work", req.SyncStateTarget)
-		assert.True(t, req.MigrateLegacySyncState)
-		writeTestJSON(t, w, postgres.PushResult{
+		if !assert.NotNil(t, req.Replica) {
+			return
+		}
+		assert.Equal(t, "postgres://user:pass@host/db", req.Replica.URL)
+		assert.Equal(t, new("mirror"), req.Replica.Schema)
+		assert.Equal(t, "laptop", req.Replica.MachineName)
+		assert.Equal(t, new(true), req.Replica.AllowInsecure)
+		assert.Equal(t, new("work"), req.SyncStateTarget)
+		assert.Equal(t, new(true), req.MigrateLegacySyncState)
+		writeTestJSON(t, w, storage.PushResult{
 			SessionsPushed: 2,
 			MessagesPushed: 3,
 			Duration:       time.Second,
@@ -96,19 +102,18 @@ func TestArchiveWriteBackendPGPushPostsToDaemon(t *testing.T) {
 	backend := newDaemonArchiveWriteBackendForTest(
 		config.Config{AuthToken: "secret"}, ts.URL,
 	)
-	result, err := backend.PGPush(
-		context.Background(),
-		pgTargetSelection{
-			PG: config.PGConfig{
+	result, err := backend.ReplicaPush(
+		t.Context(), pgReplica{},
+		storage.ConfiguredReplica{
+			Name: "work", IsDefault: true,
+			Target: storage.ReplicaTarget{
 				URL:           "postgres://user:pass@host/db",
 				Schema:        "mirror",
 				MachineName:   "laptop",
 				AllowInsecure: true,
 			},
-			SyncStateTarget:        "work",
-			MigrateLegacySyncState: true,
 		},
-		PGPushConfig{Full: true},
+		ReplicaPushConfig{Full: true},
 		[]string{"a"},
 		[]string{"b"},
 	)
@@ -131,11 +136,11 @@ func TestResolveArchiveWriteBackendSkipsReadOnlyDaemon(t *testing.T) {
 	registerTestRuntime(t, dataDir, ts.URL, true)
 
 	backend, cleanup, err := resolveArchiveWriteBackend(
-		context.Background(),
+		t.Context(),
 		config.Config{
 			DataDir: dataDir,
 			DBPath:  filepath.Join(dataDir, "sessions.db"),
-		},
+		}, transportIntentArchiveWrite,
 	)
 	require.NoError(t, err)
 	defer cleanup()
@@ -145,14 +150,75 @@ func TestResolveArchiveWriteBackendSkipsReadOnlyDaemon(t *testing.T) {
 
 func TestArchiveWriteBackendPGPushWatchReResolvesDaemon(t *testing.T) {
 	dataDir := t.TempDir()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	setTestVersion(t, "v1.1.0-2-g123456")
+	stubStartBackgroundServeForTransport(t, func(context.Context, *config.Config, time.Duration, bool) (*DaemonRuntime, error) {
+		cancel()
+		return nil, context.Canceled
+	})
 	var startupPushes int
 	startup := pushRuntimeServer(t, "/api/v1/push/pg", func(
 		w http.ResponseWriter,
 		r *http.Request,
 	) {
 		startupPushes++
-		writeTestJSON(t, w, postgres.PushResult{SessionsPushed: 1})
+		writeTestJSON(t, w, storage.PushResult{SessionsPushed: 1})
+	})
+	var resolvedPushes int
+	resolved := pushRuntimeServer(t, "/api/v1/push/pg", func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		resolvedPushes++
+		if resolvedPushes == 2 {
+			cancel()
+		}
+		writeTestJSON(t, w, storage.PushResult{SessionsPushed: 1})
+	})
+	host, port := splitTestServerURL(t, resolved.URL)
+	writeDaemonRuntimeForTest(t, dataDir, host, port, "v1.1.0-3-gabcdef", false)
+
+	backend := newDaemonArchiveWriteBackendForTest(
+		config.Config{DataDir: dataDir}, startup.URL,
+	)
+	err := backend.ReplicaPushWatch(
+		ctx, pgReplica{},
+		storage.ConfiguredReplica{Target: storage.ReplicaTarget{
+			URL: "postgres://user:pass@host/db",
+		}},
+		ReplicaPushConfig{},
+		nil,
+		nil,
+		time.Millisecond,
+		time.Millisecond,
+	)
+	require.NoError(t, err)
+	assert.Equal(t, 1, startupPushes)
+	assert.GreaterOrEqual(t, resolvedPushes, 2)
+	assert.NoFileExists(t, filepath.Join(dataDir, "sessions.db"))
+}
+
+// TestArchiveWriteBackendPGPushWatchRetriesStartupOnResolvedDaemon checks that
+// a failed startup push retries against the daemon the runtime file names now.
+// A daemon that restarts on a new address must not leave the watch retrying the
+// address it launched with.
+func TestArchiveWriteBackendPGPushWatchRetriesStartupOnResolvedDaemon(t *testing.T) {
+	dataDir := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	setTestVersion(t, "v1.1.0-2-g123456")
+	stubStartBackgroundServeForTransport(t, func(context.Context, *config.Config, time.Duration, bool) (*DaemonRuntime, error) {
+		cancel()
+		return nil, context.Canceled
+	})
+	var launchPushes int
+	launch := pushRuntimeServer(t, "/api/v1/push/pg", func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		launchPushes++
+		http.Error(w, "daemon restarting", http.StatusServiceUnavailable)
 	})
 	var resolvedPushes int
 	resolved := pushRuntimeServer(t, "/api/v1/push/pg", func(
@@ -161,48 +227,118 @@ func TestArchiveWriteBackendPGPushWatchReResolvesDaemon(t *testing.T) {
 	) {
 		resolvedPushes++
 		cancel()
-		writeTestJSON(t, w, postgres.PushResult{SessionsPushed: 1})
+		writeTestJSON(t, w, storage.PushResult{SessionsPushed: 1})
 	})
-	registerTestRuntime(t, dataDir, resolved.URL, false)
+	host, port := splitTestServerURL(t, resolved.URL)
+	writeDaemonRuntimeForTest(t, dataDir, host, port, "v1.1.0-3-gabcdef", false)
 
 	backend := newDaemonArchiveWriteBackendForTest(
-		config.Config{DataDir: dataDir}, startup.URL,
+		config.Config{DataDir: dataDir}, launch.URL,
 	)
-	err := backend.PGPushWatch(
-		ctx,
-		pgTargetSelection{
-			PG: config.PGConfig{
-				URL: "postgres://user:pass@host/db",
-			},
-		},
-		PGPushConfig{},
+	err := backend.ReplicaPushWatch(
+		ctx, pgReplica{},
+		storage.ConfiguredReplica{Target: storage.ReplicaTarget{
+			URL: "postgres://user:pass@host/db",
+		}},
+		ReplicaPushConfig{},
 		nil,
 		nil,
 		time.Millisecond,
-		time.Millisecond,
+		time.Hour,
 	)
 	require.NoError(t, err)
-	assert.Equal(t, 1, startupPushes)
-	assert.GreaterOrEqual(t, resolvedPushes, 1)
-	assert.NoFileExists(t, filepath.Join(dataDir, "sessions.db"))
+	assert.Equal(t, 1, launchPushes, "only the first push uses the launch address")
+	assert.GreaterOrEqual(t, resolvedPushes, 1, "the startup retry reaches the resolved daemon")
 }
 
-// fakeTarget is a test double for pgTarget.
+func TestArchiveWriteBackendPGPushWatchRetriesStartupRequiringDaemon(t *testing.T) {
+	dataDir := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	setTestVersion(t, "v1.1.0-2-g123456")
+	var starts int
+	stubStartBackgroundServeForTransport(t, func(context.Context, *config.Config, time.Duration, bool) (*DaemonRuntime, error) {
+		starts++
+		cancel()
+		return nil, context.Canceled
+	})
+	var resolvedPushes int
+	resolved := pushRuntimeServer(t, "/api/v1/push/pg", func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		resolvedPushes++
+		writeTestJSON(t, w, storage.PushResult{SessionsPushed: 1})
+	})
+	var launchPushes int
+	launch := pushRuntimeServer(t, "/api/v1/push/pg", func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		launchPushes++
+		http.Error(w, "daemon restarting", http.StatusServiceUnavailable)
+	})
+
+	cfg := config.Config{DataDir: dataDir, DBPath: filepath.Join(dataDir, "sessions.db"), RequireDaemon: true}
+	backend := newDaemonArchiveWriteBackendForTest(cfg, launch.URL)
+	var retriedWithoutDaemon bool
+	var recovered bool
+	backend.watchHooks = &archivePushWatchHooks{
+		newLoop: func(
+			label string, debounce, interval time.Duration,
+			push func(context.Context, pushReason, *syncpkg.WatchBatch) error,
+		) (*pushLoop, func()) {
+			loop, ticker := newPushLoopWithLabel(label, debounce, interval, func(ctx context.Context, reason pushReason, batch *syncpkg.WatchBatch) error {
+				err := push(ctx, reason, batch)
+				if errors.Is(err, errNoWritableDaemon) && !retriedWithoutDaemon {
+					retriedWithoutDaemon = true
+					host, port := splitTestServerURL(t, resolved.URL)
+					writeDaemonRuntimeForTest(t, dataDir, host, port, "v1.1.0-3-gabcdef", false)
+				}
+				if err == nil && retriedWithoutDaemon && resolvedPushes > 0 {
+					recovered = true
+					cancel()
+				}
+				return err
+			})
+			return loop, ticker.Stop
+		},
+	}
+	err := backend.ReplicaPushWatch(
+		ctx, pgReplica{},
+		storage.ConfiguredReplica{Target: storage.ReplicaTarget{
+			URL: "postgres://user:pass@host/db",
+		}},
+		ReplicaPushConfig{},
+		nil,
+		nil,
+		time.Millisecond,
+		time.Hour,
+	)
+	require.NoError(t, err)
+	require.ErrorIs(t, ctx.Err(), context.Canceled, "recovery must cancel the watch before its deadline")
+	assert.Equal(t, 1, launchPushes, "only the first push uses the launch address")
+	assert.GreaterOrEqual(t, resolvedPushes, 1, "the startup retry reaches the resolved daemon")
+	assert.True(t, retriedWithoutDaemon, "a retry observes the collector outage before its replacement is published")
+	assert.True(t, recovered, "a later retry completes through the replacement daemon")
+}
+
+// fakeTarget is a test double for storage.Pusher.
 type fakeTarget struct {
 	ensureErr  error
 	pushErr    error
-	pushResult postgres.PushResult
+	pushResult storage.PushResult
 	onPush     func()
 	pushes     int
 	closed     int
-	pushOpts   []postgres.PushOptions // options of each push, in order
+	pushOpts   []storage.PushOptions // options of each push, in order
 }
 
 func (f *fakeTarget) EnsureSchema(context.Context) error { return f.ensureErr }
 func (f *fakeTarget) PushWithOptions(
-	_ context.Context, opts postgres.PushOptions,
-	_ func(postgres.PushProgress),
-) (postgres.PushResult, error) {
+	_ context.Context, opts storage.PushOptions,
+	_ func(storage.PushProgress),
+) (storage.PushResult, error) {
 	f.pushes++
 	f.pushOpts = append(f.pushOpts, opts)
 	if f.onPush != nil {
@@ -212,25 +348,33 @@ func (f *fakeTarget) PushWithOptions(
 }
 func (f *fakeTarget) Close() error { f.closed++; return nil }
 
-// pusherRecorder tracks how many times a test pgPusher dialed a connection.
+// pusherRecorder tracks how many times a test replicaPusher dialed a connection.
 type pusherRecorder struct {
 	connects int
 }
 
-// newTestPgPusher builds a pgPusher whose localSync is a no-op and whose
-// connect hands out the supplied targets in order, recording each dial.
-func newTestPgPusher(targets ...*fakeTarget) (*pgPusher, *pusherRecorder) {
+// newTestReplicaPusher builds a replicaPusher whose connect hands out the
+// supplied targets in order, recording each dial.
+func newTestReplicaPusher(targets ...*fakeTarget) (*replicaPusher, *pusherRecorder) {
 	rec := &pusherRecorder{}
-	p := &pgPusher{
-		localSync:     func(context.Context) error { return nil },
-		ensurePricing: func(context.Context) error { return nil },
-		connect: func() (pgTarget, error) {
+	p := testReplicaPusher(archivepush.ReplicaSession{
+		EnsurePricing: func(context.Context) error { return nil },
+		Connect: func(context.Context) (storage.Pusher, error) {
 			tgt := targets[rec.connects]
 			rec.connects++
 			return tgt, nil
 		},
-	}
+	})
 	return p, rec
+}
+
+func testReplicaPusher(session archivepush.ReplicaSession) *replicaPusher {
+	return &replicaPusher{
+		label:       "pg watch",
+		displayName: "PostgreSQL",
+		session:     session,
+		vectors:     newVectorReconcile(),
+	}
 }
 
 // TestPGPusherScopesChangeVectorPushes pins the watch scoping policy: only
@@ -239,22 +383,22 @@ func newTestPgPusher(targets ...*fakeTarget) (*pgPusher, *pusherRecorder) {
 // stay generation-wide, and a deferring vector phase forces the next push
 // back to generation-wide before scoping resumes.
 func TestPGPusherScopesChangeVectorPushes(t *testing.T) {
-	target := &fakeTarget{pushResult: postgres.PushResult{
-		Vectors: postgres.VectorPushResult{GenerationID: 1},
+	target := &fakeTarget{pushResult: storage.PushResult{
+		Vectors: storage.VectorPushResult{GenerationID: 1},
 	}}
-	pusher, _ := newTestPgPusher(target)
-	pusher.vectorReconcileNeeded = true
-	ctx := context.Background()
+	pusher, _ := newTestReplicaPusher(target)
+	pusher.vectors.needed = true
+	ctx := t.Context()
 
 	require.NoError(t, pusher.push(ctx, reasonStartup, false))
 	require.NoError(t, pusher.push(ctx, reasonChange, false))
 	require.NoError(t, pusher.push(ctx, reasonInterval, false))
-	target.pushResult = postgres.PushResult{
-		Vectors: postgres.VectorPushResult{SessionsDeferred: 1},
+	target.pushResult = storage.PushResult{
+		Vectors: storage.VectorPushResult{SessionsDeferred: 1},
 	}
 	require.NoError(t, pusher.push(ctx, reasonChange, false))
-	target.pushResult = postgres.PushResult{
-		Vectors: postgres.VectorPushResult{GenerationID: 1},
+	target.pushResult = storage.PushResult{
+		Vectors: storage.VectorPushResult{GenerationID: 1},
 	}
 	require.NoError(t, pusher.push(ctx, reasonChange, false))
 	require.NoError(t, pusher.push(ctx, reasonChange, false))
@@ -276,14 +420,14 @@ func TestPGPusherScopesChangeVectorPushes(t *testing.T) {
 // response that carries an id.
 func TestPGPusherZeroGenerationKeepsReconcile(t *testing.T) {
 	target := &fakeTarget{}
-	pusher, _ := newTestPgPusher(target)
-	pusher.vectorReconcileNeeded = true
-	ctx := context.Background()
+	pusher, _ := newTestReplicaPusher(target)
+	pusher.vectors.needed = true
+	ctx := t.Context()
 
 	require.NoError(t, pusher.push(ctx, reasonStartup, false))
 	require.NoError(t, pusher.push(ctx, reasonChange, false))
-	target.pushResult = postgres.PushResult{
-		Vectors: postgres.VectorPushResult{GenerationID: 3},
+	target.pushResult = storage.PushResult{
+		Vectors: storage.VectorPushResult{GenerationID: 3},
 	}
 	require.NoError(t, pusher.push(ctx, reasonInterval, false))
 	require.NoError(t, pusher.push(ctx, reasonChange, false))
@@ -302,11 +446,11 @@ func TestPGPusherZeroGenerationKeepsReconcile(t *testing.T) {
 // TestPGPusherPushErrorForcesReconcile pins that any push error sends the
 // next push back to a generation-wide vector reconciliation.
 func TestPGPusherPushErrorForcesReconcile(t *testing.T) {
-	failing := &fakeTarget{pushErr: fmt.Errorf("boom")}
+	failing := &fakeTarget{pushErr: errors.New("boom")}
 	recovered := &fakeTarget{}
-	pusher, _ := newTestPgPusher(failing, recovered)
-	pusher.vectorReconcileNeeded = false
-	ctx := context.Background()
+	pusher, _ := newTestReplicaPusher(failing, recovered)
+	pusher.vectors.needed = false
+	ctx := t.Context()
 
 	require.Error(t, pusher.push(ctx, reasonChange, false))
 	require.NoError(t, pusher.push(ctx, reasonChange, false))
@@ -324,13 +468,13 @@ func TestPGPusherPushErrorForcesReconcile(t *testing.T) {
 // always carries the current id for the vector phase to compare against.
 func TestPGPusherThreadsGenerationID(t *testing.T) {
 	target := &fakeTarget{}
-	pusher, _ := newTestPgPusher(target)
-	pusher.vectorReconcileNeeded = true
-	ctx := context.Background()
+	pusher, _ := newTestReplicaPusher(target)
+	pusher.vectors.needed = true
+	ctx := t.Context()
 
 	// Startup reconciles generation id 1 generation-wide.
-	target.pushResult = postgres.PushResult{
-		Vectors: postgres.VectorPushResult{GenerationID: 1},
+	target.pushResult = storage.PushResult{
+		Vectors: storage.VectorPushResult{GenerationID: 1},
 	}
 	require.NoError(t, pusher.push(ctx, reasonStartup, false))
 
@@ -340,8 +484,8 @@ func TestPGPusherThreadsGenerationID(t *testing.T) {
 	// The active generation is recreated as id 2. The phase promotes itself
 	// and reconciles it generation-wide, reported by the differing id, so the
 	// memo advances to 2 while the reconcile bit stays clear.
-	target.pushResult = postgres.PushResult{
-		Vectors: postgres.VectorPushResult{GenerationID: 2},
+	target.pushResult = storage.PushResult{
+		Vectors: storage.VectorPushResult{GenerationID: 2},
 	}
 	require.NoError(t, pusher.push(ctx, reasonChange, false))
 
@@ -363,46 +507,39 @@ func TestPGPusherThreadsGenerationID(t *testing.T) {
 	assert.True(t, target.pushOpts[3].ScopeVectorsToChangedSessions)
 }
 
-func TestPGPusherEnsuresPricingAfterLocalSyncBeforeConnect(t *testing.T) {
+func TestPGPusherEnsuresPricingBeforeConnect(t *testing.T) {
 	var events []string
 	target := &fakeTarget{
 		onPush: func() { events = append(events, "push") },
 	}
-	pusher := &pgPusher{
-		localSync: func(context.Context) error {
-			events = append(events, "local sync")
-			return nil
-		},
-		ensurePricing: func(context.Context) error {
+	pusher := testReplicaPusher(archivepush.ReplicaSession{
+		EnsurePricing: func(context.Context) error {
 			events = append(events, "pricing ensure")
 			return nil
 		},
-		connect: func() (pgTarget, error) {
+		Connect: func(context.Context) (storage.Pusher, error) {
 			events = append(events, "connect")
 			return target, nil
 		},
-	}
+	})
 
 	require.NoError(t, pusher.push(
-		context.Background(), reasonChange, false,
+		t.Context(), reasonChange, false,
 	))
-	assert.Equal(t, []string{
-		"local sync", "pricing ensure", "connect", "push",
-	}, events)
+	assert.Equal(t, []string{"pricing ensure", "connect", "push"}, events)
 }
 
 func TestPGPusherPricingFailureWarnsAndContinues(t *testing.T) {
 	wantErr := errors.New("catalog unavailable")
 	target := &fakeTarget{}
 	logs := captureLogOutput(t)
-	pusher := &pgPusher{
-		localSync:     func(context.Context) error { return nil },
-		ensurePricing: func(context.Context) error { return wantErr },
-		connect:       func() (pgTarget, error) { return target, nil },
-	}
+	pusher := testReplicaPusher(archivepush.ReplicaSession{
+		EnsurePricing: func(context.Context) error { return wantErr },
+		Connect:       func(context.Context) (storage.Pusher, error) { return target, nil },
+	})
 
 	require.NoError(t, pusher.push(
-		context.Background(), reasonChange, false,
+		t.Context(), reasonChange, false,
 	))
 	assert.Equal(t, 1, target.pushes)
 	assert.Contains(t, logs.String(), "pricing refresh failed")
@@ -410,24 +547,23 @@ func TestPGPusherPricingFailureWarnsAndContinues(t *testing.T) {
 }
 
 func TestPGPusherCanceledPricingStopsBeforeConnect(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	connectCalled := false
-	pusher := &pgPusher{
-		localSync: func(context.Context) error { return nil },
-		ensurePricing: func(got context.Context) error {
+	pusher := testReplicaPusher(archivepush.ReplicaSession{
+		EnsurePricing: func(got context.Context) error {
 			require.Equal(t, ctx, got)
 			cancel()
 			return got.Err()
 		},
-		connect: func() (pgTarget, error) {
+		Connect: func(context.Context) (storage.Pusher, error) {
 			connectCalled = true
 			return &fakeTarget{}, nil
 		},
-	}
+	})
 
 	err := pusher.push(ctx, reasonChange, false)
 
-	assert.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, context.Canceled)
 	assert.False(t, connectCalled)
 }
 
@@ -435,18 +571,59 @@ func TestPGPusherCanceledPricingStopsBeforeConnect(t *testing.T) {
 // the target and the next push dials a fresh connection that succeeds.
 func requireReconnectAfterTargetError(t *testing.T, first *fakeTarget) {
 	t.Helper()
-	p, rec := newTestPgPusher(first, &fakeTarget{})
-	require.Error(t, p.push(context.Background(), reasonChange, false))
+
+	p, rec := newTestReplicaPusher(first, &fakeTarget{})
+	require.Error(t, p.push(t.Context(), reasonChange, false))
 	require.Equal(t, 1, first.closed, "errored target should have been closed")
-	require.NoError(t, p.push(context.Background(), reasonChange, false))
+	require.NoError(t, p.push(t.Context(), reasonChange, false))
 	require.Equal(t, 2, rec.connects, "should reconnect after error")
+}
+
+// TestPgPusherErrorsNameTheFailedStep checks that a watch push error says
+// whether the connection or the copy failed.
+func TestPgPusherErrorsNameTheFailedStep(t *testing.T) {
+	connectErr := errors.New("connection refused")
+	p := testReplicaPusher(archivepush.ReplicaSession{
+		EnsurePricing: func(context.Context) error { return nil },
+		Connect: func(context.Context) (storage.Pusher, error) {
+			return nil, connectErr
+		},
+	})
+	err := p.push(t.Context(), reasonChange, false)
+	require.ErrorIs(t, err, connectErr)
+	assert.Equal(t, "connect: connection refused", err.Error())
+	_, notStarted := errors.AsType[storage.PushNotStartedError](err)
+	assert.True(t, notStarted, "a connect failure never reached the replica")
+
+	pushErr := errors.New("conn reset")
+	p, _ = newTestReplicaPusher(&fakeTarget{pushErr: pushErr})
+	err = p.push(t.Context(), reasonChange, false)
+	require.ErrorIs(t, err, pushErr)
+	assert.Equal(t, "push: conn reset", err.Error())
+	_, notStarted = errors.AsType[storage.PushNotStartedError](err)
+	assert.False(t, notStarted, "a copy failure may have started a full push")
+}
+
+// The watch records the push stage with its own progress hook. A hook the
+// caller set must keep firing.
+func TestPgPusherKeepsTheCallerStageHook(t *testing.T) {
+	p, _ := newTestReplicaPusher(&fakeTarget{})
+	var stages []archivepush.Stage
+	p.session.OnStage = func(s archivepush.Stage) func() {
+		stages = append(stages, s)
+		return nil
+	}
+	require.NoError(t, p.push(t.Context(), reasonChange, false))
+	assert.Equal(t, []archivepush.Stage{
+		archivepush.StageConnect, archivepush.StageSchema, archivepush.StagePush,
+	}, stages)
 }
 
 func TestPgPusher_ConnectsOnceAndReuses(t *testing.T) {
 	target := &fakeTarget{}
-	p, rec := newTestPgPusher(target)
-	require.NoError(t, p.push(context.Background(), reasonChange, false))
-	require.NoError(t, p.push(context.Background(), reasonChange, false))
+	p, rec := newTestReplicaPusher(target)
+	require.NoError(t, p.push(t.Context(), reasonChange, false))
+	require.NoError(t, p.push(t.Context(), reasonChange, false))
 	assert.Equal(t, 1, rec.connects, "connection should be reused")
 	assert.Equal(t, 2, target.pushes)
 }
@@ -459,32 +636,9 @@ func TestPgPusher_ReconnectsAfterEnsureSchemaError(t *testing.T) {
 	requireReconnectAfterTargetError(t, &fakeTarget{ensureErr: errors.New("schema down")})
 }
 
-func TestPgPusher_ConnectErrorSurfaced(t *testing.T) {
-	p := &pgPusher{
-		localSync: func(context.Context) error { return nil },
-		connect: func() (pgTarget, error) {
-			return nil, errors.New("dial timeout")
-		},
-	}
-	require.Error(t, p.push(context.Background(), reasonChange, false))
-}
-
-func TestPgPusher_LocalSyncErrorSkipsConnect(t *testing.T) {
-	connects := 0
-	p := &pgPusher{
-		localSync: func(context.Context) error { return errors.New("disk") },
-		connect: func() (pgTarget, error) {
-			connects++
-			return &fakeTarget{}, nil
-		},
-	}
-	require.Error(t, p.push(context.Background(), reasonChange, false))
-	assert.Equal(t, 0, connects, "connect should not run when local sync fails")
-}
-
 func TestPgPusher_LogsPartialPushErrors(t *testing.T) {
 	target := &fakeTarget{
-		pushResult: postgres.PushResult{
+		pushResult: storage.PushResult{
 			SessionsPushed: 3,
 			MessagesPushed: 9,
 			Errors:         2,
@@ -492,19 +646,19 @@ func TestPgPusher_LogsPartialPushErrors(t *testing.T) {
 	}
 	logs := captureLogOutput(t)
 
-	p, _ := newTestPgPusher(target)
-	require.Error(t, p.push(context.Background(), reasonChange, false),
+	p, _ := newTestReplicaPusher(target)
+	require.Error(t, p.push(t.Context(), reasonChange, false),
 		"partial pushes must remain pending for retry")
 
 	got := logs.String()
 	assert.Contains(t, got, "pushed 3 sessions, 9 messages, 2 errors")
-	assert.Contains(t, got, "2 session(s) failed to push; will retry")
 	assert.Contains(t, got, "change")
+	assert.Contains(t, got, "2 session(s) failed to push; will retry")
 }
 
 func TestPgPusher_LogsSkippedConflicts(t *testing.T) {
 	target := &fakeTarget{
-		pushResult: postgres.PushResult{
+		pushResult: storage.PushResult{
 			SessionsPushed:   3,
 			MessagesPushed:   9,
 			SkippedConflicts: 2,
@@ -512,8 +666,8 @@ func TestPgPusher_LogsSkippedConflicts(t *testing.T) {
 	}
 	logs := captureLogOutput(t)
 
-	p, _ := newTestPgPusher(target)
-	require.NoError(t, p.push(context.Background(), reasonChange, false))
+	p, _ := newTestReplicaPusher(target)
+	require.NoError(t, p.push(t.Context(), reasonChange, false))
 
 	got := logs.String()
 	assert.Contains(t, got,
@@ -525,8 +679,8 @@ func TestPgPusher_LogsSkippedConflicts(t *testing.T) {
 
 func TestResolveWatchTargets_ErrorsOnEmptyURL(t *testing.T) {
 	appCfg := config.Config{} // no PG URL
-	_, _, _, err := resolveWatchTargets(
-		appCfg, PGPushConfig{}, "",
+	_, _, _, err := resolveWatchTarget(
+		pgReplica{}, appCfg, ReplicaPushConfig{}, "",
 	)
 	require.Error(t, err, "expected error when url not configured")
 }
@@ -538,11 +692,11 @@ func TestResolveWatchTargets_ResolvesProjects(t *testing.T) {
 			MachineName: "box1",
 		},
 	}
-	target, inc, _, err := resolveWatchTargets(
-		appCfg, PGPushConfig{ProjectsFlag: "a,b"}, "",
+	target, inc, _, err := resolveWatchTarget(
+		pgReplica{}, appCfg, ReplicaPushConfig{ProjectsFlag: "a,b"}, "",
 	)
 	require.NoError(t, err)
-	assert.NotEmpty(t, target.PG.URL, "expected resolved URL")
+	assert.NotEmpty(t, target.Target.URL, "expected resolved URL")
 	assert.Equal(t, []string{"a", "b"}, inc)
 }
 
@@ -562,12 +716,12 @@ func TestResolveWatchTargets_IgnoresBrokenUnselectedTarget(t *testing.T) {
 		},
 	}
 
-	target, _, _, err := resolveWatchTargets(
-		appCfg, PGPushConfig{}, "archive",
+	target, _, _, err := resolveWatchTarget(
+		pgReplica{}, appCfg, ReplicaPushConfig{}, "archive",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "archive", target.Name)
-	assert.Equal(t, "postgres://archive", target.PG.URL)
+	assert.Equal(t, "postgres://archive", target.Target.URL)
 }
 
 func TestResolvePGTargetSelections_DefaultAndAll(t *testing.T) {
@@ -579,19 +733,18 @@ func TestResolvePGTargetSelections_DefaultAndAll(t *testing.T) {
 		},
 	}
 
-	defaultTarget, err := resolvePGTargetSelections(
-		appCfg, "", false,
+	defaultTarget, err := storage.SelectTargets(
+		pgReplica{}, appCfg, "", false,
 	)
 	require.NoError(t, err)
 	require.Len(t, defaultTarget, 1)
 	assert.Equal(t, "work", defaultTarget[0].Name)
 	assert.True(t, defaultTarget[0].IsDefault)
-	assert.Equal(t, "work", defaultTarget[0].SyncStateTarget)
-	assert.True(t, defaultTarget[0].MigrateLegacySyncState)
-	assert.Empty(t, defaultTarget[0].PG.URL)
+	assert.Equal(t, "work", defaultTarget[0].SyncStateTarget())
+	assert.True(t, defaultTarget[0].MigrateLegacySyncState())
 
-	allTargets, err := resolvePGTargetSelections(
-		appCfg, "", true,
+	allTargets, err := storage.SelectTargets(
+		pgReplica{}, appCfg, "", true,
 	)
 	require.NoError(t, err)
 	require.Len(t, allTargets, 2)
@@ -615,25 +768,23 @@ func TestResolvePGTargetConfig_IgnoresBrokenUnselectedTarget(t *testing.T) {
 		},
 	}
 
-	target, err := resolvePGTargetConfig(
-		appCfg,
-		pgTargetSelection{Name: "archive"},
+	target, err := pgReplica{}.ResolveTarget(
+		appCfg, storage.ReplicaTargetRef{Name: "archive"},
 	)
 	require.NoError(t, err)
-	assert.Equal(t, "postgres://archive", target.PG.URL)
+	assert.Equal(t, "postgres://archive", target.Target.URL)
 }
 
 func restoreUnsetEnv(t *testing.T, name string) {
 	t.Helper()
 	oldValue, hadValue := os.LookupEnv(name)
+	if hadValue {
+		t.Setenv(name, oldValue)
+	} else {
+		t.Setenv(name, "")
+		t.Cleanup(func() { _ = os.Unsetenv(name) })
+	}
 	require.NoError(t, os.Unsetenv(name))
-	t.Cleanup(func() {
-		if hadValue {
-			require.NoError(t, os.Setenv(name, oldValue))
-			return
-		}
-		require.NoError(t, os.Unsetenv(name))
-	})
 }
 
 func TestResolvePGTargetSelections_RejectsLegacyNamedLookup(t *testing.T) {
@@ -644,8 +795,8 @@ func TestResolvePGTargetSelections_RejectsLegacyNamedLookup(t *testing.T) {
 		},
 	}
 
-	_, err := resolvePGTargetSelections(
-		appCfg, "archive", false,
+	_, err := storage.SelectTargets(
+		pgReplica{}, appCfg, "archive", false,
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "single legacy [pg] block")
@@ -659,18 +810,63 @@ func TestResolvePGTargetSelections_RejectsTargetWithAll(t *testing.T) {
 		},
 	}
 
-	_, err := resolvePGTargetSelections(
-		appCfg, "work", true,
+	_, err := storage.SelectTargets(
+		pgReplica{}, appCfg, "work", true,
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cannot be combined with --all")
 }
 
 func TestNewPGPushCommandRejectsAllWatch(t *testing.T) {
-	cmd := newPGPushCommand()
+	cmd := newReplicaPushCommand(pgReplica{})
 	cmd.SetArgs([]string{"--all", "--watch"})
 
 	err := cmd.Execute()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--all cannot be combined with --watch")
+}
+
+// TestPGPusherFullVectorRepairNarrowsToDeferredSessions pins how a --full
+// watch finishes its vector repair: the first vector phase that runs repairs
+// the generation, each session it deferred keeps a per-session repair until
+// its vectors push, and later deferrals of other sessions owe no repair.
+func TestPGPusherFullVectorRepairNarrowsToDeferredSessions(t *testing.T) {
+	deferred := func(ids ...string) storage.PushResult {
+		return storage.PushResult{Errors: len(ids), Vectors: storage.VectorPushResult{
+			GenerationID: 1, SessionsDeferred: len(ids), DeferredSessionIDs: ids,
+		}}
+	}
+	target := &fakeTarget{}
+	pusher, _ := newTestReplicaPusher(target)
+	pusher.vectors.fullPending = true
+	steps := []storage.PushResult{
+		{Vectors: storage.VectorPushResult{Skipped: true}},
+		deferred("s1"),
+		deferred("s1", "s2"),
+		deferred(),
+		deferred("s3"),
+	}
+	for _, result := range steps {
+		target.pushResult = result
+		_ = pusher.push(t.Context(), reasonChange, false)
+	}
+	require.Len(t, target.pushOpts, 5)
+	type sent struct {
+		fullVectors bool
+		sessions    []string
+		scoped      bool
+	}
+	var got []sent
+	for _, opts := range target.pushOpts {
+		got = append(got, sent{
+			opts.FullVectors, opts.FullVectorSessions, opts.ScopeVectorsToChangedSessions,
+		})
+	}
+	assert.Equal(t, []sent{
+		{fullVectors: true},
+		{fullVectors: true},
+		{sessions: []string{"s1"}},
+		{sessions: []string{"s1"}},
+		{scoped: true},
+	}, got)
 }

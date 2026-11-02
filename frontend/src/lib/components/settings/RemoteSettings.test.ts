@@ -1,11 +1,6 @@
 // @vitest-environment jsdom
-import {
-  cleanup,
-  fireEvent,
-  render,
-  waitFor,
-} from "@testing-library/svelte";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/svelte";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { tick } from "svelte";
 
 import { initI18n } from "../../i18n/index.js";
@@ -32,15 +27,14 @@ afterEach(() => {
 describe("RemoteSettings", () => {
   it("shows the requested authentication state while saving", async () => {
     let releaseSave!: () => void;
-    const saveSpy = vi.spyOn(settings, "save").mockImplementation(
-      async (patch) => {
-        expect(patch).toEqual({ require_auth: true });
-        await new Promise<void>((resolve) => {
-          releaseSave = resolve;
-        });
-        settings.requireAuth = true;
-      },
-    );
+    const saveSpy = vi.spyOn(settings, "save").mockImplementation(async (patch) => {
+      expect(patch).toEqual({ require_auth: true });
+      await new Promise<void>((resolve) => {
+        releaseSave = resolve;
+      });
+      settings.requireAuth = true;
+      return true;
+    });
     const { getByRole } = render(RemoteSettings);
     const requireAuth = getByRole("switch", {
       name: "Require auth token",
@@ -62,11 +56,10 @@ describe("RemoteSettings", () => {
   });
 
   it("rolls back when saving leaves authentication unchanged", async () => {
-    const saveSpy = vi.spyOn(settings, "save").mockImplementation(
-      async (patch) => {
-        expect(patch).toEqual({ require_auth: true });
-      },
-    );
+    const saveSpy = vi.spyOn(settings, "save").mockImplementation(async (patch) => {
+      expect(patch).toEqual({ require_auth: true });
+      return false;
+    });
     const { getByRole } = render(RemoteSettings);
     const requireAuth = getByRole("switch", {
       name: "Require auth token",

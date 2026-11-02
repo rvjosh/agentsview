@@ -6,13 +6,20 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"log"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/lockctx"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 // ErrInvalidCursor is returned when a cursor cannot be decoded or verified.
@@ -28,16 +35,20 @@ var ErrSessionExcluded = errors.New("session excluded")
 // should surface a conflict instead of silently overwriting it.
 var ErrSessionTrashed = errors.New("session trashed")
 
-// deletionCauseSourceMissing marks a watcher-created tombstone. Unlike user
-// trash (the established NULL cause), it is cleared when the exact source is
-// parsed again. Mirror pushes preserve the cause so read backends can keep
-// recoverable source loss distinct from explicit user deletion.
-const deletionCauseSourceMissing = "source_missing"
+// legacyDeletionCauseSourceMissing identifies rows written before source
+// availability was separated from user deletion. It is used only to migrate
+// or copy an older archive without preserving the accidental trash state.
+const legacyDeletionCauseSourceMissing = "source_missing"
+
+// subagentParentRepairQueueStateKey is the temporary JSON queue used by early
+// builds of the nested-hierarchy change. RepairQueuedSubagentParents migrates
+// it into subagent_parent_repair_queue before processing queued children.
+const subagentParentRepairQueueStateKey = "subagent_parent_repair_queue_v1"
 
 // sessionBaseCols is the column list for standard session queries
 // (list, get). Keep in sync with scanSessionRow.
 const sessionBaseCols = `id, project, machine, agent,
-	agent_label, entrypoint,
+	agent_label, entrypoint, session_kind,
 	first_message, COALESCE(display_name, session_name) AS display_name, started_at, ended_at,
 	message_count, user_message_count,
 	parent_session_id, relationship_type,
@@ -54,6 +65,7 @@ const sessionBaseCols = `id, project, machine, agent,
 	health_score, health_grade,
 	has_tool_calls, has_context_data,
 	secret_leak_count, secrets_rules_version,
+	friction_count, friction_rules_version, friction_hash,
 	quality_signal_version,
 	short_prompt_count, unstructured_start,
 	missing_success_criteria_count,
@@ -61,14 +73,28 @@ const sessionBaseCols = `id, project, machine, agent,
 	no_code_context_count, runaway_tool_loop_count,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
-	transcript_fidelity,
+	group_key, transcript_fidelity,
 	parser_malformed_lines, is_truncated,
-	deleted_at, termination_status, transcript_revision, created_at`
+	deleted_at, termination_status, transcript_revision, created_at,
+	EXISTS (
+		SELECT 1 FROM session_project_assignments spa
+		WHERE spa.session_id = sessions.id
+	) AS project_assigned,
+	pr_links, ` + sessionLabelsSelectSQL
+
+// sessionLabelsSelectSQL reads a session's labels as a sorted JSON array.
+// The correlated lookup seeks the session_labels primary key.
+const sessionLabelsSelectSQL = `(
+		SELECT json_group_array(label) FROM (
+			SELECT sl.label FROM session_labels sl
+			WHERE sl.session_id = sessions.id ORDER BY sl.label
+		)
+	) AS labels`
 
 // sessionPruneCols extends sessionBaseCols with file metadata
 // needed by FindPruneCandidates.
 const sessionPruneCols = `id, project, machine, agent,
-	agent_label, entrypoint,
+	agent_label, entrypoint, session_kind,
 	first_message, COALESCE(display_name, session_name) AS display_name, started_at, ended_at,
 	message_count, user_message_count,
 	parent_session_id, relationship_type,
@@ -85,6 +111,7 @@ const sessionPruneCols = `id, project, machine, agent,
 	health_score, health_grade,
 	has_tool_calls, has_context_data,
 	secret_leak_count, secrets_rules_version,
+	friction_count, friction_rules_version, friction_hash,
 	quality_signal_version,
 	short_prompt_count, unstructured_start,
 	missing_success_criteria_count,
@@ -92,17 +119,24 @@ const sessionPruneCols = `id, project, machine, agent,
 	no_code_context_count, runaway_tool_loop_count,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
-	transcript_fidelity,
+	group_key, transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	deleted_at, termination_status, transcript_revision,
-	file_path, file_size, created_at`
+	file_path, file_size, created_at,
+	pr_links, ` + sessionLabelsSelectSQL
 
 // sessionFullCols includes all columns for a complete session record.
-const sessionFullCols = `id, project, machine, agent,
-	agent_label, entrypoint,
+const sessionFullCols = sessionFullColsBeforeParent + "parent_session_id" + sessionFullColsAfterParent
+
+const sessionFullColsBeforeParent = `id, project, machine, agent,
+	agent_label, entrypoint, session_kind,
 	first_message, display_name, session_name, started_at, ended_at,
 	message_count, user_message_count,
-	parent_session_id, relationship_type,
+`
+
+const sessionFullColsAfterParent = `, parser_parent_session_id, ` + "relationship_type" + sessionFullColsAfterRelationship
+
+const sessionFullColsAfterRelationship = `,
 	total_output_tokens, peak_context_tokens,
 	has_total_output_tokens, has_peak_context_tokens,
 	is_automated,
@@ -116,6 +150,7 @@ const sessionFullCols = `id, project, machine, agent,
 	health_score, health_grade,
 	has_tool_calls, has_context_data,
 	secret_leak_count, secrets_rules_version,
+	friction_count, friction_rules_version, friction_hash,
 	quality_signal_version,
 	short_prompt_count, unstructured_start,
 	missing_success_criteria_count,
@@ -123,13 +158,19 @@ const sessionFullCols = `id, project, machine, agent,
 	no_code_context_count, runaway_tool_loop_count,
 	data_version,
 	cwd, git_branch, source_session_id, source_version,
-	transcript_fidelity,
+	group_key, transcript_fidelity,
 	parser_malformed_lines, is_truncated,
 	last_write_incremental,
-	deleted_at, deletion_cause, termination_status, file_path, file_size, file_mtime,
+	deleted_at, deletion_cause, source_missing_at, trash_includes_codex_pages,
+	termination_status, file_path, file_size, file_mtime,
 	next_ordinal, last_entry_uuid,
 	file_inode, file_device,
-	file_hash, local_modified_at, transcript_revision, created_at`
+	file_hash, local_modified_at, transcript_revision, created_at,
+	EXISTS (
+		SELECT 1 FROM session_project_assignments spa
+		WHERE spa.session_id = sessions.id
+	) AS project_assigned,
+	pr_links, ` + sessionLabelsSelectSQL
 
 const (
 	// DefaultSessionLimit is the default number of sessions returned.
@@ -146,10 +187,16 @@ type rowScanner interface {
 
 // scanSessionRow scans sessionBaseCols into a Session.
 func scanSessionRow(rs rowScanner) (Session, error) {
+	return scanSessionRowWithSource(rs, false)
+}
+
+// scanSessionRowWithSource scans sessionBaseCols and an optional trailing
+// source metadata into a Session.
+func scanSessionRowWithSource(rs rowScanner, includeSource bool) (Session, error) {
 	var s Session
-	err := rs.Scan(
+	targets := []any{
 		&s.ID, &s.Project, &s.Machine, &s.Agent,
-		&s.AgentLabel, &s.Entrypoint,
+		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
 		&s.FirstMessage, &s.DisplayName, &s.StartedAt, &s.EndedAt,
 		&s.MessageCount, &s.UserMessageCount,
 		&s.ParentSessionID, &s.RelationshipType,
@@ -166,6 +213,7 @@ func scanSessionRow(rs rowScanner) (Session, error) {
 		&s.HealthScore, &s.HealthGrade,
 		&s.HasToolCalls, &s.HasContextData,
 		&s.SecretLeakCount, &s.SecretsRulesVersion,
+		&s.FrictionCount, &s.FrictionRulesVersion, &s.FrictionHash,
 		&s.QualitySignalVersion,
 		&s.ShortPromptCount, &s.UnstructuredStart,
 		&s.MissingSuccessCriteriaCount,
@@ -174,15 +222,22 @@ func scanSessionRow(rs rowScanner) (Session, error) {
 		&s.DataVersion,
 		&s.Cwd, &s.GitBranch,
 		&s.SourceSessionID, &s.SourceVersion,
-		&s.TranscriptFidelity,
+		&s.GroupKey, &s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.DeletedAt, &s.TerminationStatus,
-		&s.TranscriptRevision, &s.CreatedAt,
-	)
+		&s.TranscriptRevision, &s.CreatedAt, &s.ProjectAssigned,
+		prLinksColumn{&s.PRLinks},
+		labelsColumn{&s.Labels},
+	}
+	if includeSource {
+		targets = append(targets, &s.FilePath, &s.FileSize, &s.LocalModifiedAt)
+	}
+	err := rs.Scan(targets...)
 	return s, err
 }
 
-const CurrentQualitySignalVersion = 2
+// Version 6 stores per-call tool observations for effectiveness rates.
+const CurrentQualitySignalVersion = 6
 
 // QualitySignals groups persisted deterministic quality-signal
 // columns for API callers while keeping the database representation
@@ -250,7 +305,7 @@ func (s *Session) ApplyQualitySignals(qs *QualitySignals) {
 func (s Session) MarshalJSON() ([]byte, error) {
 	type sessionAlias Session
 	return json.Marshal(struct {
-		sessionAlias
+		sessionAlias   `json:",inline"`
 		QualitySignals *QualitySignals `json:"quality_signals,omitempty"`
 	}{
 		sessionAlias:   sessionAlias(s),
@@ -263,7 +318,7 @@ func (s Session) MarshalJSON() ([]byte, error) {
 func (s *Session) UnmarshalJSON(data []byte) error {
 	type sessionAlias Session
 	var v struct {
-		sessionAlias
+		sessionAlias   `json:",inline"`
 		QualitySignals *QualitySignals `json:"quality_signals"`
 	}
 	if err := json.Unmarshal(data, &v); err != nil {
@@ -275,27 +330,36 @@ func (s *Session) UnmarshalJSON(data []byte) error {
 }
 
 // Session represents a row in the sessions table.
+//
+//nolint:recvcheck // Value encoding and pointer decoding intentionally implement distinct interfaces.
 type Session struct {
-	ID                   string  `json:"id"`
-	Project              string  `json:"project"`
-	Machine              string  `json:"machine"`
-	Agent                string  `json:"agent"`
-	AgentLabel           string  `json:"agent_label,omitempty"`
-	Entrypoint           string  `json:"entrypoint,omitempty"`
-	FirstMessage         *string `json:"first_message"`
-	DisplayName          *string `json:"display_name,omitempty"`
-	SessionName          *string `json:"-"`
-	StartedAt            *string `json:"started_at"`
-	EndedAt              *string `json:"ended_at"`
-	MessageCount         int     `json:"message_count"`
-	UserMessageCount     int     `json:"user_message_count"`
-	ParentSessionID      *string `json:"parent_session_id,omitempty"`
-	RelationshipType     string  `json:"relationship_type,omitempty"`
-	TotalOutputTokens    int     `json:"total_output_tokens"`
-	PeakContextTokens    int     `json:"peak_context_tokens"`
-	HasTotalOutputTokens bool    `json:"has_total_output_tokens"`
-	HasPeakContextTokens bool    `json:"has_peak_context_tokens"`
-	IsAutomated          bool    `json:"is_automated"`
+	// WebURL is a client-derived browser link, never persisted.
+	WebURL  string `json:"web_url,omitempty"`
+	ID      string `json:"id"`
+	Project string `json:"project"`
+	Machine string `json:"machine"`
+	// SourceMachines lists contributing hosted device identities, derived on read.
+	SourceMachines        []string `json:"source_machines,omitempty" doc:"Contributing hosted device machine IDs; omitted for sessions without hosted provenance."`
+	Agent                 string   `json:"agent"`
+	AgentLabel            string   `json:"agent_label,omitempty"`
+	Entrypoint            string   `json:"entrypoint,omitempty"`
+	SessionKind           string   `json:"session_kind,omitempty"`
+	FirstMessage          *string  `json:"first_message"`
+	DisplayName           *string  `json:"display_name,omitempty"`
+	SessionName           *string  `json:"-"`
+	StartedAt             *string  `json:"started_at"`
+	EndedAt               *string  `json:"ended_at"`
+	MessageCount          int      `json:"message_count"`
+	UserMessageCount      int      `json:"user_message_count"`
+	ParentSessionIDs      []string `json:"parent_session_ids,omitempty"`
+	ParentSessionID       *string  `json:"parent_session_id,omitempty"`
+	ParserParentSessionID *string  `json:"-"`
+	RelationshipType      string   `json:"relationship_type,omitempty"`
+	TotalOutputTokens     int      `json:"total_output_tokens"`
+	PeakContextTokens     int      `json:"peak_context_tokens"`
+	HasTotalOutputTokens  bool     `json:"has_total_output_tokens"`
+	HasPeakContextTokens  bool     `json:"has_peak_context_tokens"`
+	IsAutomated           bool     `json:"is_automated"`
 
 	// Session signals (computed from messages/tool_calls).
 	ToolFailureSignalCount int      `json:"tool_failure_signal_count"`
@@ -314,36 +378,53 @@ type Session struct {
 	HealthGrade            *string  `json:"health_grade,omitempty"`
 	// QualitySignals mirrors the scalar persistence fields below for API
 	// schema and JSON transport.
-	QualitySignals              *QualitySignals `json:"quality_signals,omitempty"`
-	HasToolCalls                bool            `json:"-"`
-	HasContextData              bool            `json:"-"`
-	SecretLeakCount             int             `json:"secret_leak_count"`
-	SecretsRulesVersion         string          `json:"-"`
-	QualitySignalVersion        int             `json:"-"`
-	ShortPromptCount            int             `json:"-"`
-	UnstructuredStart           bool            `json:"-"`
-	MissingSuccessCriteriaCount int             `json:"-"`
-	MissingVerificationCount    int             `json:"-"`
-	DuplicatePromptCount        int             `json:"-"`
-	NoCodeContextCount          int             `json:"-"`
-	RunawayToolLoopCount        int             `json:"-"`
-	DataVersion                 int             `json:"-"`
-	Cwd                         string          `json:"cwd,omitempty"`
-	GitBranch                   string          `json:"git_branch,omitempty"`
-	SourceSessionID             string          `json:"source_session_id,omitempty"`
-	SourceVersion               string          `json:"source_version,omitempty"`
-	TranscriptFidelity          string          `json:"transcript_fidelity,omitempty"`
-	ParserMalformedLines        int             `json:"parser_malformed_lines,omitempty"`
-	IsTruncated                 bool            `json:"is_truncated,omitempty"`
+	QualitySignals      *QualitySignals `json:"quality_signals,omitempty"`
+	HasToolCalls        bool            `json:"-"`
+	HasContextData      bool            `json:"-"`
+	SecretLeakCount     int             `json:"secret_leak_count"`
+	SecretsRulesVersion string          `json:"-"`
+	// Friction summary columns stay out of the session API payload.
+	FrictionCount               int    `json:"-"`
+	FrictionRulesVersion        string `json:"-"`
+	FrictionHash                string `json:"-"`
+	QualitySignalVersion        int    `json:"-"`
+	ShortPromptCount            int    `json:"-"`
+	UnstructuredStart           bool   `json:"-"`
+	MissingSuccessCriteriaCount int    `json:"-"`
+	MissingVerificationCount    int    `json:"-"`
+	DuplicatePromptCount        int    `json:"-"`
+	NoCodeContextCount          int    `json:"-"`
+	RunawayToolLoopCount        int    `json:"-"`
+	DataVersion                 int    `json:"-"`
+	Cwd                         string `json:"cwd,omitempty"`
+	GitBranch                   string `json:"git_branch,omitempty"`
+	ProjectAssigned             bool   `json:"project_assigned,omitempty"`
+	// PRLinks lists the pull or merge requests the source transcript
+	// associated with the session. Parser-owned: a full reparse replaces it.
+	// Always serialized, as [] when empty, so a client merging a fresh
+	// response over a cached one drops cleared values.
+	PRLinks []PRLink `json:"pr_links" required:"false"`
+	// Labels are user- or tool-supplied tags. They are stored apart from
+	// parsed transcript data, so a reparse or resync never changes them.
+	// Always serialized, as [] when empty, like PRLinks.
+	Labels               []string `json:"labels" required:"false"`
+	SourceSessionID      string   `json:"source_session_id,omitempty"`
+	SourceVersion        string   `json:"source_version,omitempty"`
+	GroupKey             string   `json:"group_key,omitempty"`
+	TranscriptFidelity   string   `json:"transcript_fidelity,omitempty"`
+	ParserMalformedLines int      `json:"parser_malformed_lines,omitzero"`
+	IsTruncated          bool     `json:"is_truncated,omitzero"`
 
-	DeletedAt         *string `json:"deleted_at,omitempty"`
-	DeletionCause     *string `json:"-"`
-	TerminationStatus *string `json:"termination_status,omitempty"`
-	FilePath          *string `json:"file_path,omitempty"`
-	FileSize          *int64  `json:"file_size,omitempty"`
-	FileMtime         *int64  `json:"file_mtime,omitempty"`
-	NextOrdinal       int     `json:"-"`
-	LastEntryUUID     *string `json:"-"`
+	DeletedAt               *string `json:"deleted_at,omitempty"`
+	TrashIncludesCodexPages bool    `json:"-"`
+	DeletionCause           *string `json:"-"`
+	SourceMissingAt         *string `json:"-"`
+	TerminationStatus       *string `json:"termination_status,omitempty"`
+	FilePath                *string `json:"file_path,omitempty"`
+	FileSize                *int64  `json:"file_size,omitempty"`
+	FileMtime               *int64  `json:"file_mtime,omitempty"`
+	NextOrdinal             int     `json:"-"`
+	LastEntryUUID           *string `json:"-"`
 	// ClaudeLinearParse is SQLite-only sync bookkeeping: whether the
 	// Claude full parser fell back to linear processing for this file
 	// (nil = unknown/legacy or non-Claude). Linearity is monotonic
@@ -365,6 +446,19 @@ type Session struct {
 	LocalModifiedAt      *string `json:"local_modified_at,omitempty"`
 	TranscriptRevision   *string `json:"transcript_revision,omitempty"`
 	CreatedAt            string  `json:"created_at"`
+
+	// PreserveSessionName is transient write intent. Parser write paths set it
+	// when a provider supplied no authoritative title signal, so an upsert
+	// retains an existing session_name while a new row can still use the
+	// parser's fallback name.
+	PreserveSessionName bool `json:"-"`
+
+	// PreserveStoredAutomation is transient write intent set by the usage-only
+	// projection when metadata cannot reclassify a one-turn session.
+	PreserveStoredAutomation bool `json:"-"`
+	// UsageAutomationProjected keeps repeated projections from treating the
+	// prompt they already discarded as missing classification evidence.
+	UsageAutomationProjected bool `json:"-"`
 }
 
 // SessionCursor is the opaque pagination token. EndedAt carries the
@@ -433,11 +527,11 @@ func (db *DB) DecodeCursor(s string) (SessionCursor, error) {
 		// Legacy cursor (unsigned). Trust nothing about the Total.
 		data, err := base64.RawURLEncoding.DecodeString(parts[0])
 		if err != nil {
-			return SessionCursor{}, fmt.Errorf("%w: %v", ErrInvalidCursor, err)
+			return SessionCursor{}, fmt.Errorf("%w: %w", ErrInvalidCursor, err)
 		}
 		var c SessionCursor
 		if err := json.Unmarshal(data, &c); err != nil {
-			return SessionCursor{}, fmt.Errorf("%w: %v", ErrInvalidCursor, err)
+			return SessionCursor{}, fmt.Errorf("%w: %w", ErrInvalidCursor, err)
 		}
 		c.Total = 0 // Force re-computation
 		return c, nil
@@ -450,12 +544,12 @@ func (db *DB) DecodeCursor(s string) (SessionCursor, error) {
 
 	data, err := base64.RawURLEncoding.DecodeString(payload)
 	if err != nil {
-		return SessionCursor{}, fmt.Errorf("%w: invalid payload: %v", ErrInvalidCursor, err)
+		return SessionCursor{}, fmt.Errorf("%w: invalid payload: %w", ErrInvalidCursor, err)
 	}
 
 	sig, err := base64.RawURLEncoding.DecodeString(sigStr)
 	if err != nil {
-		return SessionCursor{}, fmt.Errorf("%w: invalid signature encoding: %v", ErrInvalidCursor, err)
+		return SessionCursor{}, fmt.Errorf("%w: invalid signature encoding: %w", ErrInvalidCursor, err)
 	}
 
 	db.cursorMu.RLock()
@@ -471,28 +565,46 @@ func (db *DB) DecodeCursor(s string) (SessionCursor, error) {
 
 	var c SessionCursor
 	if err := json.Unmarshal(data, &c); err != nil {
-		return SessionCursor{}, fmt.Errorf("%w: invalid json: %v", ErrInvalidCursor, err)
+		return SessionCursor{}, fmt.Errorf("%w: invalid json: %w", ErrInvalidCursor, err)
 	}
 	return c, nil
 }
 
 // SessionFilter specifies how to query sessions.
 type SessionFilter struct {
-	Project        string
+	// IDs selects rows directly. Nil preserves discovery defaults; an empty
+	// non-nil slice matches nothing. Raw IDs expand over literal tilde suffixes.
+	IDs []string
+	// IDsExact selects only physical IDs resolved by the hosted public-ID layer.
+	IDsExact  bool
+	SessionID string
+	Project   string
+	// ProjectLabels carries exact internal project labels resolved from an
+	// opaque project key. A non-nil slice takes precedence over Project and is
+	// never parsed as user-facing transport input.
+	ProjectLabels  []string
 	ExcludeProject string // exclude sessions with this project name
 	Machine        string
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
-	GitBranch       string
-	Agent           string
-	Date            string // date overlapped by session activity, YYYY-MM-DD
-	DateFrom        string // activity range start (inclusive)
-	DateTo          string // activity range end (inclusive)
-	Timezone        string // IANA timezone for date filters; empty means UTC
-	ActiveSince     string // ISO-8601 timestamp; filters on most recent activity
-	MinMessages     int    // message_count >= N (0 = no filter)
-	MaxMessages     int    // message_count <= N (0 = no filter)
-	MinUserMessages int    // user_message_count >= N (0 = no filter)
-	ExcludeOneShot  bool   // exclude sessions with user_message_count <= 1
+	GitBranch string
+	// GitBranchExact matches one raw branch name in any project. It is ANDed
+	// with GitBranch when both are set.
+	GitBranchExact     string
+	Agent              string
+	Date               string // date overlapped by session activity, YYYY-MM-DD
+	DateFrom           string // activity range start (inclusive)
+	DateTo             string // activity range end (inclusive)
+	Timezone           string // IANA timezone for date filters; empty means UTC
+	ActiveSince        string // ISO-8601 timestamp; filters on most recent activity
+	MinMessages        int    // message_count >= N (0 = no filter)
+	MaxMessages        int    // message_count <= N (0 = no filter)
+	MinUserMessages    int    // user_message_count >= N (0 = no filter)
+	ExcludeOneShot     bool   // exclude sessions with user_message_count <= 1
+	OneShotFilterSet   bool   // preserve an explicit one-shot exclusion with annotation filters
+	AutomatedFilterSet bool   // preserve an explicit automated exclusion with annotation filters
+	// ExcludeActiveSince keeps sessions whose last activity is at or before
+	// this instant, or unknown. The zero time disables the filter.
+	ExcludeActiveSince time.Time
 	// ChildExemptOneShot carves child sessions (a sidebar-child
 	// relationship_type or a non-empty parent_session_id) out of the
 	// ExcludeOneShot gate. Set only by the semantic/hybrid content-search
@@ -505,12 +617,19 @@ type SessionFilter struct {
 	ExcludeAutomated   bool     // exclude sessions where is_automated = 1
 	AutomatedScope     string   // "", "human", "all", or "automated"
 	IncludeChildren    bool     // include subagent sessions (for sidebar grouping)
+	IncludeEmpty       bool     // include zero-message sessions for project mapping
 	IncludeOrphans     bool     // promote orphan child rows to sidebar roots
+	IncludeSource      bool     // include the session source file path in list rows
 	Outcome            []string // filter by outcome values
 	HealthGrade        []string // filter by health grade values
 	MinToolFailures    *int     // minimum tool_failure_signal_count
 	HasSecret          bool     // only sessions with current secret_leak_count > 0
 	Starred            bool     // only sessions starred by the user
+	// Labels keeps sessions carrying every listed label (exact match).
+	Labels []string
+	// PR keeps sessions linked to a repository, optionally narrowed to one
+	// pull request number.
+	PR PRFilter
 	// SecretsRulesVersions limits HasSecret to sessions scanned by one of these
 	// current scanner versions. Empty preserves raw DB semantics for tests and
 	// direct store callers that explicitly want unversioned counts.
@@ -580,25 +699,6 @@ func buildCanonicalRootWhere(includeOrphans bool) string {
 	return BuildCanonicalRootWhere(SQLiteQueryDialect(), "sessions", includeOrphans)
 }
 
-// buildTerminationPredSQLite returns a WHERE fragment and args for
-// the multi-state termination filter (active / stale / unclean).
-// The status value may be comma-separated to OR multiple states
-// (e.g. "stale,unclean"). Returns ("", nil) when empty or "all".
-//
-// Stale and unclean both require a parser red flag
-// (tool_call_pending or truncated). Sessions classified as clean
-// or with NULL termination_status never appear under those
-// filters — the parser-side classifier is the only positive
-// signal that something is wrong. Active is purely time-based:
-// any session written to in the last activeWindow qualifies.
-func buildTerminationPredSQLite(status string) (string, []any) {
-	b := NewQueryBuilder(SQLiteQueryDialect(), 0)
-	pred := terminationPredicate(status, b, func(col string) string {
-		return col
-	})
-	return pred, b.Args()
-}
-
 // SessionPage is a page of session results.
 type SessionPage struct {
 	Sessions   []Session `json:"sessions"`
@@ -607,30 +707,36 @@ type SessionPage struct {
 }
 
 type SidebarSessionIndexRow struct {
-	ID                 string  `json:"id"`
-	ParentSessionID    *string `json:"parent_session_id,omitempty"`
-	RelationshipType   string  `json:"relationship_type,omitempty"`
-	Project            string  `json:"project"`
-	Machine            string  `json:"machine"`
-	Agent              string  `json:"agent"`
-	AgentLabel         string  `json:"agent_label,omitempty"`
-	Entrypoint         string  `json:"entrypoint,omitempty"`
-	DisplayName        *string `json:"display_name,omitempty"`
-	StartedAt          *string `json:"started_at"`
-	EndedAt            *string `json:"ended_at"`
-	CreatedAt          string  `json:"created_at"`
-	TerminationStatus  *string `json:"termination_status,omitempty"`
-	MessageCount       int     `json:"message_count"`
-	UserMessageCount   int     `json:"user_message_count"`
-	TranscriptRevision *string `json:"transcript_revision,omitempty"`
-	IsAutomated        bool    `json:"is_automated"`
-	IsTeammate         bool    `json:"is_teammate"`
+	ParentSessionIDs   []string `json:"parent_session_ids,omitempty"`
+	ID                 string   `json:"id"`
+	ParentSessionID    *string  `json:"parent_session_id,omitempty"`
+	RelationshipType   string   `json:"relationship_type,omitempty"`
+	Project            string   `json:"project"`
+	ProjectAssigned    bool     `json:"project_assigned,omitempty"`
+	Machine            string   `json:"machine"`
+	SourceMachines     []string `json:"source_machines,omitempty" doc:"Contributing hosted device machine IDs; omitted for sessions without hosted provenance."`
+	Agent              string   `json:"agent"`
+	AgentLabel         string   `json:"agent_label,omitempty"`
+	Entrypoint         string   `json:"entrypoint,omitempty"`
+	SessionKind        string   `json:"session_kind,omitempty"`
+	DisplayName        *string  `json:"display_name,omitempty"`
+	StartedAt          *string  `json:"started_at"`
+	EndedAt            *string  `json:"ended_at"`
+	CreatedAt          string   `json:"created_at"`
+	TerminationStatus  *string  `json:"termination_status,omitempty"`
+	MessageCount       int      `json:"message_count"`
+	UserMessageCount   int      `json:"user_message_count"`
+	TranscriptRevision *string  `json:"transcript_revision,omitempty"`
+	IsAutomated        bool     `json:"is_automated"`
+	IsTeammate         bool     `json:"is_teammate"`
 }
 
 type SidebarSessionIndex struct {
 	Sessions   []SidebarSessionIndexRow `json:"sessions"`
 	NextCursor string                   `json:"next_cursor,omitempty"`
-	Total      int                      `json:"total"`
+	// Total counts canonical root groups matching the filter. Sessions may
+	// contain additional descendant rows needed to render those groups.
+	Total int `json:"total"`
 }
 
 // buildSessionFilter returns a WHERE clause and args for the
@@ -643,9 +749,7 @@ func buildSessionFilter(f SessionFilter) (string, []any) {
 func (db *DB) ListSessions(
 	ctx context.Context, f SessionFilter,
 ) (SessionPage, error) {
-	if f.Limit <= 0 || f.Limit > MaxSessionLimit {
-		f.Limit = DefaultSessionLimit
-	}
+	f.Limit = NormalizeSessionLimit(f.Limit)
 
 	where, args := buildSessionFilter(f)
 
@@ -689,7 +793,11 @@ func (db *DB) ListSessions(
 		)
 	}
 
-	query := "SELECT " + sessionBaseCols +
+	columns := sessionBaseCols
+	if f.IncludeSource {
+		columns += ", file_path, file_size, local_modified_at"
+	}
+	query := "SELECT " + columns +
 		" FROM sessions WHERE " + cursorWhere + " " +
 		pageBuilder.OrderByClause(rs, f) + " " +
 		pageBuilder.Limit(f.Limit+1)
@@ -702,21 +810,21 @@ func (db *DB) ListSessions(
 	}
 	defer rows.Close()
 
-	sessions, err := scanSessionRows(rows)
+	sessions, err := scanSessionRowsWithSource(rows, f.IncludeSource)
 	if err != nil {
 		return SessionPage{}, err
 	}
 
-	page := SessionPage{Sessions: sessions, Total: total}
-	if len(sessions) > f.Limit {
-		page.Sessions = sessions[:f.Limit]
-		last := page.Sessions[f.Limit-1]
-		page.NextCursor = db.EncodeCursor(
-			NextSessionCursor(&last, rs, total, f),
-		)
-	}
+	return BuildSessionPage(sessions, total, f, rs, db.EncodeCursor), nil
+}
 
-	return page, nil
+// HasVisibleSession reports whether the default sidebar has a session to show.
+func (db *DB) HasVisibleSession(ctx context.Context) (bool, error) {
+	where, args := buildSessionBaseFilter(SessionFilter{ExcludeAutomated: true})
+	var exists bool
+	err := db.getReader().QueryRowContext(ctx,
+		"SELECT EXISTS(SELECT 1 FROM sessions WHERE "+where+" AND "+buildCanonicalRootWhere(true)+")", args...).Scan(&exists)
+	return exists, err
 }
 
 // GetSidebarSessionIndex returns the skinny session rows needed by
@@ -733,6 +841,20 @@ func (db *DB) GetSidebarSessionIndex(
 	}
 
 	f.Cursor = ""
+	rootFilter := f
+	rootFilter.IncludeChildren = false
+	rootWhere, rootArgs := buildSessionBaseFilter(rootFilter)
+	canonicalRootWhere := buildCanonicalRootWhere(f.IncludeOrphans)
+	var total int
+	countQuery := "SELECT COUNT(*) FROM sessions WHERE " +
+		rootWhere + " AND " + canonicalRootWhere
+	if err := db.getReader().QueryRowContext(
+		ctx, countQuery, rootArgs...,
+	).Scan(&total); err != nil {
+		return SidebarSessionIndex{},
+			fmt.Errorf("counting sidebar roots: %w", err)
+	}
+
 	where, args := buildSessionFilter(f)
 	query := `
 		SELECT
@@ -740,10 +862,15 @@ func (db *DB) GetSidebarSessionIndex(
 			parent_session_id,
 			relationship_type,
 			project,
+			EXISTS (
+				SELECT 1 FROM session_project_assignments spa
+				WHERE spa.session_id = sessions.id
+			) AS project_assigned,
 			machine,
 			agent,
 			agent_label,
 			entrypoint,
+			session_kind,
 			COALESCE(display_name, session_name) AS display_name,
 			started_at,
 			ended_at,
@@ -771,6 +898,7 @@ func (db *DB) GetSidebarSessionIndex(
 
 	index := SidebarSessionIndex{
 		Sessions: []SidebarSessionIndexRow{},
+		Total:    total,
 	}
 	for rows.Next() {
 		var row SidebarSessionIndexRow
@@ -779,10 +907,12 @@ func (db *DB) GetSidebarSessionIndex(
 			&row.ParentSessionID,
 			&row.RelationshipType,
 			&row.Project,
+			&row.ProjectAssigned,
 			&row.Machine,
 			&row.Agent,
 			&row.AgentLabel,
 			&row.Entrypoint,
+			&row.SessionKind,
 			&row.DisplayName,
 			&row.StartedAt,
 			&row.EndedAt,
@@ -803,29 +933,79 @@ func (db *DB) GetSidebarSessionIndex(
 		return SidebarSessionIndex{},
 			fmt.Errorf("iterating sidebar session index: %w", err)
 	}
-	index.Total = len(index.Sessions)
-
 	return index, nil
 }
 
-func (db *DB) getSidebarSessionIndexPage(
-	ctx context.Context, f SessionFilter,
-) (SidebarSessionIndex, error) {
-	if f.Limit <= 0 || f.Limit > MaxSessionLimit {
-		f.Limit = DefaultSessionLimit
-	}
+type sidebarPredicates struct {
+	rootWhere          string
+	rootArgs           []any
+	canonicalRootWhere string
+	treeMemberWhere    string
+}
 
+func buildSidebarPredicates(f SessionFilter) sidebarPredicates {
 	rootFilter := f
 	rootFilter.Cursor = ""
 	rootFilter.Starred = false
 	rootFilter.IncludeChildren = false
 	rootWhere, rootArgs := buildSessionBaseFilter(rootFilter)
 	canonicalRootWhere := buildCanonicalRootWhere(f.IncludeOrphans)
-	childAutomationPred := automationScopePredicate(f, SQLiteQueryDialect(), "s")
-	childAutomationWhere := ""
-	if childAutomationPred != "" {
-		childAutomationWhere = " AND " + childAutomationPred
+	treeMemberWhere := SessionTreeMemberPredicate(f, SQLiteQueryDialect(), "s")
+	return sidebarPredicates{
+		rootWhere:          rootWhere,
+		rootArgs:           rootArgs,
+		canonicalRootWhere: canonicalRootWhere,
+		treeMemberWhere:    treeMemberWhere,
 	}
+}
+
+func sidebarRootPageQuery(f SessionFilter, cur SessionCursor, predicates sidebarPredicates) (string, []any) {
+	pageBuilder := NewQueryBuilder(SQLiteQueryDialect(), len(predicates.rootArgs))
+	cursorWhere := ""
+	if f.Cursor != "" {
+		cursorWhere = "WHERE (activity, id) < (" +
+			pageBuilder.Add(cur.EndedAt) + ", " +
+			pageBuilder.Add(cur.ID) + ")"
+	}
+	query := `
+		WITH RECURSIVE root_candidates(id) AS (
+			SELECT id
+			FROM sessions
+			WHERE ` + predicates.rootWhere + `
+			  AND ` + predicates.canonicalRootWhere + `
+		),
+		tree(root_id, id) AS (
+			SELECT id, id FROM root_candidates
+			UNION
+			SELECT t.root_id, s.id
+			FROM sessions s
+			JOIN tree t ON s.parent_session_id = t.id
+			WHERE ` + predicates.treeMemberWhere + `
+		)
+		` + sidebarStarredRootCTE(f.Starred) + `,
+		root_activity(id, activity) AS (
+			SELECT t.root_id AS id, MAX(` + sidebarActivityExprSQLiteS + `) AS activity
+			FROM tree t
+			` + sidebarStarredRootJoin(f.Starred) + `
+			JOIN sessions s ON s.id = t.id
+			GROUP BY t.root_id
+		)
+		SELECT id, activity
+		FROM root_activity
+		` + cursorWhere + `
+		ORDER BY activity DESC, id DESC
+		` + pageBuilder.Limit(f.Limit+1)
+	args := append([]any{}, predicates.rootArgs...)
+	args = append(args, pageBuilder.Args()...)
+	return query, args
+}
+
+func (db *DB) getSidebarSessionIndexPage(
+	ctx context.Context, f SessionFilter,
+) (SidebarSessionIndex, error) {
+	f.Limit = NormalizeSessionLimit(f.Limit)
+
+	predicates := buildSidebarPredicates(f)
 
 	var total int
 	var cur SessionCursor
@@ -843,8 +1023,8 @@ func (db *DB) getSidebarSessionIndexPage(
 				WITH RECURSIVE root_candidates(id) AS (
 					SELECT id
 					FROM sessions
-					WHERE ` + rootWhere + `
-					  AND ` + canonicalRootWhere + `
+					WHERE ` + predicates.rootWhere + `
+					  AND ` + predicates.canonicalRootWhere + `
 				),
 				tree(root_id, id) AS (
 					SELECT id, id FROM root_candidates
@@ -852,9 +1032,7 @@ func (db *DB) getSidebarSessionIndexPage(
 					SELECT t.root_id, s.id
 					FROM sessions s
 					JOIN tree t ON s.parent_session_id = t.id
-					WHERE s.message_count > 0
-					  AND s.deleted_at IS NULL
-					  ` + childAutomationWhere + `
+					WHERE ` + predicates.treeMemberWhere + `
 				),
 				eligible_roots(id) AS (
 					SELECT DISTINCT t.root_id
@@ -863,16 +1041,16 @@ func (db *DB) getSidebarSessionIndexPage(
 				)
 				SELECT COUNT(*) FROM eligible_roots`
 			if err := db.getReader().QueryRowContext(
-				ctx, countQuery, rootArgs...,
+				ctx, countQuery, predicates.rootArgs...,
 			).Scan(&total); err != nil {
 				return SidebarSessionIndex{},
 					fmt.Errorf("counting sidebar roots: %w", err)
 			}
 		} else {
 			countQuery := "SELECT COUNT(*) FROM sessions WHERE " +
-				rootWhere + " AND " + canonicalRootWhere
+				predicates.rootWhere + " AND " + predicates.canonicalRootWhere
 			if err := db.getReader().QueryRowContext(
-				ctx, countQuery, rootArgs...,
+				ctx, countQuery, predicates.rootArgs...,
 			).Scan(&total); err != nil {
 				return SidebarSessionIndex{},
 					fmt.Errorf("counting sidebar roots: %w", err)
@@ -880,45 +1058,7 @@ func (db *DB) getSidebarSessionIndexPage(
 		}
 	}
 
-	pageBuilder := NewQueryBuilder(SQLiteQueryDialect(), len(rootArgs))
-	cursorWhere := ""
-	if f.Cursor != "" {
-		cursorWhere = "WHERE (activity, id) < (" +
-			pageBuilder.Add(cur.EndedAt) + ", " +
-			pageBuilder.Add(cur.ID) + ")"
-	}
-	rootQuery := `
-		WITH RECURSIVE root_candidates(id) AS (
-			SELECT id
-			FROM sessions
-			WHERE ` + rootWhere + `
-			  AND ` + canonicalRootWhere + `
-		),
-		tree(root_id, id) AS (
-			SELECT id, id FROM root_candidates
-			UNION
-			SELECT t.root_id, s.id
-			FROM sessions s
-			JOIN tree t ON s.parent_session_id = t.id
-			WHERE s.message_count > 0
-			  AND s.deleted_at IS NULL
-			  ` + childAutomationWhere + `
-		)
-		` + sidebarStarredRootCTE(f.Starred) + `,
-		root_activity(id, activity) AS (
-			SELECT t.root_id AS id, MAX(` + sidebarActivityExprSQLiteS + `) AS activity
-			FROM tree t
-			` + sidebarStarredRootJoin(f.Starred) + `
-			JOIN sessions s ON s.id = t.id
-			GROUP BY t.root_id
-		)
-		SELECT id, activity
-		FROM root_activity
-		` + cursorWhere + `
-		ORDER BY activity DESC, id DESC
-		` + pageBuilder.Limit(f.Limit+1)
-	rootQueryArgs := append([]any{}, rootArgs...)
-	rootQueryArgs = append(rootQueryArgs, pageBuilder.Args()...)
+	rootQuery, rootQueryArgs := sidebarRootPageQuery(f, cur, predicates)
 
 	rows, err := db.getReader().QueryContext(ctx, rootQuery, rootQueryArgs...)
 	if err != nil {
@@ -982,9 +1122,7 @@ func (db *DB) getSidebarSessionIndexPage(
 			SELECT s.id, t.ord
 			FROM sessions s
 			JOIN tree t ON s.parent_session_id = t.id
-			WHERE s.message_count > 0
-			  AND s.deleted_at IS NULL
-			  ` + childAutomationWhere + `
+			WHERE ` + predicates.treeMemberWhere + `
 		),
 		ranked_tree(id, ord) AS (
 			SELECT id, MIN(ord) AS ord
@@ -996,10 +1134,15 @@ func (db *DB) getSidebarSessionIndexPage(
 			s.parent_session_id,
 			s.relationship_type,
 			s.project,
+			EXISTS (
+				SELECT 1 FROM session_project_assignments spa
+				WHERE spa.session_id = s.id
+			) AS project_assigned,
 			s.machine,
 			s.agent,
 			s.agent_label,
 			s.entrypoint,
+			s.session_kind,
 			COALESCE(s.display_name, s.session_name) AS display_name,
 			s.started_at,
 			s.ended_at,
@@ -1031,10 +1174,12 @@ func (db *DB) getSidebarSessionIndexPage(
 			&row.ParentSessionID,
 			&row.RelationshipType,
 			&row.Project,
+			&row.ProjectAssigned,
 			&row.Machine,
 			&row.Agent,
 			&row.AgentLabel,
 			&row.Entrypoint,
+			&row.SessionKind,
 			&row.DisplayName,
 			&row.StartedAt,
 			&row.EndedAt,
@@ -1071,7 +1216,7 @@ func (db *DB) GetSession(
 	)
 
 	s, err := scanSessionRow(row)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -1084,19 +1229,55 @@ func (db *DB) GetSession(
 func (db *DB) GetSessionFull(
 	ctx context.Context, id string,
 ) (*Session, error) {
+	s, err := db.getSessionFullUncoalesced(ctx, id)
+	if err != nil || s == nil {
+		return s, err
+	}
+	// Expose the visible name (user rename, else agent session name)
+	// like the PG and DuckDB GetSessionFull and the sqlite base reads.
+	// The coalesce happens post-scan because sessionFullCols is shared
+	// with ListSessionsModifiedBetween, whose push consumers must see
+	// display_name and session_name unmerged.
+	if s.DisplayName == nil {
+		s.DisplayName = s.SessionName
+	}
+	return s, nil
+}
+
+// GetArtifactExportSession returns uncoalesced names and omits applied launcher parents.
+func (db *DB) GetArtifactExportSession(
+	ctx context.Context, id string,
+) (*Session, error) {
+	launcherApplied := `COALESCE(parser_parent_session_id, '') = ''
+		AND NOT ` + spawnEdgeExistsSQL("sessions") + `
+		AND EXISTS (SELECT 1 FROM session_external_parents ep
+			WHERE ep.session_id = sessions.id AND ep.parent_session_id = sessions.parent_session_id)`
+	parent := `CASE WHEN ` + launcherApplied + ` THEN NULL ELSE parent_session_id END`
+	relationship := `CASE WHEN ` + launcherApplied + ` THEN ` + parserRelationshipSQL + ` ELSE relationship_type END`
+	cols := sessionFullColsBeforeParent + parent + `, parser_parent_session_id, ` + relationship + sessionFullColsAfterRelationship
+	return scanSessionFullRow(db.getReader().QueryRowContext(ctx,
+		"SELECT "+cols+" FROM sessions WHERE id = ?", id), id)
+}
+
+func (db *DB) getSessionFullUncoalesced(
+	ctx context.Context, id string,
+) (*Session, error) {
 	row := db.getReader().QueryRowContext(
 		ctx,
 		"SELECT "+sessionFullCols+" FROM sessions WHERE id = ?",
 		id,
 	)
+	return scanSessionFullRow(row, id)
+}
 
+func scanSessionFullRow(row interface{ Scan(...any) error }, id string) (*Session, error) {
 	var s Session
 	err := row.Scan(
 		&s.ID, &s.Project, &s.Machine, &s.Agent,
-		&s.AgentLabel, &s.Entrypoint,
+		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
 		&s.FirstMessage, &s.DisplayName, &s.SessionName, &s.StartedAt, &s.EndedAt,
 		&s.MessageCount, &s.UserMessageCount,
-		&s.ParentSessionID, &s.RelationshipType,
+		&s.ParentSessionID, &s.ParserParentSessionID, &s.RelationshipType,
 		&s.TotalOutputTokens, &s.PeakContextTokens,
 		&s.HasTotalOutputTokens, &s.HasPeakContextTokens,
 		&s.IsAutomated,
@@ -1110,6 +1291,7 @@ func (db *DB) GetSessionFull(
 		&s.HealthScore, &s.HealthGrade,
 		&s.HasToolCalls, &s.HasContextData,
 		&s.SecretLeakCount, &s.SecretsRulesVersion,
+		&s.FrictionCount, &s.FrictionRulesVersion, &s.FrictionHash,
 		&s.QualitySignalVersion,
 		&s.ShortPromptCount, &s.UnstructuredStart,
 		&s.MissingSuccessCriteriaCount,
@@ -1118,29 +1300,22 @@ func (db *DB) GetSessionFull(
 		&s.DataVersion,
 		&s.Cwd, &s.GitBranch,
 		&s.SourceSessionID, &s.SourceVersion,
-		&s.TranscriptFidelity,
+		&s.GroupKey, &s.TranscriptFidelity,
 		&s.ParserMalformedLines, &s.IsTruncated,
 		&s.LastWriteIncremental,
-		&s.DeletedAt, &s.DeletionCause,
+		&s.DeletedAt, &s.DeletionCause, &s.SourceMissingAt, &s.TrashIncludesCodexPages,
 		&s.TerminationStatus, &s.FilePath, &s.FileSize,
 		&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
 		&s.FileInode, &s.FileDevice,
 		&s.FileHash, &s.LocalModifiedAt,
-		&s.TranscriptRevision, &s.CreatedAt,
+		&s.TranscriptRevision, &s.CreatedAt, &s.ProjectAssigned,
+		prLinksColumn{&s.PRLinks}, labelsColumn{&s.Labels},
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("getting session full %s: %w", id, err)
-	}
-	// Expose the visible name (user rename, else agent session name)
-	// like the PG and DuckDB GetSessionFull and the sqlite base reads.
-	// The coalesce happens post-scan because sessionFullCols is shared
-	// with ListSessionsModifiedBetween, whose push consumers must see
-	// display_name and session_name unmerged.
-	if s.DisplayName == nil {
-		s.DisplayName = s.SessionName
 	}
 	return &s, nil
 }
@@ -1166,37 +1341,62 @@ func (db *DB) GetSessionName(
 	return stored.String, true, nil
 }
 
+// A pre-revert-page deletion covered the whole Codex thread. Keep that scope
+// even for page files absent during the upgrade. New deletions remain exact IDs.
+// A page <thread>_<rollout> is also excluded by its retired bare <rollout> ID,
+// which may have been recorded without a file name to derive the new ID from.
+const sessionExcludedQuery = `SELECT EXISTS (
+	SELECT 1 FROM excluded_sessions
+	WHERE id = ?1 OR (
+		substr(?1, -37, 1) = '_' AND length(?1) > 73
+		AND id = substr(?1, 1, length(?1) - 73) || substr(?1, -36)
+	) OR (
+		include_codex_pages = 1 AND substr(?1, -37, 1) = '_'
+		AND id = substr(?1, 1, length(?1) - 37)
+	)
+)`
+
 // IsSessionExcluded returns true if the session ID was
 // permanently deleted by the user.
-func (db *DB) IsSessionExcluded(id string) bool {
+func (db *DB) IsSessionExcluded(ctx context.Context, id string) bool {
 	var n int
-	_ = db.getReader().QueryRow(
-		"SELECT 1 FROM excluded_sessions WHERE id = ?", id,
+	_ = db.getReader().QueryRow(ctx,
+		sessionExcludedQuery, id,
 	).Scan(&n)
 	return n == 1
 }
 
-// IsSessionTrashed returns true if the session ID exists in the trash.
-func (db *DB) IsSessionTrashed(id string) bool {
+const sessionTrashedQuery = `SELECT EXISTS (
+	SELECT 1 FROM sessions
+	WHERE deleted_at IS NOT NULL AND (
+		id = ?1 OR (
+			trash_includes_codex_pages = 1 AND substr(?1, -37, 1) = '_'
+			AND id = substr(?1, 1, length(?1) - 37)
+		)
+	)
+)`
+
+// IsSessionTrashed includes pages covered by a legacy whole-thread trash action.
+func (db *DB) IsSessionTrashed(ctx context.Context, id string) bool {
 	var n int
-	_ = db.getReader().QueryRow(
-		"SELECT 1 FROM sessions WHERE id = ?"+
-			" AND deleted_at IS NOT NULL AND deletion_cause IS NULL", id,
+	_ = db.getReader().QueryRow(ctx,
+		sessionTrashedQuery, id,
 	).Scan(&n)
 	return n == 1
 }
+
+const hasTrashedSessionByFilePathQuery = "SELECT 1 FROM sessions" +
+	" INDEXED BY idx_sessions_file_path" +
+	" WHERE file_path = ? AND agent = ?" +
+	" AND deleted_at IS NOT NULL" +
+	" LIMIT 1"
 
 // HasTrashedSessionByFilePath returns true when a source path already belongs
-// to a trashed row for this agent.
-func (db *DB) HasTrashedSessionByFilePath(path, agent string) bool {
+// to a trashed row for this agent. Use the path index so each parsed source
+// checks only its own rows, rather than scanning every session for the agent.
+func (db *DB) HasTrashedSessionByFilePath(ctx context.Context, path, agent string) bool {
 	var n int
-	_ = db.getReader().QueryRow(
-		"SELECT 1 FROM sessions"+
-			" WHERE file_path = ? AND agent = ?"+
-			" AND deleted_at IS NOT NULL AND deletion_cause IS NULL"+
-			" LIMIT 1",
-		path, agent,
-	).Scan(&n)
+	_ = db.getReader().QueryRow(ctx, hasTrashedSessionByFilePathQuery, path, agent).Scan(&n)
 	return n == 1
 }
 
@@ -1204,42 +1404,69 @@ func (db *DB) HasTrashedSessionByFilePath(path, agent string) bool {
 // appear in excluded_sessions. Used after a resync to clean
 // up sessions that were synced before their exclusion was
 // recorded.
-func (db *DB) PurgeExcludedSessions() error {
+func (db *DB) PurgeExcludedSessions(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin purge excluded tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	ids, err := sessionIDsTx(
-		tx, "id IN (SELECT id FROM excluded_sessions)",
-	)
-	if err != nil {
+	if _, err := purgeExcludedSessionsTx(ctx, tx); err != nil {
 		return err
+	}
+	return tx.Commit()
+}
+
+func purgeExcludedSessionsTx(ctx context.Context, tx *sql.Tx) (int64, error) {
+	const excluded = `EXISTS (
+		SELECT 1 FROM excluded_sessions excluded
+		WHERE excluded.id = sessions.id OR (
+			substr(sessions.id, -37, 1) = '_' AND length(sessions.id) > 73
+			AND excluded.id = substr(sessions.id, 1, length(sessions.id) - 73) || substr(sessions.id, -36)
+		) OR (
+			excluded.include_codex_pages = 1 AND substr(sessions.id, -37, 1) = '_'
+			AND excluded.id = substr(sessions.id, 1, length(sessions.id) - 37)
+		)
+	)`
+	ids, err := sessionIDsTx(ctx, tx, excluded)
+	if err != nil {
+		return 0, err
+	}
+	children, err := sessionIDsTx(ctx, tx, `id IN (
+		SELECT tc.subagent_session_id FROM tool_calls tc
+		WHERE tc.session_id IN (SELECT id FROM sessions WHERE `+excluded+`)
+		AND tc.session_id IS NOT tc.subagent_session_id)`)
+	if err != nil {
+		return 0, err
 	}
 	for _, id := range ids {
 		if err := deleteSessionMessagesTx(tx, id); err != nil {
-			return fmt.Errorf(
-				"pre-deleting excluded session %s messages: %w",
-				id, err,
-			)
+			return 0, fmt.Errorf("pre-deleting excluded session %s messages: %w", id, err)
 		}
 	}
-	if _, err := tx.Exec(
-		"DELETE FROM sessions WHERE id IN (SELECT id FROM excluded_sessions)",
-	); err != nil {
-		return fmt.Errorf("purging excluded sessions: %w", err)
+	if err := deleteSessionAnnotationsTx(ctx, tx, excluded); err != nil {
+		return 0, err
 	}
-	return tx.Commit()
+	res, err := tx.ExecContext(ctx, "DELETE FROM sessions WHERE "+excluded)
+	if err != nil {
+		return 0, fmt.Errorf("purging excluded sessions: %w", err)
+	}
+	if _, err := applySessionExternalParentsFor(ctx, tx.ExecContext,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
+		}, append(ids, children...)); err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // DeleteParserExcludedSessions removes rows that the current parser
 // deliberately excludes, without recording a permanent user deletion
 // in excluded_sessions. If the source file later becomes a real
 // conversation, sync may import it again.
-func (db *DB) DeleteParserExcludedSessions(ids []string) (int, error) {
+func (db *DB) DeleteParserExcludedSessions(ctx context.Context, ids []string) (int, error) {
 	if err := db.requireWritable(); err != nil {
 		return 0, err
 	}
@@ -1249,7 +1476,7 @@ func (db *DB) DeleteParserExcludedSessions(ids []string) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin parser-excluded delete: %w", err)
 	}
@@ -1260,13 +1487,16 @@ func (db *DB) DeleteParserExcludedSessions(ids []string) (int, error) {
 		if id == "" {
 			continue
 		}
+		if err := db.checkArchiveSessionProvenanceTx(ctx, tx, SessionBatchWrite{Session: Session{ID: id}}); err != nil {
+			return 0, fmt.Errorf("checking parser-excluded session ownership: %w", err)
+		}
 		if err := deleteSessionMessagesTx(tx, id); err != nil {
 			return 0, fmt.Errorf(
 				"pre-deleting parser-excluded session %s messages: %w",
 				id, err,
 			)
 		}
-		res, err := tx.Exec(
+		res, err := tx.ExecContext(ctx,
 			"DELETE FROM sessions WHERE id = ?", id,
 		)
 		if err != nil {
@@ -1287,23 +1517,25 @@ func (db *DB) DeleteParserExcludedSessions(ids []string) (int, error) {
 const insertSessionSQL = `
 		INSERT INTO sessions (
 			id, project, machine, agent, first_message, session_name,
-			agent_label, entrypoint,
+			agent_label, entrypoint, session_kind,
 			started_at, ended_at, message_count,
 			user_message_count, parent_session_id,
+			parser_parent_session_id,
 			relationship_type,
 			total_output_tokens, peak_context_tokens,
 			has_total_output_tokens, has_peak_context_tokens,
 			is_automated,
 			termination_status,
 			cwd, git_branch, source_session_id,
-			source_version, transcript_fidelity,
+			source_version, group_key, transcript_fidelity,
 			parser_malformed_lines,
 			is_truncated,
 			last_write_incremental,
 			file_path, file_size, file_mtime,
 			next_ordinal, last_entry_uuid, claude_linear_parse,
-			file_inode, file_device, file_hash
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			file_inode, file_device, file_hash,
+			pr_links, parser_relationship_type
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // insertSessionIfAbsentSQL inserts a session only when its id does not already
 // exist, leaving an existing row untouched.
@@ -1317,8 +1549,11 @@ const upsertSessionBaseSQL = insertSessionSQL + `
 			agent = excluded.agent,
 			agent_label = excluded.agent_label,
 			entrypoint = excluded.entrypoint,
+			session_kind = excluded.session_kind,
 			first_message = excluded.first_message,
-			-- session_name is always overwritten by re-parse; display_name
+			-- Parser writes resolve session_name before this statement: an
+			-- explicit title (including blank) replaces it, while an absent
+			-- provider signal may carry the existing value forward. display_name
 			-- is the user override and is only touched by RenameSession.
 			session_name = excluded.session_name,
 			started_at = excluded.started_at,
@@ -1326,7 +1561,14 @@ const upsertSessionBaseSQL = insertSessionSQL + `
 			message_count = excluded.message_count,
 			user_message_count = excluded.user_message_count,
 			parent_session_id = excluded.parent_session_id,
+			parser_parent_session_id = excluded.parser_parent_session_id,
 			relationship_type = excluded.relationship_type,
+			parser_relationship_type = excluded.parser_relationship_type,
+			friction_rules_version = CASE
+				WHEN sessions.parent_session_id IS NOT excluded.parent_session_id
+				  OR sessions.relationship_type IS NOT excluded.relationship_type
+				  OR sessions.agent IS NOT excluded.agent
+				THEN '' ELSE sessions.friction_rules_version END,
 			total_output_tokens = excluded.total_output_tokens,
 			peak_context_tokens = excluded.peak_context_tokens,
 			has_total_output_tokens = excluded.has_total_output_tokens,
@@ -1337,6 +1579,7 @@ const upsertSessionBaseSQL = insertSessionSQL + `
 			git_branch = excluded.git_branch,
 			source_session_id = excluded.source_session_id,
 			source_version = excluded.source_version,
+			group_key = excluded.group_key,
 			transcript_fidelity = excluded.transcript_fidelity,
 			parser_malformed_lines = excluded.parser_malformed_lines,
 			is_truncated = excluded.is_truncated,
@@ -1360,38 +1603,41 @@ const upsertSessionBaseSQL = insertSessionSQL + `
 				excluded.claude_linear_parse, sessions.claude_linear_parse),
 			file_inode = excluded.file_inode,
 			file_device = excluded.file_device,
-			file_hash = excluded.file_hash`
+			file_hash = excluded.file_hash,
+			pr_links = excluded.pr_links`
 
 const upsertSessionSQL = upsertSessionBaseSQL + `,
-			deleted_at = CASE
-				WHEN sessions.deletion_cause = '` + deletionCauseSourceMissing + `' THEN NULL
-				ELSE sessions.deleted_at
-			END,
-			deletion_cause = CASE
-				WHEN sessions.deletion_cause = '` + deletionCauseSourceMissing + `' THEN NULL
-				ELSE sessions.deletion_cause
-			END`
+			source_missing_at = NULL`
 
 func sessionIsAutomated(s Session) bool {
 	return s.IsAutomated ||
+		IsAutomatedSessionMetadata(s.SessionKind) ||
 		(s.UserMessageCount <= 1 &&
 			s.FirstMessage != nil &&
 			IsAutomatedSession(*s.FirstMessage))
 }
 
+func parserParentSessionID(s Session) *string {
+	if s.ParserParentSessionID != nil {
+		return s.ParserParentSessionID
+	}
+	return s.ParentSessionID
+}
+
 func upsertSessionArgs(s Session) []any {
+	s.RelationshipType = SessionRelationship(s)
 	return []any{
 		s.ID, s.Project, s.Machine, s.Agent, s.FirstMessage, s.SessionName,
-		s.AgentLabel, s.Entrypoint,
+		s.AgentLabel, s.Entrypoint, s.SessionKind,
 		s.StartedAt, s.EndedAt, s.MessageCount,
-		s.UserMessageCount, s.ParentSessionID,
+		s.UserMessageCount, s.ParentSessionID, parserParentSessionID(s),
 		s.RelationshipType,
 		s.TotalOutputTokens, s.PeakContextTokens,
 		s.HasTotalOutputTokens, s.HasPeakContextTokens,
 		sessionIsAutomated(s),
 		s.TerminationStatus,
 		s.Cwd, s.GitBranch, s.SourceSessionID,
-		s.SourceVersion, s.TranscriptFidelity,
+		s.SourceVersion, s.GroupKey, s.TranscriptFidelity,
 		s.ParserMalformedLines,
 		s.IsTruncated,
 		// last_write_incremental is seeded false on fresh INSERT: a brand-new
@@ -1402,56 +1648,157 @@ func upsertSessionArgs(s Session) []any {
 		s.FilePath, s.FileSize, s.FileMtime,
 		s.NextOrdinal, s.LastEntryUUID, s.ClaudeLinearParse,
 		s.FileInode, s.FileDevice, s.FileHash,
+		EncodePRLinks(s.PRLinks),
+		s.RelationshipType,
 	}
+}
+
+// SessionRelationship normalizes older parentless workers at every session write.
+func SessionRelationship(s Session) string {
+	var parent string
+	if s.ParentSessionID != nil {
+		parent = *s.ParentSessionID
+	}
+	return string(parser.PromoteParentlessWorker(parent, parser.RelationshipType(s.RelationshipType), s.SessionKind == parser.SessionKindNonInteractive))
 }
 
 // UpsertSession inserts or updates a session.
 // Sessions that were permanently deleted (in excluded_sessions)
 // or currently in the trash are rejected.
-func (db *DB) UpsertSession(s Session) error {
-	_, err := db.upsertSession(s, true)
+func (db *DB) UpsertSession(ctx context.Context, s Session) error {
+	_, err := db.upsertSession(ctx, s, true)
 	return err
 }
 
 // UpsertSessionPendingContent inserts or updates the session row without
-// reviving a source-missing tombstone. Full content writers call
-// ReviveSourceMissingSession only after every required dependent write lands.
+// clearing source-missing state. Full content writers call
+// ClearSessionSourceMissing only after every required dependent write lands.
 // The returned bool reports whether the row was source-missing before the
 // upsert, so callers can replace rather than append its retained content.
-func (db *DB) UpsertSessionPendingContent(s Session) (bool, error) {
-	return db.upsertSession(s, false)
+func (db *DB) UpsertSessionPendingContent(ctx context.Context, s Session) (bool, error) {
+	result, err := db.upsertSession(ctx, s, false)
+	return result.sourceMissing, err
 }
 
-func (db *DB) upsertSession(
+func (db *DB) upsertSession(ctx context.Context,
 	s Session, reviveSourceMissing bool,
-) (bool, error) {
-	_ = ValidateAndSanitize(&s, nil, nil)
-
+) (sessionUpsertResult, error) {
+	s = db.sessionForStorage(s)
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	writer := db.getWriter()
+	// The upsert leaves stored titles, signals, and findings alone on
+	// purpose in full mode; a usage archive must not keep any that predate
+	// the policy, so the row is settled in the same transaction.
+	tx, err := writer.Begin(ctx)
+	if err != nil {
+		return sessionUpsertResult{}, fmt.Errorf("beginning session upsert: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := db.checkArchiveSessionProvenanceTx(ctx, tx, SessionBatchWrite{Session: s}); err != nil {
+		return sessionUpsertResult{}, err
+	}
+
+	result, err := upsertSessionExec(
+		ctx,
+		tx.ExecContext,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
+		},
+		s,
+		reviveSourceMissing,
+	)
+	if err != nil {
+		return result, err
+	}
+	if db.usageOnlyStorage() {
+		if err := settleUsageOnlySessionTx(tx, s.ID); err != nil {
+			return result, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return result, fmt.Errorf("committing session upsert: %w", err)
+	}
+	return result, nil
+}
+
+type sessionUpsertResult struct {
+	inserted        bool
+	sourceMissing   bool
+	previousProject string
+	currentProject  string
+}
+
+func upsertSessionExec(
+	ctx context.Context,
+	exec func(context.Context, string, ...any) (sql.Result, error),
+	queryRow func(context.Context, string, ...any) rowScanner,
+	s Session,
+	reviveSourceMissing bool,
+) (sessionUpsertResult, error) {
+	_ = ValidateAndSanitize(&s, nil, nil)
 
 	// Check exclusion/trash state under the write lock to avoid a race with
 	// concurrent DeleteSession/EmptyTrash/RestoreSession.
 	var excluded int
-	_ = db.getWriter().QueryRow(
-		"SELECT 1 FROM excluded_sessions WHERE id = ?", s.ID,
+	err := queryRow(ctx,
+		sessionExcludedQuery, s.ID,
 	).Scan(&excluded)
-	if excluded == 1 {
-		return false, ErrSessionExcluded
-	}
-	var deletedAt, deletionCause sql.NullString
-	err := db.getWriter().QueryRow(
-		"SELECT deleted_at, deletion_cause FROM sessions WHERE id = ?", s.ID,
-	).Scan(&deletedAt, &deletionCause)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, fmt.Errorf("checking trash for %s: %w", s.ID, err)
+		return sessionUpsertResult{},
+			fmt.Errorf("checking exclusion for %s: %w", s.ID, err)
 	}
-	if deletedAt.Valid &&
-		(!deletionCause.Valid || deletionCause.String != deletionCauseSourceMissing) {
-		return false, ErrSessionTrashed
+	if excluded == 1 {
+		return sessionUpsertResult{}, ErrSessionExcluded
 	}
-	sourceMissing := deletionCause.Valid &&
-		deletionCause.String == deletionCauseSourceMissing
+	var previousProject string
+	var previousSessionName sql.NullString
+	var previousAutomated bool
+	var previousParent sql.NullString
+	var previousRelationship string
+	var deletedAt, sourceMissingAt sql.NullString
+	err = queryRow(ctx,
+		"SELECT project, session_name, deleted_at, source_missing_at, is_automated, parent_session_id, relationship_type "+
+			"FROM sessions WHERE id = ?", s.ID,
+	).Scan(
+		&previousProject, &previousSessionName, &deletedAt, &sourceMissingAt, &previousAutomated,
+		&previousParent, &previousRelationship,
+	)
+	result := sessionUpsertResult{
+		inserted:        errors.Is(err, sql.ErrNoRows),
+		previousProject: previousProject,
+		currentProject:  s.Project,
+	}
+	if err != nil && !result.inserted {
+		return sessionUpsertResult{},
+			fmt.Errorf("checking session %s: %w", s.ID, err)
+	}
+	if s.PreserveStoredAutomation {
+		s.IsAutomated = s.IsAutomated || previousAutomated
+	}
+	if s.PreserveSessionName && !result.inserted {
+		if previousSessionName.Valid {
+			name := previousSessionName.String
+			s.SessionName = &name
+		} else {
+			s.SessionName = nil
+		}
+	}
+	if deletedAt.Valid {
+		return sessionUpsertResult{}, ErrSessionTrashed
+	}
+	// Only page-shaped IDs can inherit a thread's trash. Ordinary writes
+	// retain the exact-row check above without another database query.
+	if len(s.ID) > 37 && s.ID[len(s.ID)-37] == '_' {
+		var trashed bool
+		if err := queryRow(ctx, sessionTrashedQuery, s.ID).Scan(&trashed); err != nil {
+			return sessionUpsertResult{}, fmt.Errorf("checking trash for %s: %w", s.ID, err)
+		}
+		if trashed {
+			return sessionUpsertResult{}, ErrSessionTrashed
+		}
+	}
+	result.sourceMissing = sourceMissingAt.Valid
 
 	// data_version is intentionally NOT advanced here. The
 	// caller must call SetSessionDataVersion only after the
@@ -1464,27 +1811,36 @@ func (db *DB) upsertSession(
 	if reviveSourceMissing {
 		query = upsertSessionSQL
 	}
-	_, err = db.getWriter().Exec(query, upsertSessionArgs(s)...)
+	_, err = exec(ctx,
+		query,
+		upsertSessionArgs(s)...,
+	)
 	if err != nil {
-		return false, fmt.Errorf("upserting session %s: %w", s.ID, err)
+		return sessionUpsertResult{},
+			fmt.Errorf("upserting session %s: %w", s.ID, err)
 	}
-	return sourceMissing, nil
+	parentChanged := !nullableStringEqual(previousParent, s.ParentSessionID)
+	if result.inserted || parentChanged || previousRelationship != s.RelationshipType {
+		if _, err := applySessionExternalParentsFor(ctx, exec, queryRow, []string{s.ID}); err != nil {
+			return sessionUpsertResult{}, err
+		}
+	}
+	return result, nil
 }
 
-// ReviveSourceMissingSession makes a watcher-tombstoned session visible after
-// its replacement session row, messages, usage events, and data version have
-// all been persisted successfully. User trash is never affected.
-func (db *DB) ReviveSourceMissingSession(id string) error {
+// ClearSessionSourceMissing clears source-missing state after its replacement
+// session row, messages, usage events, and data version have all been persisted
+// successfully. User trash is never affected.
+func (db *DB) ClearSessionSourceMissing(ctx context.Context, id string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(`
+	_, err := db.getWriter().Exec(ctx, `
 		UPDATE sessions
-		SET deleted_at = NULL,
-		    deletion_cause = NULL,
+		SET source_missing_at = NULL,
 		    local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		WHERE id = ? AND deletion_cause = ?`, id, deletionCauseSourceMissing)
+		WHERE id = ? AND source_missing_at IS NOT NULL`, id)
 	if err != nil {
-		return fmt.Errorf("reviving source-missing session %s: %w", id, err)
+		return fmt.Errorf("clearing source-missing state for session %s: %w", id, err)
 	}
 	return nil
 }
@@ -1500,7 +1856,7 @@ func (db *DB) insertSessionIfAbsent(ctx context.Context, s Session) error {
 
 	var excluded int
 	_ = db.getWriter().QueryRowContext(
-		ctx, "SELECT 1 FROM excluded_sessions WHERE id = ?", s.ID,
+		ctx, sessionExcludedQuery, s.ID,
 	).Scan(&excluded)
 	if excluded == 1 {
 		return ErrSessionExcluded
@@ -1510,7 +1866,7 @@ func (db *DB) insertSessionIfAbsent(ctx context.Context, s Session) error {
 	// UpsertSession does, under the same lock to avoid a restore/delete race.
 	var trashed int
 	_ = db.getWriter().QueryRowContext(
-		ctx, "SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NOT NULL", s.ID,
+		ctx, sessionTrashedQuery, s.ID,
 	).Scan(&trashed)
 	if trashed == 1 {
 		return ErrSessionTrashed
@@ -1544,15 +1900,166 @@ func (db *DB) GetChildSessions(
 	return scanSessionRows(rows)
 }
 
+// subagentSpawnerExpr resolves the parent of the session aliased `s`
+// from the authoritative tool_calls spawn edges (recorded by the parser
+// from toolUseResult.agentId).
+//
+// A child is normally referenced by exactly one edge, but copied or
+// forked history can leave several sessions claiming the same child.
+// Resolution must then be a pure function of the stored edges and never
+// of the order they arrived, because any single sync may observe only a
+// subset of them: a link written from a partial view has to self-correct
+// once the rest land, rather than being locked in.
+//
+// A fork derives from the session it was forked from, so it always
+// starts later. Ordering candidates by start time therefore resolves to
+// the original spawner from any subset, and converges on the next sync.
+//
+// started_at has to be NORMALIZED before it is ordered, not compared
+// raw. It is TEXT written by timeutil.Format, i.e. time.RFC3339Nano,
+// which STRIPS trailing zeros from the fractional second: a whole-second
+// start is stored '...T00:00:00Z' while a later one is stored
+// '...T00:00:00.1Z', and '.' (0x2E) sorts before 'Z' (0x5A). Raw lexical
+// order is therefore not chronological in exactly the case that matters
+// here — it ranks a whole-second spawner behind every fractional one and
+// would hand the child to a copy. strftime re-renders each value as
+// fixed-width '...T00:00:00.000Z', for which lexical order IS
+// chronological (to the millisecond; anything closer than that falls
+// through to the id key below).
+//
+// The remaining keys keep that total order well defined:
+//   - strftime yields NULL for a started_at that is unset, empty or
+//     malformed, and SQLite sorts NULL first, so an unknown start time
+//     would otherwise outrank every real one — the leading IS NULL key
+//     pushes those candidates last instead.
+//   - among candidates whose normalized start times TIE (identical
+//     timestamps — a copy shares its source's; sub-millisecond gaps
+//     truncated away by %f; or all unknown), the parser-established
+//     parent wins if it is one of them. parser_parent_session_id is
+//     immutable linker provenance: unlike the effective parent, a
+//     copied-only linker pass cannot overwrite it and then make its own
+//     provisional choice sticky when the real edge arrives later.
+//     Whenever start times DO differ, chronology still decides
+//     unconditionally, so parser provenance never preserves a parent
+//     that stronger evidence contradicts.
+//   - the session id breaks any remaining tie (no parser-established
+//     parent among the tied candidates), so resolution still never
+//     depends on whichever edge SQLite visited first.
+//
+// Ranking unknown start times last is a deliberate trade-off: a real
+// spawner with no usable started_at loses to a copied spawner that has
+// one. Protecting it unconditionally would make the stored parent
+// outrank fresher evidence, which is the ingestion-order dependence
+// this resolution exists to remove. If the spawner's start time later
+// becomes known, its row update re-enters linking and the child
+// self-corrects.
+//
+// The LEFT JOIN keeps an edge whose spawner has no sessions row as a
+// last-resort candidate (it sorts with the unknown start times) rather
+// than discarding it.
+//
+// A self-referential edge (tc.session_id = tc.subagent_session_id, only
+// reachable from a corrupt or crafted transcript) is never a candidate: a
+// session cannot spawn itself, and treating the edge as evidence would
+// make the row its own parent and drop it from the hierarchy roots. The
+// same guard is applied wherever spawn edges are enumerated (the driver
+// sets below, clearDanglingSubagentParentQuery, SubagentChildSessionIDs).
+const subagentSpawnerExpr = `
+		SELECT tc.session_id
+		FROM tool_calls tc
+		LEFT JOIN sessions ps ON ps.id = tc.session_id
+		WHERE tc.subagent_session_id = s.id
+		AND tc.session_id IS NOT s.id
+		ORDER BY
+			(strftime('%Y-%m-%dT%H:%M:%fZ', ps.started_at) IS NULL),
+			strftime('%Y-%m-%dT%H:%M:%fZ', ps.started_at),
+			(tc.session_id IS NOT s.parser_parent_session_id),
+			tc.session_id
+		LIMIT 1`
+
+// linkSubagentSessionsQuery re-points every session that carries a spawn edge
+// at the spawner subagentSpawnerExpr resolves for it.
+//
+// The statement is driven from the edges rather than from sessions: `s.id IN
+// (SELECT tc.subagent_session_id ...)` lets SQLite seek the partial index
+// idx_tool_calls_subagent and then look each child up by primary key, so a
+// sync's linking cost scales with the number of spawn edges instead of with
+// the size of the archive. The equivalent EXISTS(...) form reads the same but
+// plans as a full scan of sessions with a correlated probe per row, which is
+// what makes linking on a large archive expensive even when nothing changed.
+// The IS NOT NULL filter keeps the candidate list free of NULLs, so the IN
+// comparison cannot go three-valued (the partial index carries exactly those
+// rows, so the filter is free).
+const linkSubagentSessionsQuery = `
+	UPDATE sessions AS s
+	SET parent_session_id = (` + subagentSpawnerExpr + `
+	),
+	relationship_type = 'subagent',
+	friction_rules_version = '',
+	local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	-- The tool_calls edge (from toolUseResult.agentId) records the actual
+	-- spawn, authoritative over the path-derived parent set at parse time.
+	-- Nested subagents (depth >= 2) live flat in <main>/subagents/, so path
+	-- derivation pins them to the main session AND tags them 'subagent';
+	-- the old relationship_type != 'subagent' guard skipped them, leaving
+	-- the hierarchy flat.
+	--
+	-- Update when EITHER the row is not yet 'subagent' (upgrade
+	-- continuation/fork/empty) OR the resolved spawner differs from the
+	-- stored parent (null-safe IS NOT, so a subagent with a NULL parent is
+	-- still linked). Because the resolved spawner depends only on the
+	-- stored edges, a row already pointing at it matches neither branch:
+	-- linking stays a no-op and does not churn local_modified_at.
+	WHERE s.id IN (
+		SELECT tc.subagent_session_id FROM tool_calls tc
+		WHERE tc.subagent_session_id IS NOT NULL
+		AND tc.session_id IS NOT tc.subagent_session_id
+	)
+	AND (
+		relationship_type != 'subagent'
+		OR parent_session_id IS NOT (` + subagentSpawnerExpr + `
+		)
+	)`
+
 // LinkSubagentSessions sets parent_session_id and
-// relationship_type on sessions that are referenced by
-// tool_calls.subagent_session_id. Updates sessions that either
-// have no parent yet or have a non-subagent relationship (e.g.
-// a Zencoder session classified as "continuation" from header
-// parentId that is actually a spawned subagent).
+// relationship_type on sessions referenced by
+// tool_calls.subagent_session_id (the authoritative spawn edge).
+// A session is updated when it is not yet tagged 'subagent' (e.g.
+// a Zencoder session classified as "continuation" from a header
+// parentId that is actually a spawned subagent) OR when its stored
+// parent disagrees with the spawn edge. The latter re-parents
+// nested subagents (depth >= 2), which the parser pins to the main
+// session because Claude Code stores every subagent flat under
+// <main>/subagents/. Already-correct subagents are left untouched.
+//
+// See subagentSpawnerExpr for how a child claimed by more than one
+// spawner is resolved, and linkSubagentSessionsQuery for why the
+// statement is driven from the spawn-edge index: every sync calls this,
+// so its cost has to track the number of spawn edges rather than the
+// size of the archive. Per-event paths (single-session watcher syncs)
+// use LinkSubagentSessionsForSessions instead, which further bounds the
+// pass to the changed batch.
 func (db *DB) LinkSubagentSessions() error {
+	_, err := db.LinkSubagentSessionsContext(context.Background())
+	return err
+}
+
+// LinkSubagentSessionsContext is LinkSubagentSessions with caller-controlled
+// cancellation for bounded sync paths. The count is the number of session
+// rows whose parent link changed. Legacy repairs and ordinary linking commit
+// together so an error leaves no unreported parent changes.
+func (db *DB) LinkSubagentSessionsContext(ctx context.Context) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("beginning subagent linking: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	repaired, err := repairLegacySelfParentedSessions(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
 
 	// local_modified_at is bumped so the sync_marker trigger fires and
 	// push targets (PostgreSQL and the DuckDB mirror) re-select the linked
@@ -1561,38 +2068,568 @@ func (db *DB) LinkSubagentSessions() error {
 	// session after a mirror's cutoff would otherwise never re-push it
 	// (see updateSessionSignalsTx and ReplaceSessionUsageEvents for the
 	// same pattern).
-	_, err := db.getWriter().Exec(`
-		UPDATE sessions
-		SET parent_session_id = (
-			SELECT tc.session_id
-			FROM tool_calls tc
-			WHERE tc.subagent_session_id = sessions.id
-			LIMIT 1
-		),
-		relationship_type = 'subagent',
-		local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		WHERE relationship_type != 'subagent'
-		AND EXISTS (
-			SELECT 1 FROM tool_calls tc
-			WHERE tc.subagent_session_id = sessions.id
-		)`)
+	res, err := tx.ExecContext(ctx, linkSubagentSessionsQuery)
 	if err != nil {
-		return fmt.Errorf("linking subagent sessions: %w", err)
+		return 0, fmt.Errorf("linking subagent sessions: %w", err)
+	}
+	updated, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("counting linked subagent sessions: %w", err)
+	}
+	launched, err := applySessionExternalParents(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing subagent linking: %w", err)
+	}
+	return repaired + int(updated) + launched, nil
+}
+
+// selfParentRepairStateKey marks the archive as having cleared the
+// self-parented rows that linking produced before self-referential spawn
+// edges were ignored. See repairLegacySelfParentedSessions.
+const selfParentRepairStateKey = "subagent_self_parent_repair_v1"
+
+// clearSelfParentedSessionsSQL repairs any session that points at itself.
+// The linker never writes parser_parent_session_id, so when it holds a
+// different session that is the path-derived parent the legacy linker
+// overwrote, and the row gets it back; otherwise (no parser parent, or the
+// column was backfilled from an already self-parented row) the parent is
+// cleared. Row-level ingest sanitization (SanitizeSession) and the
+// self-edge guard in subagentSpawnerExpr keep new rows out of that state,
+// so this only ever matches rows written by earlier builds. The
+// archive-rebuild orphan copy applies the same repair to copied rows
+// (clearCopiedSelfParents).
+const clearSelfParentedSessionsSQL = `
+	UPDATE sessions
+	SET parent_session_id = NULLIF(parser_parent_session_id, id),
+	friction_rules_version = '',
+	local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	WHERE parent_session_id IS id`
+
+// repairLegacySelfParentedSessions runs clearSelfParentedSessionsSQL once
+// per archive. Earlier builds let a self-referential spawn edge resolve to
+// the session itself, and because linking now ignores those edges the
+// affected rows would never re-enter the linker. The pass is a full scan
+// of sessions (parent_session_id IS id cannot use idx_sessions_parent), so
+// it is gated by a pg_sync_state marker rather than repeated on every sync.
+// The caller commits the marker, repair, and ordinary linking together so a
+// failed run retries every change.
+func repairLegacySelfParentedSessions(ctx context.Context, tx *sql.Tx) (int, error) {
+	var repaired int
+	if err := tx.QueryRowContext(
+		ctx,
+		"SELECT EXISTS(SELECT 1 FROM pg_sync_state WHERE key = ?)",
+		selfParentRepairStateKey,
+	).Scan(&repaired); err != nil {
+		return 0, fmt.Errorf("checking self-parent repair state: %w", err)
+	}
+	if repaired != 0 {
+		return 0, nil
+	}
+	res, err := tx.ExecContext(ctx, clearSelfParentedSessionsSQL)
+	if err != nil {
+		return 0, fmt.Errorf("clearing legacy self-parented sessions: %w", err)
+	}
+	updated, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("counting legacy self-parent repairs: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO pg_sync_state (key, value) VALUES (?, '1')
+		ON CONFLICT(key) DO NOTHING`, selfParentRepairStateKey); err != nil {
+		return 0, fmt.Errorf("recording self-parent repair state: %w", err)
+	}
+	return int(updated), nil
+}
+
+// linkSubagentSessionsForSessionsQuery is linkSubagentSessionsQuery
+// restricted to the children a batch of changed sessions can affect. ph is
+// an inPlaceholders list bound twice: once per branch of the UNION.
+//
+// A changed session can alter linking in exactly two ways, one per branch:
+//   - tc.session_id IN ph: the session's transcript carries spawn edges, so
+//     every child it claims is re-resolved (idx_tool_calls_session seek).
+//     A conflicting edge always arrives through its spawner's transcript,
+//     so this branch is what lets a provisional link self-correct — the
+//     spawner whose edge just landed is in the batch by definition.
+//   - tc.subagent_session_id IN ph: the session is itself a child whose row
+//     was rewritten (e.g. re-parsed with a path-derived parent), so its own
+//     link is re-resolved (idx_tool_calls_subagent seek).
+//
+// Sessions outside both branches have unchanged edges, and resolution is a
+// pure function of the stored edges (see subagentSpawnerExpr), so their
+// links cannot have changed — skipping them is what keeps a single-session
+// watcher sync bounded by the batch instead of the archive.
+func linkSubagentSessionsForSessionsQuery(ph string) string {
+	return `
+	UPDATE sessions AS s
+	SET parent_session_id = (` + subagentSpawnerExpr + `
+	),
+	relationship_type = 'subagent',
+	friction_rules_version = '',
+	local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	WHERE s.id IN (
+		SELECT tc.subagent_session_id FROM tool_calls tc
+		WHERE tc.session_id IN ` + ph + `
+		AND tc.subagent_session_id IS NOT NULL
+		AND tc.session_id IS NOT tc.subagent_session_id
+		UNION
+		SELECT tc.subagent_session_id FROM tool_calls tc
+		WHERE tc.subagent_session_id IN ` + ph + `
+		AND tc.session_id IS NOT tc.subagent_session_id
+	)
+	AND (
+		relationship_type != 'subagent'
+		OR parent_session_id IS NOT (` + subagentSpawnerExpr + `
+		)
+	)`
+}
+
+// clearDanglingSubagentParentQuery repairs a captured former child whose LAST spawn
+// edge was removed together with its spawner: both UNION branches of the
+// linking statement select from remaining tool_calls, so an edge-less child
+// can never be re-resolved there, and its parent now points at a session
+// that no longer exists. Clearing is deliberately restricted to that
+// dangling case — when the stored parent still exists, only the edge is
+// gone, and nothing distinguishes an edge-derived parent (stale) from a
+// path-derived one (still valid, e.g. a Claude subagent whose directory
+// proves membership), so the safer failure mode is to keep the historical
+// claim. relationship_type stays 'subagent'; if an edge reappears, linking
+// re-parents the NULL-parent row (see the null-safe IS NOT predicate).
+func clearDanglingSubagentParentQuery(ph string) string {
+	return `
+	UPDATE sessions AS s
+	SET parent_session_id = NULL,
+	friction_rules_version = '',
+	local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+	WHERE s.id IN ` + ph + `
+	AND s.relationship_type = 'subagent'
+	AND s.parent_session_id IS NOT NULL
+	AND NOT EXISTS (
+		SELECT 1 FROM tool_calls tc WHERE tc.subagent_session_id = s.id
+		AND tc.session_id IS NOT tc.subagent_session_id
+	)
+	AND NOT EXISTS (
+		SELECT 1 FROM sessions p WHERE p.id = s.parent_session_id
+	)`
+}
+
+// LinkSubagentSessionsForSessions is LinkSubagentSessions scoped to the
+// sessions written by one sync batch: only children reachable from a batch
+// member's spawn edges (or batch members that are themselves children) are
+// re-resolved. Generic changed-session IDs are deliberately ineligible for
+// dangling-parent cleanup: a parser-derived parent may simply not have been
+// ingested yet. Destructive cleanup is reserved for former children captured
+// before a write that can remove their spawn edges and persisted through
+// QueueSubagentParentCleanupRepairs.
+// Per-event paths — the session watcher re-syncs a single file
+// on every change — must use this form so their linking cost tracks the
+// changed batch; bulk paths (full sync, reconciliation, resync) keep the
+// global LinkSubagentSessions pass they already coalesce to.
+// The returned count includes only committed changes; all chunks commit together.
+func (db *DB) LinkSubagentSessionsForSessions(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("beginning scoped subagent linking: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	updated, err := linkSubagentSessionsForSessionsTx(ctx, tx, ids)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing scoped subagent linking: %w", err)
+	}
+	return updated, nil
+}
+
+func linkSubagentSessionsForSessionsTx(ctx context.Context, tx *sql.Tx, ids []string) (int, error) {
+	updated := 0
+	seeds := append([]string{}, ids...)
+
+	// Each id binds twice (once per UNION branch), so halve the chunk to
+	// stay within SQLite's bind-variable limit.
+	err := QueryChunkedSize(ids, maxSQLVars/2, func(chunk []string) error {
+		ph, args := InPlaceholders(chunk)
+		allArgs := append(append([]any{}, args...), args...)
+		rows, err := tx.QueryContext(ctx,
+			linkSubagentSessionsForSessionsQuery(ph)+" RETURNING id", allArgs...,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"linking subagent sessions for %d changed sessions: %w",
+				len(chunk), err,
+			)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return fmt.Errorf("reading scoped subagent link: %w", err)
+			}
+			seeds = append(seeds, id)
+			updated++
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return 0, err
+	}
+	launched, err := applySessionExternalParentsFor(ctx, tx.ExecContext,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
+		}, seeds)
+	if err != nil {
+		return 0, err
+	}
+	updated += launched
+	return updated, nil
+}
+
+// QueueSubagentParentRepairs durably records sessions whose hierarchy must be
+// re-evaluated from surviving spawn edges. These generic seeds are never used
+// for destructive dangling-parent cleanup; callers that captured a former
+// child before removing edges use QueueSubagentParentCleanupRepairs instead.
+func (db *DB) QueueSubagentParentRepairs(ctx context.Context, ids []string) error {
+	return db.queueSubagentParentRepairs(ctx, ids, false)
+}
+
+// QueueSubagentParentCleanupRepairs durably records former children captured
+// before an exclusion or message replacement can remove their spawn edges.
+// Cleanup intent is separate from ordinary relink work so a newly parsed child
+// whose parent has not arrived yet never loses valid parser-derived parentage.
+func (db *DB) QueueSubagentParentCleanupRepairs(ctx context.Context, ids []string) error {
+	return db.queueSubagentParentRepairs(ctx, ids, true)
+}
+
+func (db *DB) queueSubagentParentRepairs(ctx context.Context, ids []string, cleanup bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	tx, err := db.getWriter().Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning subagent parent repair queue update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	repairStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO subagent_parent_repair_queue (session_id) VALUES (?)
+		ON CONFLICT(session_id) DO NOTHING`)
+	if err != nil {
+		return fmt.Errorf("preparing subagent parent repair queue insert: %w", err)
+	}
+	defer repairStmt.Close()
+	var cleanupStmt *sql.Stmt
+	if cleanup {
+		cleanupStmt, err = tx.PrepareContext(ctx, `
+			INSERT INTO subagent_parent_cleanup_queue (session_id) VALUES (?)
+			ON CONFLICT(session_id) DO NOTHING`)
+		if err != nil {
+			return fmt.Errorf(
+				"preparing subagent parent cleanup queue insert: %w", err,
+			)
+		}
+		defer cleanupStmt.Close()
+	}
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, err := repairStmt.ExecContext(ctx, id); err != nil {
+			return fmt.Errorf("queueing subagent parent repair for %s: %w", id, err)
+		}
+		if cleanupStmt != nil {
+			if _, err := cleanupStmt.ExecContext(ctx, id); err != nil {
+				return fmt.Errorf(
+					"queueing subagent parent cleanup for %s: %w", id, err,
+				)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing subagent parent repair queue: %w", err)
 	}
 	return nil
 }
 
+// RepairQueuedSubagentParents re-evaluates every durably queued session and
+// clears the queue in the same transaction. A failed link or cleanup rolls
+// back both the hierarchy changes and queue deletion so a later sync retries
+// the exact IDs even when their original spawn edges have disappeared.
+func (db *DB) RepairQueuedSubagentParents() error {
+	_, err := db.RepairQueuedSubagentParentsContext(context.Background(), nil)
+	return err
+}
+
+// RepairQueuedSubagentParentsContext is RepairQueuedSubagentParents with
+// caller-controlled cancellation and optional batch progress. Progress counts
+// checked queue entries, including missing sessions and unchanged parents. The
+// final callback precedes commit; an error still rolls back the entire repair.
+// The callback runs under the writer lock and must not call back into DB.
+// The returned count includes session rows changed by committed linking and cleanup.
+func (db *DB) RepairQueuedSubagentParentsContext(
+	ctx context.Context, onProgress func(done, total int),
+) (int, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	var pending int
+	err := db.getWriter().QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM subagent_parent_repair_queue)
+		    OR EXISTS(SELECT 1 FROM subagent_parent_cleanup_queue)
+		    OR EXISTS(SELECT 1 FROM pg_sync_state WHERE key = ?)`,
+		subagentParentRepairQueueStateKey,
+	).Scan(&pending)
+	if err != nil {
+		return 0, fmt.Errorf("checking subagent parent repair queue: %w", err)
+	}
+	if pending == 0 {
+		return 0, nil
+	}
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("beginning queued subagent parent repair: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := migrateLegacySubagentParentRepairQueueTx(ctx, tx); err != nil {
+		return 0, err
+	}
+	updated := 0
+	var done, total int
+	if onProgress != nil {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT count(*) FROM (
+				SELECT session_id FROM subagent_parent_repair_queue
+				UNION
+				SELECT session_id FROM subagent_parent_cleanup_queue
+			)`).Scan(&total); err != nil {
+			return 0, fmt.Errorf("counting queued subagent parent repairs: %w", err)
+		}
+		if total > 0 {
+			onProgress(0, total)
+		}
+	}
+	for {
+		ids, err := func() ([]string, error) {
+			rows, err := tx.QueryContext(ctx, `
+			SELECT session_id FROM subagent_parent_repair_queue
+			UNION
+			SELECT session_id FROM subagent_parent_cleanup_queue
+			ORDER BY session_id LIMIT ?`, maxSQLVars/2)
+			if err != nil {
+				return nil, fmt.Errorf("listing queued subagent parent repairs: %w", err)
+			}
+			defer rows.Close()
+			ids := make([]string, 0, maxSQLVars/2)
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("scanning queued subagent parent repair: %w", err)
+				}
+				ids = append(ids, id)
+			}
+			rowsErr := rows.Err()
+			rows.Close()
+			if rowsErr != nil {
+				return nil, fmt.Errorf("iterating queued subagent parent repairs: %w", rowsErr)
+			}
+			return ids, nil
+		}()
+		if err != nil {
+			return 0, err
+		}
+		if len(ids) == 0 {
+			break
+		}
+
+		chunk := ids
+		ph, args := InPlaceholders(chunk)
+		allArgs := append(append([]any{}, args...), args...)
+		res, err := tx.ExecContext(ctx,
+			linkSubagentSessionsForSessionsQuery(ph), allArgs...,
+		)
+		if err != nil {
+			return 0, fmt.Errorf(
+				"linking queued subagent parents for %d sessions: %w",
+				len(chunk), err,
+			)
+		}
+		linked, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("counting queued subagent links: %w", err)
+		}
+		updated += int(linked)
+		cleanupSeeds := `(SELECT session_id
+			FROM subagent_parent_cleanup_queue WHERE session_id IN ` + ph + `)`
+		res, err = tx.ExecContext(ctx,
+			clearDanglingSubagentParentQuery(cleanupSeeds), args...,
+		)
+		if err != nil {
+			return 0, fmt.Errorf(
+				"clearing queued dangling subagent parents for %d "+
+					"sessions: %w",
+				len(chunk), err,
+			)
+		}
+		cleared, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("counting queued dangling-parent repairs: %w", err)
+		}
+		updated += int(cleared)
+		if _, err := tx.ExecContext(ctx,
+			"DELETE FROM subagent_parent_cleanup_queue WHERE session_id IN "+ph,
+			args...,
+		); err != nil {
+			return 0, fmt.Errorf(
+				"clearing %d queued subagent parent cleanups: %w",
+				len(chunk), err,
+			)
+		}
+		if _, err := tx.ExecContext(ctx,
+			"DELETE FROM subagent_parent_repair_queue WHERE session_id IN "+ph,
+			args...,
+		); err != nil {
+			return 0, fmt.Errorf(
+				"clearing %d queued subagent parent repairs: %w",
+				len(chunk), err,
+			)
+		}
+		done += len(chunk)
+		if onProgress != nil {
+			onProgress(done, total)
+		}
+	}
+	launched, err := applySessionExternalParents(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	updated += launched
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing queued subagent parent repair: %w", err)
+	}
+	return updated, nil
+}
+
+func migrateLegacySubagentParentRepairQueueTx(
+	ctx context.Context, tx *sql.Tx,
+) error {
+	var encoded string
+	err := tx.QueryRowContext(ctx,
+		"SELECT value FROM pg_sync_state WHERE key = ?",
+		subagentParentRepairQueueStateKey,
+	).Scan(&encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading legacy subagent parent repair queue: %w", err)
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(encoded), &ids); err != nil {
+		return fmt.Errorf("decoding legacy subagent parent repair queue: %w", err)
+	}
+	repairStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO subagent_parent_repair_queue (session_id) VALUES (?)
+		ON CONFLICT(session_id) DO NOTHING`)
+	if err != nil {
+		return fmt.Errorf("preparing legacy subagent parent repair migration: %w", err)
+	}
+	defer repairStmt.Close()
+	cleanupStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO subagent_parent_cleanup_queue (session_id) VALUES (?)
+		ON CONFLICT(session_id) DO NOTHING`)
+	if err != nil {
+		return fmt.Errorf("preparing legacy subagent parent cleanup migration: %w", err)
+	}
+	defer cleanupStmt.Close()
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, err := repairStmt.ExecContext(ctx, id); err != nil {
+			return fmt.Errorf("migrating legacy subagent parent repair for %s: %w", id, err)
+		}
+		// The JSON queue predates generic post-write and attempted-session
+		// seeds; every legacy ID was captured before a destructive write and
+		// therefore carries cleanup intent.
+		if _, err := cleanupStmt.ExecContext(ctx, id); err != nil {
+			return fmt.Errorf(
+				"migrating legacy subagent parent cleanup for %s: %w", id, err,
+			)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM pg_sync_state WHERE key = ?",
+		subagentParentRepairQueueStateKey,
+	); err != nil {
+		return fmt.Errorf("clearing legacy subagent parent repair queue: %w", err)
+	}
+	return nil
+}
+
+// SubagentChildSessionIDs returns the distinct children the given sessions'
+// spawn edges currently reference (tool_calls.subagent_session_id). Sync
+// captures this BEFORE a full rewrite or parser-exclusion delete: those
+// writes cascade tool_calls away, and LinkSubagentSessionsForSessions
+// discovers children only through post-write edges, so a child whose edge is
+// about to disappear must be carried into the scoped batch explicitly to be
+// re-resolved against its remaining spawners.
+func (db *DB) SubagentChildSessionIDs(ctx context.Context, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var children []string
+	err := queryChunked(ids, func(chunk []string) error {
+		ph, args := InPlaceholders(chunk)
+		rows, err := db.getReader().Query(ctx, `
+			SELECT DISTINCT tc.subagent_session_id
+			FROM tool_calls tc
+			WHERE tc.session_id IN `+ph+`
+			AND tc.subagent_session_id IS NOT NULL
+			AND tc.session_id IS NOT tc.subagent_session_id`, args...)
+		if err != nil {
+			return fmt.Errorf(
+				"listing subagent children of %d sessions: %w",
+				len(chunk), err,
+			)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var child string
+			if err := rows.Scan(&child); err != nil {
+				return fmt.Errorf("scanning subagent child: %w", err)
+			}
+			children = append(children, child)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return children, nil
+}
+
 // GetSessionFileInfo returns file_size and file_mtime for a session. Used for
-// fast skip checks during sync. Recoverable source-missing tombstones are
-// excluded so an identical source restoration cannot be mistaken for fresh.
-func (db *DB) GetSessionFileInfo(
+// fast skip checks during sync. Missing sources are excluded so an identical
+// source restoration cannot be mistaken for fresh.
+func (db *DB) GetSessionFileInfo(ctx context.Context,
 	id string,
 ) (size int64, mtime int64, ok bool) {
 	var s, m sql.NullInt64
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		"SELECT file_size, file_mtime FROM sessions WHERE id = ?"+
-			" AND (deletion_cause IS NULL"+
-			" OR deletion_cause <> '"+deletionCauseSourceMissing+"')",
+			" AND source_missing_at IS NULL",
 		id,
 	).Scan(&s, &m)
 	if err != nil {
@@ -1603,12 +2640,11 @@ func (db *DB) GetSessionFileInfo(
 
 // GetSessionFileHash returns file_hash for a non-source-missing session. The
 // bool is false when no eligible session exists or the column is NULL.
-func (db *DB) GetSessionFileHash(id string) (hash string, ok bool) {
+func (db *DB) GetSessionFileHash(ctx context.Context, id string) (hash string, ok bool) {
 	var h sql.NullString
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		"SELECT file_hash FROM sessions WHERE id = ?"+
-			" AND (deletion_cause IS NULL"+
-			" OR deletion_cause <> '"+deletionCauseSourceMissing+"')",
+			" AND source_missing_at IS NULL",
 		id,
 	).Scan(&h)
 	if err != nil || !h.Valid {
@@ -1617,11 +2653,30 @@ func (db *DB) GetSessionFileHash(id string) (hash string, ok bool) {
 	return h.String, true
 }
 
+// GetSessionFilePathNotSourceMissing returns the stored file_path for a
+// session unless its source is missing. Freshness gates use
+// it to decide whether a canonical primary row still vouches for its source: a
+// source-missing row must not, or a rowless source could never be marked
+// fresh, while a user-trashed row keeps its path so trash handling is
+// unchanged. It returns "" when no eligible row exists or file_path is NULL.
+func (db *DB) GetSessionFilePathNotSourceMissing(ctx context.Context, id string) string {
+	var fp sql.NullString
+	err := db.getReader().QueryRow(ctx,
+		"SELECT file_path FROM sessions WHERE id = ?"+
+			" AND source_missing_at IS NULL",
+		id,
+	).Scan(&fp)
+	if err != nil || !fp.Valid {
+		return ""
+	}
+	return fp.String
+}
+
 // GetSessionFilePath returns the stored file_path for a session,
 // or empty string if not found or NULL.
-func (db *DB) GetSessionFilePath(id string) string {
+func (db *DB) GetSessionFilePath(ctx context.Context, id string) string {
 	var fp sql.NullString
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		"SELECT file_path FROM sessions WHERE id = ?", id,
 	).Scan(&fp)
 	if err != nil || !fp.Valid {
@@ -1633,10 +2688,10 @@ func (db *DB) GetSessionFilePath(id string) string {
 // BumpLocalModifiedAt stamps the current time as local_modified_at so
 // incremental PG push picks up metadata changes (e.g. session_name updates
 // on the importer skip path) that don't go through the file-based sync path.
-func (db *DB) BumpLocalModifiedAt(id string) error {
+func (db *DB) BumpLocalModifiedAt(ctx context.Context, id string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(
+	_, err := db.getWriter().Exec(ctx,
 		`UPDATE sessions SET local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = ? AND deleted_at IS NULL`,
 		id,
@@ -1648,7 +2703,21 @@ func (db *DB) BumpLocalModifiedAt(id string) error {
 // in a single targeted UPDATE. Use this on re-import skip paths where the
 // full UpsertSession is unsafe because the caller does not have a complete
 // row to avoid overwriting existing fields with zero values.
-func (db *DB) RefreshSessionName(id string, sessionName *string) error {
+func (db *DB) RefreshSessionName(ctx context.Context, id string, sessionName *string) error {
+	return db.refreshSessionName(ctx, id, sessionName, false)
+}
+
+// RefreshNativeSessionName is RefreshSessionName for a title owned by the
+// agent's own store. It also updates trashed rows so a restore shows the
+// agent's current title.
+func (db *DB) RefreshNativeSessionName(ctx context.Context, id string, sessionName *string) error {
+	return db.refreshSessionName(ctx, id, sessionName, true)
+}
+
+func (db *DB) refreshSessionName(ctx context.Context, id string, sessionName *string, includeTrashed bool) error {
+	if db.usageOnlyStorage() {
+		sessionName = nil
+	}
 	if sessionName != nil {
 		clean := *sessionName
 		var stats ValidationStats
@@ -1658,14 +2727,27 @@ func (db *DB) RefreshSessionName(id string, sessionName *string) error {
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(
+	tx, err := db.getWriter().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(ctx,
 		`UPDATE sessions
 		 SET session_name = ?,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		 WHERE id = ? AND deleted_at IS NULL`,
-		sessionName, id,
+		 WHERE id = ? AND (? OR deleted_at IS NULL)`,
+		sessionName, id, includeTrashed,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if db.usageOnlyStorage() {
+		if err := clearUsageOnlyTextTx(tx, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // FindSessionIDsByPartial returns up to limit session IDs that contain the
@@ -1714,7 +2796,8 @@ func (db *DB) FindSessionIDsByPartial(
 
 // FindSessionIDsByRawSuffix returns up to limit session IDs whose
 // stored id is either the exact raw input or the raw input
-// preceded by an agent prefix (e.g. "codex:<uuid>"). The suffix
+// preceded by an agent or host prefix (e.g. "codex:<uuid>" or
+// "host~<uuid>"). The suffix
 // comparison uses SUBSTR rather than LIKE so that SQL wildcard
 // characters ('_' and '%') present in session IDs (which permit
 // underscores) are compared literally instead of matching any
@@ -1732,7 +2815,7 @@ func (db *DB) FindSessionIDsByRawSuffix(
 	rows, err := db.getReader().QueryContext(ctx,
 		`SELECT id FROM sessions
 		 WHERE (id = ?1
-		        OR SUBSTR(id, -(LENGTH(?1) + 1)) = ':' || ?1)
+		        OR SUBSTR(id, -(LENGTH(?1) + 1)) IN (':' || ?1, '~' || ?1))
 		   AND deleted_at IS NULL
 		 ORDER BY (id = ?1) DESC,
 		          COALESCE(
@@ -1763,11 +2846,48 @@ func (db *DB) FindSessionIDsByRawSuffix(
 	return ids, rows.Err()
 }
 
+// CodexRevertPageSessionIDs returns the ids of stored, non-deleted sessions
+// whose id starts with threadSessionID + "_" (Codex revert pages of that
+// thread, codex:<thread>_<rollout>). It compares an id range, not LIKE,
+// because '_' is a wildcard in LIKE and valid in session ids.
+func (db *DB) CodexRevertPageSessionIDs(
+	ctx context.Context, threadSessionID string,
+) ([]string, error) {
+	if threadSessionID == "" {
+		return nil, nil
+	}
+	// '`' is the byte after '_', so the range holds exactly the ids with the "_" prefix.
+	rows, err := db.getReader().QueryContext(ctx,
+		`SELECT id FROM sessions
+		 WHERE id > ?1 AND id < ?2 AND deleted_at IS NULL
+		 ORDER BY id`,
+		threadSessionID+"_", threadSessionID+"`",
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"finding codex revert pages of %q: %w",
+			threadSessionID, err,
+		)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf(
+				"scanning session id: %w", err,
+			)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // GetSessionDataVersion returns the data_version for a session.
 // Returns 0 when the session does not exist.
-func (db *DB) GetSessionDataVersion(id string) int {
+func (db *DB) GetSessionDataVersion(ctx context.Context, id string) int {
 	var v int
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		"SELECT data_version FROM sessions WHERE id = ?", id,
 	).Scan(&v)
 	if err != nil {
@@ -1782,10 +2902,10 @@ func (db *DB) GetSessionDataVersion(id string) int {
 // next sync re-parses the file instead of treating it as
 // already current. Bumps local_modified_at so the change
 // propagates through the next pg push.
-func (db *DB) SetSessionDataVersion(id string, version int) error {
+func (db *DB) SetSessionDataVersion(ctx context.Context, id string, version int) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(
+	_, err := db.getWriter().Exec(ctx,
 		`UPDATE sessions SET
 			data_version = ?,
 			local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
@@ -1800,12 +2920,88 @@ func (db *DB) SetSessionDataVersion(id string, version int) error {
 	return nil
 }
 
+// SetSessionDataVersions atomically stamps the parser data_version on every
+// listed session. This is used when several session rows represent one source:
+// either every member becomes current, or all remain eligible for retry.
+func (db *DB) SetSessionDataVersions(ids []string, version int) error {
+	return db.SetSessionDataVersionsContext(
+		context.Background(), ids, version,
+	)
+}
+
+// SetSessionDataVersionsContext stamps parser versions within ctx.
+func (db *DB) SetSessionDataVersionsContext(
+	ctx context.Context, ids []string, version int,
+) error {
+	return db.setSessionDataVersions(ctx, ids, version, true)
+}
+
+// SetExistingSessionDataVersions atomically stamps every listed session that
+// already exists, ignoring IDs that have not been inserted yet.
+func (db *DB) SetExistingSessionDataVersions(ids []string, version int) error {
+	return db.setSessionDataVersions(
+		context.Background(), ids, version, false,
+	)
+}
+
+func (db *DB) setSessionDataVersions(
+	ctx context.Context, ids []string, version int, requireAll bool,
+) error {
+	if err := db.requireWritable(); err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning data version update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, id := range ids {
+		result, err := tx.ExecContext(
+			ctx,
+			`UPDATE sessions SET
+				data_version = ?,
+				local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			 WHERE id = ?`,
+			version, id,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"setting data_version for %s: %w", id, err,
+			)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf(
+				"checking data_version update for %s: %w", id, err,
+			)
+		}
+		if rows == 0 && !requireAll {
+			continue
+		}
+		if rows != 1 {
+			return fmt.Errorf(
+				"setting data_version for %s: session not found", id,
+			)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing data version update: %w", err)
+	}
+	return nil
+}
+
 // GetSessionMessageCount returns the message_count for a
 // session. Returns (0, false) when the session does not exist.
-func (db *DB) GetSessionMessageCount(
+func (db *DB) GetSessionMessageCount(ctx context.Context,
 	id string,
 ) (count int, ok bool) {
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		"SELECT message_count FROM sessions WHERE id = ?",
 		id,
 	).Scan(&count)
@@ -1839,24 +3035,31 @@ func SessionVersionMarker(parts ...string) int64 {
 
 // GetSessionVersion returns the message count and a compact version
 // marker for change detection in SSE watchers.
-func (db *DB) GetSessionVersion(
+func (db *DB) GetSessionVersion(ctx context.Context,
 	id string,
 ) (count int, version int64, ok bool) {
 	var fileMtime int64
-	var fileHash, localModifiedAt string
-	err := db.getReader().QueryRow(
+	var fileHash, localModifiedAt, syncMarker, labels, parent, relationship, launcherParent string
+	err := db.getReader().QueryRow(ctx,
 		"SELECT message_count, COALESCE(file_mtime, 0),"+
-			" COALESCE(file_hash, ''), COALESCE(local_modified_at, '')"+
-			" FROM sessions WHERE id = ?",
+			" COALESCE(file_hash, ''), COALESCE(local_modified_at, ''), COALESCE(sync_marker, '')"+
+			", (SELECT json_group_array(label) FROM (SELECT label FROM session_labels WHERE session_id = sessions.id ORDER BY label)),"+
+			" COALESCE(parent_session_id, ''), COALESCE(relationship_type, ''),"+
+			" COALESCE((SELECT ep.parent_session_id FROM session_external_parents ep WHERE ep.session_id = sessions.id), '') FROM sessions WHERE id = ?",
 		id,
-	).Scan(&count, &fileMtime, &fileHash, &localModifiedAt)
+	).Scan(&count, &fileMtime, &fileHash, &localModifiedAt, &syncMarker, &labels, &parent, &relationship, &launcherParent)
 	if err != nil {
 		return 0, 0, false
 	}
 	return count, SessionVersionMarker(
-		fmt.Sprintf("%d", fileMtime),
+		strconv.FormatInt(fileMtime, 10),
 		fileHash,
 		localModifiedAt,
+		syncMarker,
+		labels,
+		parent,
+		relationship,
+		launcherParent,
 	), true
 }
 
@@ -1868,10 +3071,13 @@ func (db *DB) GetSessionVersion(
 type IncrementalInfo struct {
 	ID                   string
 	Project              string
+	SourceProject        string
 	Machine              string
 	Cwd                  string
 	AgentLabel           string
 	Entrypoint           string
+	SessionKind          string
+	RecordedGitRemote    string // source-recorded URL, separate from preserved identity
 	FileSize             int64
 	FileMtime            int64
 	NextOrdinal          int
@@ -1886,24 +3092,58 @@ type IncrementalInfo struct {
 	PeakContextTokens    int
 	HasTotalOutputTokens bool
 	HasPeakContextTokens bool
+	// PendingUsageOrdinal identifies the last committed assistant message in
+	// the current turn whose token usage has not yet been persisted. Codex
+	// incremental tails use it to apply the token_count that follows a late
+	// tool result without reparsing the committed prefix.
+	PendingUsageOrdinal *int
+}
+
+// MessageTokenUsageUpdate applies token metadata to an assistant message
+// that was committed in an earlier incremental batch.
+type MessageTokenUsageUpdate struct {
+	Ordinal          int
+	TokenUsage       jsontext.Value
+	ContextTokens    int
+	OutputTokens     int
+	HasContextTokens bool
+	HasOutputTokens  bool
 }
 
 type IncrementalSessionUpdate struct {
-	EndedAt                 *string
-	TerminationStatus       *string
-	MsgCount                int
-	UserMsgCount            int
-	FileSize                int64
-	FileMtime               int64
-	FileHash                *string
-	NextOrdinal             int
-	LastEntryUUID           string
-	TotalOutputTokens       int
-	PeakContextTokens       int
-	HasTotalOutputTokens    bool
-	HasPeakContextTokens    bool
-	SubagentLinks           []ToolCallSubagentLink
+	EndedAt                  *string
+	TerminationStatus        *string
+	MsgCount                 int
+	UserMsgCount             int
+	FileSize                 int64
+	FileMtime                int64
+	FileHash                 *string
+	NextOrdinal              int
+	LastEntryUUID            string
+	TotalOutputTokens        int
+	PeakContextTokens        int
+	HasTotalOutputTokens     bool
+	HasPeakContextTokens     bool
+	SubagentLinks            []ToolCallSubagentLink
+	ToolCallResultUpdates    []ToolCallResultUpdate
+	MessageTokenUsageUpdates []MessageTokenUsageUpdate
+	// Checkpoint/CheckpointBlobs are the machine-local parser checkpoint
+	// metadata and lazy payload to persist in the same transaction as this
+	// delta. nil keeps any existing checkpoint.
+	Checkpoint              *ParserCheckpoint
+	CheckpointBlobs         *ParserCheckpointBlobs
 	BlockedResultCategories map[string]bool
+	// ReplaceFromOrdinal, when set, marks the caller's message slice as
+	// the replacement for every stored row at or after that ordinal
+	// rather than an append. Earlier rows are left untouched. The session
+	// aggregates are adjusted by the replaced and inserted rows' own
+	// totals, so the count and token fields above are ignored.
+	ReplaceFromOrdinal *int
+	// SignalMaintainer, when set, computes the incremental signal/secret
+	// delta inside the write transaction (after messages and result
+	// updates are applied). nil keeps the legacy behavior: signals are
+	// invalidated and recomputed by the debounced full path.
+	SignalMaintainer SignalMaintainer
 }
 
 type ToolCallSubagentLink struct {
@@ -1911,55 +3151,95 @@ type ToolCallSubagentLink struct {
 	SubagentSessionID string
 	ResultContent     string
 	ResultContentLen  int
+	ResultEvents      []ToolResultEvent
 	HasResult         bool
 }
 
-// GetSessionForIncremental returns session state needed for
-// incremental parsing, looked up by file_path. Returns false
-// when the path is unknown or maps to multiple sessions (e.g.
-// Claude DAG forks), since incremental parsing cannot update
-// multiple sessions from a single append.
-func (db *DB) GetSessionForIncremental(
-	path string,
+// ToolCallPosition identifies one stored tool-call occurrence by its stable
+// normalized message ordinal and call index.
+type ToolCallPosition struct {
+	MessageOrdinal int
+	CallIndex      int
+}
+
+// ToolCallResultUpdate carries result events for one exact tool-call occurrence
+// that already exists in the database. ToolUseID remains a provider identity
+// check; Position is the authoritative target when providers reuse call IDs.
+type ToolCallResultUpdate struct {
+	ToolUseID string
+	Position  ToolCallPosition
+	Events    []ToolResultEvent
+}
+
+// GetSessionForIncremental returns session state needed for incremental
+// parsing, looked up by agent and file_path. Returns false when the scoped path
+// is unknown or maps to multiple sessions (e.g. Claude DAG forks), since
+// incremental parsing cannot update multiple sessions from a single append.
+func (db *DB) GetSessionForIncremental(ctx context.Context,
+	path, agent string,
 ) (*IncrementalInfo, bool) {
 	// Bail out if the file maps to more than one session
 	// (Claude fork/subagent splits).
 	var count int
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		`SELECT COUNT(*) FROM sessions
 		 WHERE file_path = ?
-		   AND deleted_at IS NULL`, path,
+		   AND agent = ?
+		   AND deleted_at IS NULL
+		   AND source_missing_at IS NULL`, path,
+		agent,
 	).Scan(&count)
 	if err != nil || count != 1 {
 		return nil, false
 	}
 
 	var info IncrementalInfo
-	var fs, fm, fi, fd sql.NullInt64
+	var fs, fm, fi, fd, pendingUsageOrdinal sql.NullInt64
 	var firstMsg, lastEntryUUID sql.NullString
 	var linearParse sql.NullBool
-	err = db.getReader().QueryRow(
-		`SELECT id, project, machine, cwd, agent_label, entrypoint,
+	err = db.getReader().QueryRow(ctx,
+		`SELECT s.id, s.project, COALESCE(snap.project, ''),
+			COALESCE(snap.recorded_git_remote, ''),
+			s.machine, s.cwd, s.agent_label, s.entrypoint, s.session_kind,
 			file_size, file_mtime,
 			next_ordinal, last_entry_uuid, claude_linear_parse,
 			file_inode, file_device,
 			message_count, user_message_count,
 			first_message,
 			total_output_tokens, peak_context_tokens,
-			has_total_output_tokens, has_peak_context_tokens
-		 FROM sessions
-		 WHERE file_path = ?
-		   AND deleted_at IS NULL`,
-		path,
+			has_total_output_tokens, has_peak_context_tokens,
+			(SELECT m.ordinal
+			 FROM messages m
+			 WHERE m.session_id = s.id
+			   AND m.role = 'assistant'
+			   AND (m.token_usage IS NULL OR length(m.token_usage) = 0)
+			   AND m.ordinal > COALESCE((
+			       SELECT MAX(u.ordinal)
+			       FROM messages u
+			       WHERE u.session_id = s.id AND u.role = 'user'
+			   ), -1)
+			 ORDER BY m.ordinal DESC
+			 LIMIT 1)
+		 FROM sessions s
+		 LEFT JOIN session_project_identity_snapshots snap
+		   ON snap.session_id = s.id
+		 WHERE s.file_path = ?
+		   AND s.agent = ?
+		   AND s.deleted_at IS NULL
+		   AND s.source_missing_at IS NULL`,
+		path, agent,
 	).Scan(
-		&info.ID, &info.Project, &info.Machine, &info.Cwd,
-		&info.AgentLabel, &info.Entrypoint,
+		&info.ID, &info.Project, &info.SourceProject,
+		&info.RecordedGitRemote,
+		&info.Machine, &info.Cwd,
+		&info.AgentLabel, &info.Entrypoint, &info.SessionKind,
 		&fs, &fm, &info.NextOrdinal, &lastEntryUUID, &linearParse,
 		&fi, &fd,
 		&info.MsgCount, &info.UserMsgCount,
 		&firstMsg,
 		&info.TotalOutputTokens, &info.PeakContextTokens,
 		&info.HasTotalOutputTokens, &info.HasPeakContextTokens,
+		&pendingUsageOrdinal,
 	)
 	if err != nil {
 		return nil, false
@@ -1985,6 +3265,10 @@ func (db *DB) GetSessionForIncremental(
 	if fd.Valid {
 		info.FileDevice = fd.Int64
 	}
+	if pendingUsageOrdinal.Valid {
+		ordinal := int(pendingUsageOrdinal.Int64)
+		info.PendingUsageOrdinal = &ordinal
+	}
 	info.HasTotalOutputTokens =
 		info.HasTotalOutputTokens || info.TotalOutputTokens != 0
 	info.HasPeakContextTokens =
@@ -1994,17 +3278,18 @@ func (db *DB) GetSessionForIncremental(
 
 // FileIdentityChanged reports whether any active session row for path has a
 // known file identity that differs from the current file identity.
-func (db *DB) FileIdentityChanged(path string, inode, device int64) bool {
+func (db *DB) FileIdentityChanged(ctx context.Context, path string, inode, device int64) bool {
 	if path == "" || inode == 0 || device == 0 {
 		return false
 	}
 
 	var count int
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		`SELECT COUNT(*)
 		 FROM sessions
 		 WHERE file_path = ?
 		   AND deleted_at IS NULL
+		   AND source_missing_at IS NULL
 		   AND file_inode IS NOT NULL
 		   AND file_device IS NOT NULL
 		   AND file_inode != 0
@@ -2034,14 +3319,14 @@ func (db *DB) FileIdentityChanged(path string, inode, device int64) bool {
 // incremental path only sees the new tail and needs the full message slice
 // to classify termination reliably. Clearing prevents a stale prior verdict
 // from remaining visible until the next full sync reclassifies the session.
-func updateSessionIncrementalTx(
+func updateSessionIncrementalTx(ctx context.Context,
 	tx *sql.Tx, id string, update IncrementalSessionUpdate,
 ) error {
 	var lastEntryUUID any
 	if update.LastEntryUUID != "" {
 		lastEntryUUID = update.LastEntryUUID
 	}
-	result, err := tx.Exec(`
+	result, err := tx.ExecContext(ctx, `
 		UPDATE sessions SET
 			ended_at = COALESCE(?, ended_at),
 			message_count = ?,
@@ -2089,24 +3374,151 @@ func updateSessionIncrementalTx(
 	return nil
 }
 
-func (db *DB) UpdateSessionIncremental(
+// messageRangeTotals is what the rows at or after one ordinal contribute
+// to a session's message-derived aggregates. The expressions mirror
+// ingest.ApplySessionMessageDerivedFieldsContext and
+// ingest.MessageTokenTotalsContext; keep them in step.
+type messageRangeTotals struct {
+	count        int
+	userCount    int
+	outputTokens int64
+	hasOutput    bool
+	peakContext  int64
+	hasContext   bool
+}
+
+func messageRangeTotalsTx(ctx context.Context,
+	tx *sql.Tx, sessionID string, fromOrdinal int,
+) (messageRangeTotals, error) {
+	var t messageRangeTotals
+	err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*),
+			COALESCE(SUM(role = 'user' AND is_system = 0
+				AND COALESCE(source_subtype, '') <> 'tool_result'), 0),
+			COALESCE(SUM(CASE WHEN has_output_tokens != 0
+				THEN output_tokens ELSE 0 END), 0),
+			COALESCE(MAX(has_output_tokens != 0), 0),
+			COALESCE(MAX(CASE WHEN has_context_tokens != 0
+				THEN context_tokens END), 0),
+			COALESCE(MAX(has_context_tokens != 0), 0)
+		FROM messages
+		WHERE session_id = ? AND ordinal >= ?`,
+		sessionID, fromOrdinal,
+	).Scan(&t.count, &t.userCount, &t.outputTokens,
+		&t.hasOutput, &t.peakContext, &t.hasContext)
+	if err != nil {
+		return messageRangeTotals{}, fmt.Errorf(
+			"totaling messages of %s from ordinal %d: %w",
+			sessionID, fromOrdinal, err,
+		)
+	}
+	return t, nil
+}
+
+// replaceSessionIncrementalTx advances the file cursor after a ranged
+// replacement and adjusts the session aggregates by the difference
+// between the removed and inserted rows, so the write reads only the
+// replaced range. Counts and output tokens are sums and adjust exactly.
+// The peak and presence flags are maxima: they adjust exactly unless the
+// removed rows held a maximum the inserted rows no longer reach, and only
+// then are they recomputed from every stored row.
+func replaceSessionIncrementalTx(ctx context.Context,
+	tx *sql.Tx, id string, update IncrementalSessionUpdate,
+	removed messageRangeTotals,
+) error {
+	added, err := messageRangeTotalsTx(ctx, tx, id, *update.ReplaceFromOrdinal)
+	if err != nil {
+		return err
+	}
+	recomputeOutput := removed.hasOutput && !added.hasOutput
+	recomputePeak := removed.hasContext &&
+		(!added.hasContext || added.peakContext < removed.peakContext)
+	var lastEntryUUID any
+	if update.LastEntryUUID != "" {
+		lastEntryUUID = update.LastEntryUUID
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE sessions SET
+			ended_at = COALESCE(?, ended_at),
+			message_count = message_count - ? + ?,
+			user_message_count = user_message_count - ? + ?,
+			total_output_tokens = total_output_tokens - ? + ?,
+			has_total_output_tokens = CASE WHEN ? THEN (
+				SELECT COALESCE(MAX(has_output_tokens != 0), 0)
+				FROM messages WHERE session_id = ?
+			) ELSE (has_total_output_tokens != 0 OR ?) END,
+			peak_context_tokens = CASE WHEN ? THEN (
+				SELECT COALESCE(MAX(context_tokens), 0) FROM messages
+				WHERE session_id = ? AND has_context_tokens != 0
+			) ELSE MAX(peak_context_tokens, ?) END,
+			has_peak_context_tokens = CASE WHEN ? THEN (
+				SELECT COALESCE(MAX(has_context_tokens != 0), 0)
+				FROM messages WHERE session_id = ?
+			) ELSE (has_peak_context_tokens != 0 OR ?) END,
+			file_size = ?,
+			file_mtime = ?,
+			file_hash = COALESCE(?, file_hash),
+			next_ordinal = ?,
+			last_entry_uuid = ?,
+			termination_status = ?,
+			last_write_incremental = 1
+		WHERE id = ?`,
+		update.EndedAt,
+		removed.count, added.count,
+		removed.userCount, added.userCount,
+		removed.outputTokens, added.outputTokens,
+		recomputeOutput, id, added.hasOutput,
+		recomputePeak, id, added.peakContext,
+		recomputePeak, id, added.hasContext,
+		update.FileSize, update.FileMtime, update.FileHash,
+		update.NextOrdinal, lastEntryUUID, update.TerminationStatus, id,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"ranged replacement update session %s: %w", id, err,
+		)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf(
+			"ranged replacement update session %s rows affected: %w", id, err,
+		)
+	}
+	if rows != 1 {
+		return fmt.Errorf(
+			"ranged replacement update session %s: updated %d rows", id, rows,
+		)
+	}
+	return nil
+}
+
+func (db *DB) UpdateSessionIncremental(ctx context.Context,
 	id string, update IncrementalSessionUpdate,
 ) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning incremental update tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	err = updateSessionIncrementalTx(tx, id, update)
+	err = updateSessionIncrementalTx(ctx, tx, id, update)
 	if err != nil {
 		return err
 	}
-	if err := updateSessionAutomationFromMessagesTx(tx, id); err != nil {
-		return err
+	if db.usageOnlyStorage() {
+		if err := updateUsageOnlyAutomationTx(tx, id, nil); err != nil {
+			return err
+		}
+		if err := settleUsageOnlySignalsTx(tx, id); err != nil {
+			return err
+		}
+	} else {
+		if err := updateSessionAutomationFromMessagesTx(tx, id); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing incremental update tx: %w", err)
@@ -2123,7 +3535,7 @@ func (db *DB) UpdateSessionIncremental(
 // A bare UpsertSession or an append-only write must not, or the
 // suppression self-heals prematurely and still-present skew reappears as
 // spurious drift.
-func resetIncrementalMarkerTx(tx *sql.Tx, sessionID string) error {
+func resetIncrementalMarkerTx(tx transactionQueries, sessionID string) error {
 	if _, err := tx.Exec(
 		`UPDATE sessions SET last_write_incremental = 0 WHERE id = ?`,
 		sessionID,
@@ -2136,17 +3548,16 @@ func resetIncrementalMarkerTx(tx *sql.Tx, sessionID string) error {
 }
 
 // GetFileInfoByPath returns file_size and file_mtime for a session identified
-// by file_path. Recoverable source-missing tombstones are excluded so a source
-// that returns with identical metadata cannot be skipped before revival.
-func (db *DB) GetFileInfoByPath(
+// by file_path. Missing sources are excluded so a source that returns with
+// identical metadata cannot be skipped before revival.
+func (db *DB) GetFileInfoByPath(ctx context.Context,
 	path string,
 ) (size int64, mtime int64, ok bool) {
 	var s, m sql.NullInt64
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		"SELECT file_size, file_mtime FROM sessions"+
 			" WHERE file_path = ?"+
-			" AND (deletion_cause IS NULL"+
-			" OR deletion_cause <> '"+deletionCauseSourceMissing+"')"+
+			" AND source_missing_at IS NULL"+
 			" ORDER BY file_mtime DESC LIMIT 1",
 		path,
 	).Scan(&s, &m)
@@ -2156,15 +3567,543 @@ func (db *DB) GetFileInfoByPath(
 	return s.Int64, m.Int64, true
 }
 
+// GetFileInfoByAgentPath is GetFileInfoByPath scoped to the agent that owns
+// the source path. Agent-scoped freshness queries force the path index because
+// SQLite otherwise prefers idx_sessions_agent and scans every session for the
+// agent once per discovered source, making archive reconciliation quadratic.
+const getFileInfoByAgentPathQuery = "SELECT file_size, file_mtime FROM sessions" +
+	" INDEXED BY idx_sessions_file_path" +
+	" WHERE file_path = ? AND agent = ?" +
+	" AND source_missing_at IS NULL" +
+	" ORDER BY file_mtime DESC LIMIT 1"
+
+func (db *DB) GetFileInfoByAgentPath(ctx context.Context,
+	path, agent string,
+) (size int64, mtime int64, ok bool) {
+	var s, m sql.NullInt64
+	err := db.getReader().QueryRow(ctx, getFileInfoByAgentPathQuery, path, agent).
+		Scan(&s, &m)
+	if err != nil {
+		return 0, 0, false
+	}
+	return s.Int64, m.Int64, true
+}
+
+// GetFileIdentityByAgentPath extends GetFileInfoByAgentPath with the stored
+// file identity (inode/device), used by the stat-only freshness gate that
+// skips a checkpointed Codex source without hashing its transcript.
+func (db *DB) GetFileIdentityByAgentPath(ctx context.Context,
+	path, agent string,
+) (size int64, mtime int64, inode, device uint64, ok bool) {
+	var s, m, i, d sql.NullInt64
+	err := db.getReader().QueryRow(ctx,
+		"SELECT file_size, file_mtime, file_inode, file_device FROM sessions"+
+			" WHERE file_path = ? AND agent = ?"+
+			" AND source_missing_at IS NULL"+
+			" ORDER BY file_mtime DESC LIMIT 1",
+		path, agent,
+	).Scan(&s, &m, &i, &d)
+	if err != nil || !s.Valid || !m.Valid || !i.Valid || !d.Valid {
+		return 0, 0, 0, 0, false
+	}
+	return s.Int64, m.Int64, uint64(i.Int64), uint64(d.Int64), true
+}
+
+// GetCwdByAgentPath returns the stored Cwd for the source owned by agent. A
+// source-missing row remains eligible because its positive Cwd is the
+// preservation authority when the source is parsed again.
+func (db *DB) GetCwdByAgentPath(ctx context.Context, path, agent string) (cwd string, ok bool) {
+	err := db.getReader().QueryRow(ctx,
+		"SELECT cwd FROM sessions"+
+			" INDEXED BY idx_sessions_file_path"+
+			" WHERE file_path = ? AND agent = ?"+
+			" AND deleted_at IS NULL"+
+			" ORDER BY file_mtime DESC LIMIT 1",
+		path, agent,
+	).Scan(&cwd)
+	if err != nil {
+		return "", false
+	}
+	return cwd, true
+}
+
+// UpdateSessionCwd updates only the durable workspace identity for an
+// existing session. It is used when a parsed source is excluded by a cwd
+// filter but its source-owned identity still has to be reconciled.
+func (db *DB) UpdateSessionCwd(ctx context.Context, id, cwd string) error {
+	_, err := db.updateSessionCwd(ctx,
+		` WHERE id = ?`, []any{id}, cwd,
+	)
+	return err
+}
+
+// UpdateSessionCwdByIdentity updates one session only when its source path and
+// agent still match the parsed source that requested the reconciliation.
+func (db *DB) UpdateSessionCwdByIdentity(ctx context.Context,
+	id, path, agent, cwd string,
+) (bool, error) {
+	return db.updateSessionCwd(ctx,
+		` WHERE id = ? AND file_path = ? AND agent = ?`,
+		[]any{id, path, agent}, cwd,
+	)
+}
+
+func (db *DB) updateSessionCwd(ctx context.Context,
+	identityWhere string, identityArgs []any, cwd string,
+) (bool, error) {
+	if err := db.requireWritable(); err != nil {
+		return false, err
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	staleVersion := max(CurrentDataVersion()-1, 0)
+	args := append([]any{cwd, staleVersion}, identityArgs...)
+	result, err := db.getWriter().Exec(ctx,
+		`UPDATE sessions SET
+			cwd = ?,
+			data_version = MIN(data_version, ?),
+			local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		`+identityWhere+` AND cwd IS NOT ?
+		 AND deleted_at IS NULL`,
+		append(args, cwd)...,
+	)
+	if err != nil {
+		return false, fmt.Errorf("updating session cwd: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("counting session cwd updates: %w", err)
+	}
+	return rows > 0, nil
+}
+
+// UpdateCwdByAgentPath updates the workspace identity for every active or
+// source-missing row at one agent/path identity.
+func (db *DB) UpdateCwdByAgentPath(ctx context.Context, path, agent, cwd string) error {
+	_, err := db.UpdateCwdByAgentPathCount(ctx, path, agent, cwd)
+	return err
+}
+
+// UpdateCwdByAgentPathCount returns the number of source rows changed and
+// marks them stale so a later admitted parse can refresh project identity.
+func (db *DB) UpdateCwdByAgentPathCount(ctx context.Context, path, agent, cwd string) (int, error) {
+	if err := db.requireWritable(); err != nil {
+		return 0, err
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	staleVersion := max(CurrentDataVersion()-1, 0)
+	result, err := db.getWriter().Exec(ctx,
+		`UPDATE sessions SET
+			cwd = ?,
+			data_version = MIN(data_version, ?),
+			local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		 WHERE file_path = ? AND agent = ?
+		 AND cwd IS NOT ?
+		 AND deleted_at IS NULL`,
+		cwd, staleVersion, path, agent, cwd,
+	)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"updating cwd for %s/%s: %w", agent, path, err,
+		)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf(
+			"counting cwd updates for %s/%s: %w", agent, path, err,
+		)
+	}
+	return int(rows), nil
+}
+
+// StaleDataVersionAgentPaths returns every (agent, file_path) source identity
+// holding at least one row below version. Membership matches
+// pathNeedsDataVersionReparse's per-path form -- GetFileInfoByAgentPath
+// finding a qualifying row and GetDataVersionByAgentPath reporting a minimum
+// below version -- because both are equivalent to a qualifying row existing
+// with data_version < version. One scan replaces two point queries per
+// discovered file on the sync mtime-cutoff path.
+func (db *DB) StaleDataVersionAgentPaths(ctx context.Context,
+	version int,
+) ([]SessionSourcePath, error) {
+	rows, err := db.getReader().Query(ctx,
+		"SELECT DISTINCT agent, file_path FROM sessions"+
+			" WHERE data_version < ?"+
+			" AND file_path IS NOT NULL"+
+			" AND source_missing_at IS NULL",
+		version,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing stale data-version sources: %w", err)
+	}
+	defer rows.Close()
+	var identities []SessionSourcePath
+	for rows.Next() {
+		var identity SessionSourcePath
+		if err := rows.Scan(&identity.Agent, &identity.FilePath); err != nil {
+			return nil, fmt.Errorf(
+				"scanning stale data-version source: %w", err,
+			)
+		}
+		identities = append(identities, identity)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading stale data-version sources: %w", err)
+	}
+	return identities, nil
+}
+
+// RecentSessionSource is the stored source of a session whose last recorded
+// activity is recent enough that its file may still be growing.
+type RecentSessionSource struct {
+	ID         string
+	FilePath   string
+	FileSize   *int64
+	FileMtime  *int64
+	FileInode  *int64
+	FileDevice *int64
+	EndedAt    string
+}
+
+// recentSessionSourcesSQL takes the machine IN list as its one verb.
+const recentSessionSourcesSQL = `
+	SELECT id, file_path, file_size, file_mtime, file_inode, file_device, ended_at
+	FROM sessions
+	WHERE agent = ? AND machine IN %s AND julianday(ended_at) >= julianday(?)
+	  AND file_path IS NOT NULL AND file_path != ''
+	  AND file_path NOT LIKE 's3://%%'
+	  AND deleted_at IS NULL AND source_missing_at IS NULL
+	ORDER BY julianday(ended_at) DESC, id LIMIT ?`
+
+// RecentSessionSources lists the live local sessions of an agent, attributed
+// to any of machines, whose ended_at is at or after since, newest first at
+// SQLite millisecond precision. Object-storage sources have no local file to
+// poll.
+func (db *DB) RecentSessionSources(ctx context.Context,
+	agent string, machines []string, since time.Time, limit int,
+) ([]RecentSessionSource, error) {
+	if len(machines) == 0 {
+		return nil, nil
+	}
+	machineList, machineArgs := InPlaceholders(machines)
+	args := append([]any{agent}, machineArgs...)
+	args = append(args, since.UTC().Format(time.RFC3339Nano), limit)
+	rows, err := db.getReader().Query(ctx,
+		fmt.Sprintf(recentSessionSourcesSQL, machineList), args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing recent session sources: %w", err)
+	}
+	defer rows.Close()
+	var sources []RecentSessionSource
+	for rows.Next() {
+		var source RecentSessionSource
+		if err := rows.Scan(
+			&source.ID, &source.FilePath, &source.FileSize,
+			&source.FileMtime, &source.FileInode, &source.FileDevice,
+			&source.EndedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scanning recent session source: %w", err)
+		}
+		sources = append(sources, source)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading recent session sources: %w", err)
+	}
+	return sources, nil
+}
+
+// VirtualContainerMemberFreshness is one stored virtual member's freshness
+// signal: the newest stored file_mtime for its path, the minimum stored
+// data version, and the newest row's fingerprint hash, mirroring
+// GetFileInfoByPath, GetDataVersionByPath, and GetFileHashByPath.
+type VirtualContainerMemberFreshness struct {
+	Agent       string
+	Project     string
+	MTimeNS     int64
+	DataVersion int
+	Hash        string
+	// Trashed reports that the newest-mtime row is in the user trash.
+	Trashed bool
+	// Excluded reports a permanently deleted member: no sessions row, only an
+	// excluded_sessions ID, so the other fields are zero.
+	Excluded bool
+}
+
+// VirtualContainerMemberFreshnessRow pairs one virtual member path with its
+// folded freshness signal.
+type VirtualContainerMemberFreshnessRow struct {
+	Path string
+	VirtualContainerMemberFreshness
+}
+
+// ListVirtualContainerMemberFreshnessPage returns the freshness signal for
+// stored sessions whose file_path is a virtual member of the shared container
+// at containerPath ("<containerPath>#<sessionID>"), excluding source-missing
+// tombstones: at most limit member paths strictly after afterPath, in
+// ascending path order, and whether the container's stored membership is
+// exhausted. Permanently deleted members whose excluded_sessions ID is
+// idPrefix plus a raw ID merge into the same order at
+// "<containerPath>#<raw ID>", marked Excluded; an empty idPrefix skips them.
+// Changed-path classification merges a streamed watermark-only
+// listing against these pages, so a one-session write flows one candidate
+// into the sync pipeline while peak memory stays one page — never the
+// container's full membership.
+//
+// Two queries per page keep each path's fold complete without materializing
+// the container: a DISTINCT path page rides idx_sessions_file_path ('$' is
+// the ASCII successor of '#', so the half-open range covers exactly the
+// "<containerPath>#" prefix), and the row fetch is bounded to that page's
+// [first, last] interval, so duplicate session rows for one path can never
+// split across pages. Folded in Go rather than GROUP BY: the fold needs
+// MAX(file_mtime), MIN(data_version), and the hash of the newest-mtime row,
+// and SQLite's bare-column-from-the-extreme-row guarantee only holds with
+// exactly one min/max aggregate in the query.
+func (db *DB) ListVirtualContainerMemberFreshnessPage(
+	ctx context.Context, containerPath, idPrefix, afterPath string, limit int,
+) ([]VirtualContainerMemberFreshnessRow, bool, error) {
+	if containerPath == "" || limit <= 0 {
+		return nil, true, nil
+	}
+	notMissing := " AND source_missing_at IS NULL"
+	lower := containerPath + "#"
+	lowerOp := ">="
+	if afterPath > lower {
+		lower = afterPath
+		lowerOp = ">"
+	}
+	pathRows, err := db.getReader().QueryContext(ctx,
+		"SELECT DISTINCT file_path FROM sessions"+
+			" WHERE file_path "+lowerOp+" ? AND file_path < ? || '$'"+
+			notMissing+
+			" ORDER BY file_path LIMIT ?",
+		lower, containerPath, limit,
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"listing container member paths %s: %w", containerPath, err,
+		)
+	}
+	defer pathRows.Close()
+	var paths []string
+	for pathRows.Next() {
+		var path string
+		if err := pathRows.Scan(&path); err != nil {
+			return nil, false, fmt.Errorf(
+				"scanning container member path %s: %w", containerPath, err,
+			)
+		}
+		paths = append(paths, path)
+	}
+	if err := pathRows.Err(); err != nil {
+		return nil, false, err
+	}
+	excluded, err := db.listExcludedContainerMemberPaths(
+		ctx, containerPath, idPrefix, afterPath, limit,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	done := len(paths) < limit && len(excluded) < limit
+	merged, excludedSet := mergeContainerMemberPaths(paths, excluded)
+	if len(merged) > limit {
+		merged = merged[:limit]
+		done = false
+	}
+	if len(merged) == 0 {
+		return nil, true, nil
+	}
+	paths = paths[:0]
+	for _, path := range merged {
+		if _, ok := excludedSet[path]; !ok {
+			paths = append(paths, path)
+		}
+	}
+	if len(paths) == 0 {
+		return excludedContainerMemberRows(merged), done, nil
+	}
+
+	rows, err := db.getReader().QueryContext(ctx,
+		"SELECT file_path, file_mtime, data_version, file_hash,"+
+			" deleted_at IS NOT NULL, agent, project FROM sessions"+
+			" WHERE file_path >= ? AND file_path <= ?"+notMissing,
+		paths[0], paths[len(paths)-1],
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"listing container member freshness %s: %w", containerPath, err,
+		)
+	}
+	defer rows.Close()
+	members := make(map[string]VirtualContainerMemberFreshness, len(paths))
+	for rows.Next() {
+		var path string
+		var mtime, version sql.NullInt64
+		var hash, agent, project sql.NullString
+		var trashed bool
+		if err := rows.Scan(&path, &mtime, &version, &hash, &trashed, &agent, &project); err != nil {
+			return nil, false, fmt.Errorf(
+				"scanning container member freshness %s: %w",
+				containerPath, err,
+			)
+		}
+		row := VirtualContainerMemberFreshness{
+			Agent: agent.String, Project: project.String,
+			MTimeNS:     mtime.Int64,
+			DataVersion: int(version.Int64),
+			Hash:        hash.String,
+			Trashed:     trashed,
+		}
+		member, seen := members[path]
+		if !seen {
+			members[path] = row
+			continue
+		}
+		if row.MTimeNS > member.MTimeNS {
+			member.MTimeNS = row.MTimeNS
+			member.Hash = row.Hash
+			member.Agent, member.Project = row.Agent, row.Project
+			member.Trashed = row.Trashed
+		}
+		if row.DataVersion < member.DataVersion {
+			member.DataVersion = row.DataVersion
+		}
+		members[path] = member
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	page := make([]VirtualContainerMemberFreshnessRow, 0, len(merged))
+	for _, path := range merged {
+		member, stored := members[path]
+		if _, ok := excludedSet[path]; ok && !stored {
+			member = VirtualContainerMemberFreshness{Excluded: true}
+		}
+		page = append(page, VirtualContainerMemberFreshnessRow{
+			Path:                            path,
+			VirtualContainerMemberFreshness: member,
+		})
+	}
+	return page, done, nil
+}
+
+// listExcludedContainerMemberPaths returns at most limit virtual paths
+// "<containerPath>#<raw ID>" strictly after afterPath, in ascending order,
+// for excluded_sessions IDs spelled idPrefix plus a raw ID. The ID range
+// rides the primary key, and raw-ID order equals virtual-path order.
+func (db *DB) listExcludedContainerMemberPaths(
+	ctx context.Context, containerPath, idPrefix, afterPath string, limit int,
+) ([]string, error) {
+	if idPrefix == "" {
+		return nil, nil
+	}
+	memberPrefix := containerPath + "#"
+	lower, lowerOp := idPrefix, ">="
+	if raw, ok := strings.CutPrefix(afterPath, memberPrefix); ok && raw != "" {
+		lower, lowerOp = idPrefix+raw, ">"
+	} else if afterPath >= containerPath+"$" {
+		return nil, nil
+	}
+	last := idPrefix[len(idPrefix)-1]
+	upper := idPrefix[:len(idPrefix)-1] + string(rune(last+1))
+	rows, err := db.getReader().QueryContext(ctx,
+		"SELECT id FROM excluded_sessions WHERE id "+lowerOp+" ? AND id < ?"+
+			" ORDER BY id LIMIT ?",
+		lower, upper, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"listing excluded container members %s: %w", containerPath, err,
+		)
+	}
+	defer rows.Close()
+	var paths []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf(
+				"scanning excluded container member %s: %w", containerPath, err,
+			)
+		}
+		if raw := strings.TrimPrefix(id, idPrefix); raw != "" {
+			paths = append(paths, memberPrefix+raw)
+		}
+	}
+	return paths, rows.Err()
+}
+
+// mergeContainerMemberPaths merges two ascending path lists without
+// duplicates and reports which paths came from the excluded list.
+func mergeContainerMemberPaths(
+	stored, excluded []string,
+) ([]string, map[string]struct{}) {
+	excludedSet := make(map[string]struct{}, len(excluded))
+	for _, path := range excluded {
+		excludedSet[path] = struct{}{}
+	}
+	merged := make([]string, 0, len(stored)+len(excluded))
+	i, j := 0, 0
+	for i < len(stored) && j < len(excluded) {
+		switch {
+		case stored[i] < excluded[j]:
+			merged = append(merged, stored[i])
+			i++
+		case excluded[j] < stored[i]:
+			merged = append(merged, excluded[j])
+			j++
+		default:
+			merged = append(merged, stored[i])
+			i++
+			j++
+		}
+	}
+	if i < len(stored) {
+		merged = append(merged, stored[i:]...)
+	}
+	if j < len(excluded) {
+		merged = append(merged, excluded[j:]...)
+	}
+	return merged, excludedSet
+}
+
+func excludedContainerMemberRows(paths []string) []VirtualContainerMemberFreshnessRow {
+	page := make([]VirtualContainerMemberFreshnessRow, 0, len(paths))
+	for _, path := range paths {
+		page = append(page, VirtualContainerMemberFreshnessRow{Path: path, Excluded: true})
+	}
+	return page
+}
+
 // GetProjectByPath returns the stored project for the newest
 // non-deleted session matching file_path.
-func (db *DB) GetProjectByPath(path string) (project string, ok bool) {
-	err := db.getReader().QueryRow(
+func (db *DB) GetProjectByPath(ctx context.Context, path string) (project string, ok bool) {
+	err := db.getReader().QueryRow(ctx,
 		"SELECT project FROM sessions"+
 			" WHERE file_path = ?"+
 			" AND deleted_at IS NULL"+
+			" AND source_missing_at IS NULL"+
 			" ORDER BY file_mtime DESC LIMIT 1",
 		path,
+	).Scan(&project)
+	if err != nil {
+		return "", false
+	}
+	return project, true
+}
+
+// GetProjectByAgentPath is GetProjectByPath scoped to the agent that owns the
+// source path.
+func (db *DB) GetProjectByAgentPath(ctx context.Context,
+	path, agent string,
+) (project string, ok bool) {
+	err := db.getReader().QueryRow(ctx,
+		"SELECT project FROM sessions"+
+			" WHERE file_path = ? AND agent = ?"+
+			" AND deleted_at IS NULL"+
+			" AND source_missing_at IS NULL"+
+			" ORDER BY file_mtime DESC LIMIT 1",
+		path, agent,
 	).Scan(&project)
 	if err != nil {
 		return "", false
@@ -2176,7 +4115,7 @@ func (db *DB) GetProjectByPath(path string) (project string, ok bool) {
 // file metadata plus the minimum active parser data version for one source
 // path. It combines the lightweight self-healing checks used by hot sync paths
 // into one query.
-func (db *DB) GetSourceRepairStateByPath(
+func (db *DB) GetSourceRepairStateByPath(ctx context.Context,
 	path string,
 ) (
 	project string,
@@ -2185,16 +4124,48 @@ func (db *DB) GetSourceRepairStateByPath(
 	fileMtime int64,
 	ok bool,
 ) {
-	err := db.getReader().QueryRow(`
+	err := db.getReader().QueryRow(ctx, `
 		SELECT project, file_size, file_mtime, (
 			SELECT MIN(data_version)
 			FROM sessions
 			WHERE file_path = ? AND deleted_at IS NULL
+			  AND source_missing_at IS NULL
 		)
 		FROM sessions
 		WHERE file_path = ? AND deleted_at IS NULL
+		  AND source_missing_at IS NULL
 		ORDER BY file_mtime DESC
 		LIMIT 1`, path, path,
+	).Scan(&project, &fileSize, &fileMtime, &dataVersion)
+	if err != nil {
+		return "", 0, 0, 0, false
+	}
+	return project, dataVersion, fileSize, fileMtime, true
+}
+
+// GetSourceRepairStateByAgentPath is GetSourceRepairStateByPath scoped to the
+// agent that owns the source path.
+func (db *DB) GetSourceRepairStateByAgentPath(ctx context.Context,
+	path, agent string,
+) (
+	project string,
+	dataVersion int,
+	fileSize int64,
+	fileMtime int64,
+	ok bool,
+) {
+	err := db.getReader().QueryRow(ctx, `
+		SELECT project, file_size, file_mtime, (
+			SELECT MIN(data_version)
+			FROM sessions
+			WHERE file_path = ? AND agent = ? AND deleted_at IS NULL
+			  AND source_missing_at IS NULL
+		)
+		FROM sessions
+		WHERE file_path = ? AND agent = ? AND deleted_at IS NULL
+		  AND source_missing_at IS NULL
+		ORDER BY file_mtime DESC
+		LIMIT 1`, path, agent, path, agent,
 	).Scan(&project, &fileSize, &fileMtime, &dataVersion)
 	if err != nil {
 		return "", 0, 0, 0, false
@@ -2207,13 +4178,12 @@ func (db *DB) GetSourceRepairStateByPath(
 // The bool is false when no row exists or the column is NULL. Used
 // by the Shelley skip to compare a per-conversation content
 // fingerprint alongside file_mtime.
-func (db *DB) GetFileHashByPath(path string) (hash string, ok bool) {
+func (db *DB) GetFileHashByPath(ctx context.Context, path string) (hash string, ok bool) {
 	var h sql.NullString
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		"SELECT file_hash FROM sessions"+
 			" WHERE file_path = ?"+
-			" AND (deletion_cause IS NULL"+
-			" OR deletion_cause <> '"+deletionCauseSourceMissing+"')"+
+			" AND source_missing_at IS NULL"+
 			" ORDER BY file_mtime DESC LIMIT 1",
 		path,
 	).Scan(&h)
@@ -2223,13 +4193,34 @@ func (db *DB) GetFileHashByPath(path string) (hash string, ok bool) {
 	return h.String, h.Valid
 }
 
+// GetFileHashByAgentPath is GetFileHashByPath scoped to the agent that owns
+// the source path.
+const getFileHashByAgentPathQuery = "SELECT file_hash FROM sessions" +
+	" INDEXED BY idx_sessions_file_path" +
+	" WHERE file_path = ? AND agent = ?" +
+	" AND source_missing_at IS NULL" +
+	" ORDER BY file_mtime DESC LIMIT 1"
+
+func (db *DB) GetFileHashByAgentPath(ctx context.Context,
+	path, agent string,
+) (hash string, ok bool) {
+	var h sql.NullString
+	err := db.getReader().QueryRow(ctx, getFileHashByAgentPathQuery, path, agent).
+		Scan(&h)
+	if err != nil {
+		return "", false
+	}
+	return h.String, h.Valid
+}
+
 // ListSessionIDsByFilePath returns non-deleted session IDs for a source path
 // and agent. Used by parsers whose canonical session ID can change while the
 // underlying source file remains the same.
-func (db *DB) ListSessionIDsByFilePath(path, agent string) ([]string, error) {
-	rows, err := db.getReader().Query(
+func (db *DB) ListSessionIDsByFilePath(ctx context.Context, path, agent string) ([]string, error) {
+	rows, err := db.getReader().Query(ctx,
 		"SELECT id FROM sessions"+
 			" WHERE file_path = ? AND agent = ? AND deleted_at IS NULL"+
+			" AND source_missing_at IS NULL"+
 			" ORDER BY id",
 		path, agent,
 	)
@@ -2250,6 +4241,339 @@ func (db *DB) ListSessionIDsByFilePath(path, agent string) ([]string, error) {
 		return nil, fmt.Errorf("iterating session IDs by file path: %w", err)
 	}
 	return ids, nil
+}
+
+// SessionPathRecord is a session id with the source file recorded for it,
+// from a stored row or from a permanent deletion.
+type SessionPathRecord struct {
+	ID            string
+	FilePath      string
+	SourceMissing bool
+	Excluded      bool
+	MessageCount  int
+	Trashed       bool
+}
+
+const sessionPathRecordQuery = "SELECT id, COALESCE(file_path, ''), source_missing_at IS NOT NULL, 0, message_count, deleted_at IS NOT NULL FROM sessions WHERE "
+
+// ListSessionPathRecords returns the records for baseID and every id
+// parser.AltSessionID derives from it, stored rows first, then deletions.
+func (db *DB) ListSessionPathRecords(ctx context.Context, baseID string) ([]SessionPathRecord, error) {
+	const match = "(id = ? OR (id >= ? AND id < ?))"
+	low, high := baseID+"_alt-", baseID+"_alt."
+	return db.querySessionPathRecords(ctx,
+		sessionPathRecordQuery+match+
+			" UNION ALL SELECT id, COALESCE(file_path, ''), 0, 1, 0, 0 FROM excluded_sessions WHERE "+match,
+		baseID, low, high, baseID, low, high,
+	)
+}
+
+// ListSessionPathRecordsForAgents returns the stored rows of the given agents.
+// A rebuild loads it once from the original archive.
+func (db *DB) ListSessionPathRecordsForAgents(ctx context.Context, agents []string) ([]SessionPathRecord, error) {
+	if len(agents) == 0 {
+		return nil, nil
+	}
+	args := make([]any, len(agents))
+	for i, agent := range agents {
+		args[i] = agent
+	}
+	return db.querySessionPathRecords(ctx,
+		sessionPathRecordQuery+"agent IN (?"+strings.Repeat(",?", len(agents)-1)+")", args...,
+	)
+}
+
+func (db *DB) querySessionPathRecords(ctx context.Context, query string, args ...any) ([]SessionPathRecord, error) {
+	rows, err := db.getReader().Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing session path records: %w", err)
+	}
+	defer rows.Close()
+	var records []SessionPathRecord
+	for rows.Next() {
+		var r SessionPathRecord
+		if err := rows.Scan(&r.ID, &r.FilePath, &r.SourceMissing, &r.Excluded, &r.MessageCount, &r.Trashed); err != nil {
+			return nil, fmt.Errorf("scanning session path record: %w", err)
+		}
+		records = append(records, r)
+	}
+	return records, rows.Err()
+}
+
+// ListStaleForkSessionOwnerships returns every active fork row written by an
+// older parser data version for one agent, with its stored machine and source
+// path. A rebuild loads this once from the write-barriered original archive so
+// per-file legacy fork checks read memory instead of opening archive
+// connections while the replacement database is being written.
+func (db *DB) ListStaleForkSessionOwnerships(ctx context.Context,
+	agent string,
+) ([]SessionSourceOwnership, error) {
+	rows, err := db.getReader().Query(ctx,
+		"SELECT id, machine, file_path FROM sessions"+
+			" WHERE agent = ? AND deleted_at IS NULL"+
+			" AND source_missing_at IS NULL"+
+			" AND relationship_type = 'fork' AND data_version < ?"+
+			" AND file_path IS NOT NULL"+
+			" ORDER BY file_path, id",
+		agent, dataVersion,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing stale fork session ownerships: %w", err)
+	}
+	defer rows.Close()
+
+	var ownerships []SessionSourceOwnership
+	for rows.Next() {
+		var ownership SessionSourceOwnership
+		if err := rows.Scan(
+			&ownership.ID, &ownership.Machine, &ownership.FilePath,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scanning stale fork session ownership: %w", err,
+			)
+		}
+		ownership.Agent = agent
+		ownerships = append(ownerships, ownership)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterating stale fork session ownerships: %w", err,
+		)
+	}
+	return ownerships, nil
+}
+
+// ListStaleForkSessionIDsByFilePath returns active fork rows written by an
+// older parser data version for one provider-owned source path. Both signals
+// are required before a caller may treat a row omitted by a current complete
+// parse as a legacy fork artifact rather than parser presence drift.
+func (db *DB) ListStaleForkSessionIDsByFilePath(ctx context.Context,
+	path, agent string,
+) ([]string, error) {
+	rows, err := db.getReader().Query(ctx,
+		"SELECT id FROM sessions"+
+			" WHERE file_path = ? AND agent = ? AND deleted_at IS NULL"+
+			" AND source_missing_at IS NULL"+
+			" AND relationship_type = 'fork' AND data_version < ?"+
+			" ORDER BY id",
+		path, agent, dataVersion,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"listing stale fork session IDs by file path: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf(
+				"scanning stale fork session ID by file path: %w", err,
+			)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf(
+			"iterating stale fork session IDs by file path: %w", err,
+		)
+	}
+	return ids, nil
+}
+
+const sessionMachineBatchSize = 500
+
+// SessionWriteIdentity is the stored state used to preserve immutable source
+// attribution and parser-owned Codex titles across session writes and rebuilds.
+type SessionWriteIdentity struct {
+	Machine     string
+	Agent       string
+	Cwd         string
+	FilePath    string
+	FileHash    string
+	SessionName *string
+}
+
+// ListSessionWriteIdentitiesByID returns stored source attribution and parser
+// title state for each requested session, including tombstoned rows that may be
+// revived by a later successful parse. Requests are chunked below SQLite's
+// bind-variable limit.
+func (db *DB) ListSessionWriteIdentitiesByID(
+	ctx context.Context,
+	ids []string,
+) (map[string]SessionWriteIdentity, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	identities := make(map[string]SessionWriteIdentity, len(ids))
+	unique := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	for start := 0; start < len(unique); start += sessionMachineBatchSize {
+		if err := func() error {
+			end := min(start+sessionMachineBatchSize, len(unique))
+			batch := unique[start:end]
+			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+			args := make([]any, len(batch))
+			for i, id := range batch {
+				args[i] = id
+			}
+			rows, err := db.getReader().QueryContext(ctx, `
+			SELECT id, machine, agent, COALESCE(cwd, ''),
+			       COALESCE(file_path, ''), COALESCE(file_hash, ''),
+			       session_name
+			FROM sessions
+			WHERE id IN (`+placeholders+`)
+			ORDER BY id`, args...)
+			if err != nil {
+				return fmt.Errorf("listing session write identities by ID: %w", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id string
+				var identity SessionWriteIdentity
+				if err := rows.Scan(
+					&id, &identity.Machine, &identity.Agent, &identity.Cwd,
+					&identity.FilePath, &identity.FileHash, &identity.SessionName,
+				); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf(
+						"scanning session write identity by ID: %w", err,
+					)
+				}
+				identities[id] = identity
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("iterating session write identities by ID: %w", err)
+			}
+			if err := rows.Close(); err != nil {
+				return fmt.Errorf("closing session write identities by ID: %w", err)
+			}
+
+			return nil
+		}(); err != nil {
+			return nil, err
+		}
+	}
+	return identities, nil
+}
+
+// ListSessionMachinesByID returns the stored machine attribution for each
+// requested session, including tombstoned rows that may be revived by a later
+// successful parse. Requests are chunked below SQLite's bind-variable limit.
+func (db *DB) ListSessionMachinesByID(
+	ctx context.Context,
+	ids []string,
+) (map[string]string, error) {
+	identities, err := db.ListSessionWriteIdentitiesByID(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	machines := make(map[string]string, len(ids))
+	for id, identity := range identities {
+		machines[id] = identity.Machine
+	}
+	return machines, nil
+}
+
+const descendantSessionRootBatchSize = 100
+
+// ListActiveDescendantSessionSourcePaths returns the source paths of active
+// descendants already linked beneath parentIDs. Both the seed and recursive
+// steps use idx_sessions_parent, so work scales with the affected subagent
+// trees rather than every archived session.
+func (db *DB) ListActiveDescendantSessionSourcePaths(
+	ctx context.Context,
+	machine, agent string,
+	parentIDs []string,
+) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	var paths []string
+	for start := 0; start < len(parentIDs); start += descendantSessionRootBatchSize {
+		if err := func() error {
+			end := min(start+descendantSessionRootBatchSize, len(parentIDs))
+			batch := parentIDs[start:end]
+			placeholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+			query := `
+			WITH RECURSIVE descendants(id, file_path) AS (
+				SELECT id, file_path
+				  FROM sessions INDEXED BY idx_sessions_parent
+				 WHERE parent_session_id IS NOT NULL
+				   AND parent_session_id IN (` + placeholders + `)
+				   AND machine = ? AND agent = ? AND deleted_at IS NULL
+				   AND source_missing_at IS NULL
+				UNION
+				SELECT s.id, s.file_path
+				  FROM sessions AS s INDEXED BY idx_sessions_parent
+				  JOIN descendants AS d ON s.parent_session_id = d.id
+				 WHERE s.parent_session_id IS NOT NULL
+				   AND s.machine = ? AND s.agent = ? AND s.deleted_at IS NULL
+				   AND s.source_missing_at IS NULL
+			)
+			SELECT file_path
+			  FROM descendants
+			 WHERE file_path IS NOT NULL AND file_path <> ''
+			 ORDER BY file_path`
+			args := make([]any, 0, len(batch)+4)
+			for _, id := range batch {
+				args = append(args, id)
+			}
+			args = append(args, machine, agent, machine, agent)
+			rows, err := db.getReader().QueryContext(ctx, query, args...)
+			if err != nil {
+				return fmt.Errorf(
+					"listing active descendant session sources: %w", err,
+				)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var path string
+				if err := rows.Scan(&path); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf(
+						"scanning active descendant session source: %w", err,
+					)
+				}
+				if _, exists := seen[path]; exists {
+					continue
+				}
+				seen[path] = struct{}{}
+				paths = append(paths, path)
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf(
+					"iterating active descendant session sources: %w", err,
+				)
+			}
+			if err := rows.Close(); err != nil {
+				return fmt.Errorf(
+					"closing active descendant session sources: %w", err,
+				)
+			}
+
+			return nil
+		}(); err != nil {
+			return nil, err
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
 }
 
 const storedSourcePathHintRootBatchSize = 100
@@ -2297,13 +4621,22 @@ type SessionSourcePath struct {
 	FilePath string
 }
 
+// SessionSourceAttribution is one distinct immutable machine label represented
+// by active sessions at an exact provider source.
+type SessionSourceAttribution struct {
+	Machine  string
+	Agent    string
+	FilePath string
+}
+
 func (o SessionSourceOwnership) Cursor() SessionSourceCursor {
 	return SessionSourceCursor{Agent: o.Agent, FilePath: o.FilePath, ID: o.ID}
 }
 
 // ListActiveSessionSourceOwnershipScopesPage returns one stable keyset page
-// across a provider's bounded physical scopes. Normalization deduplicates
-// repeated declarations before building the query.
+// across a provider's bounded physical scopes. Machine is an exact stored key,
+// including the empty key retained by legacy sessions. Normalization
+// deduplicates repeated declarations before building the query.
 func (db *DB) ListActiveSessionSourceOwnershipScopesPage(
 	ctx context.Context,
 	machine string,
@@ -2312,7 +4645,7 @@ func (db *DB) ListActiveSessionSourceOwnershipScopesPage(
 	after SessionSourceCursor,
 ) ([]SessionSourceOwnership, error) {
 	scopes = normalizeStoredSourcePathHintScopes(scopes)
-	if machine == "" || agent == "" || len(scopes) == 0 {
+	if agent == "" || len(scopes) == 0 {
 		return nil, nil
 	}
 	if after.Agent != "" && after.Agent != agent {
@@ -2348,8 +4681,14 @@ func (db *DB) listActiveSessionSourceOwnershipScopeBatch(
 	for _, scope := range scopes {
 		root := scope.Path
 		likeRoot := sqliteLikeEscape(root)
+		// A drive root or share root already ends in a separator, so the
+		// child prefix must not add a second one: stored children carry one.
+		childPrefix := likeRoot + string(filepath.Separator) + "%"
+		if strings.HasSuffix(root, string(filepath.Separator)) {
+			childPrefix = likeRoot + "%"
+		}
 		rootClause := `(b.file_path = ? OR b.file_path LIKE ? ESCAPE '!')`
-		args = append(args, root, likeRoot+string(filepath.Separator)+"%")
+		args = append(args, root, childPrefix)
 		if scope.IncludeVirtualMembers {
 			// Mirror storedSourcePathHintInRoot: a virtual member is the
 			// container plus '#' and a nonempty single segment. Nested stored
@@ -2379,6 +4718,7 @@ func (db *DB) listActiveSessionSourceOwnershipScopeBatch(
 		WHERE b.machine = ?
 		  AND b.agent = ?
 		  AND s.deleted_at IS NULL
+		  AND s.source_missing_at IS NULL
 		  AND `+rootClause+`
 		  AND (b.file_path > ? OR (b.file_path = ? AND b.session_id > ?))
 		ORDER BY b.file_path, b.session_id
@@ -2437,8 +4777,9 @@ func mergeSessionSourceOwnershipPages(
 }
 
 // BaselineActiveSessionSourcePaths marks exact active local ownerships as
-// observed. Callers pass one bounded discovery page or changed-path batch at a
-// time so this update never scales its live memory with the archive.
+// observed. Machine is an exact stored key, including the empty key retained by
+// legacy sessions. Callers pass one bounded discovery page or changed-path
+// batch at a time so this update never scales its live memory with the archive.
 func (db *DB) BaselineActiveSessionSourcePaths(
 	ctx context.Context,
 	machine string,
@@ -2447,7 +4788,7 @@ func (db *DB) BaselineActiveSessionSourcePaths(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if machine == "" || len(sources) == 0 {
+	if len(sources) == 0 {
 		return nil
 	}
 	db.mu.Lock()
@@ -2468,10 +4809,176 @@ func (db *DB) BaselineActiveSessionSourcePaths(
 	return nil
 }
 
+// BaselineActiveSessionSourceOwnerships marks only the supplied exact active
+// ownerships as observed. It is used when source-wide admission would include
+// archived members that a per-session policy deliberately rejects.
+func (db *DB) BaselineActiveSessionSourceOwnerships(
+	ctx context.Context,
+	ownerships []SessionSourceOwnership,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(ownerships) == 0 {
+		return nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting exact source baseline transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := baselineActiveSessionSourceOwnershipsTx(
+		ctx, tx, ownerships,
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing exact source baselines: %w", err)
+	}
+	return nil
+}
+
+// CopySessionSourceOwnershipBaselinesFrom copies deletion proof from another
+// archive only for the supplied exact active ownerships. Rebuilds use this for
+// admitted archive-only members without granting proof to unrelated or
+// policy-rejected orphaned sessions.
+func (db *DB) CopySessionSourceOwnershipBaselinesFrom(
+	ctx context.Context,
+	sourcePath string,
+	ownerships []SessionSourceOwnership,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(ownerships) == 0 {
+		return nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	conn, err := db.getWriter().Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquiring source baseline copy connection: %w", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(
+		ctx, "ATTACH DATABASE ? AS old_db", sourcePath,
+	); err != nil {
+		return fmt.Errorf("attaching source baseline archive: %w", err)
+	}
+	defer func() {
+		_, _ = conn.ExecContext(ctx, "DETACH DATABASE old_db")
+	}()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting source baseline copy transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if oldDBHasTable(ctx, tx, "local_session_source_baselines") {
+		for _, ownership := range ownerships {
+			if ownership.ID == "" || ownership.Agent == "" || ownership.FilePath == "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO main.local_session_source_baselines
+					(session_id, machine, agent, file_path)
+				SELECT b.session_id, b.machine, b.agent, b.file_path
+				FROM old_db.local_session_source_baselines AS b
+				JOIN main.sessions AS s
+				  ON s.id = b.session_id
+				 AND s.machine = b.machine
+				 AND s.agent = b.agent
+				 AND s.file_path = b.file_path
+				WHERE b.session_id = ? AND b.machine = ?
+				  AND b.agent = ? AND b.file_path = ?
+				  AND s.deleted_at IS NULL
+				  AND s.source_missing_at IS NULL
+				ON CONFLICT(session_id) DO UPDATE SET
+					machine = excluded.machine,
+					agent = excluded.agent,
+					file_path = excluded.file_path`,
+				ownership.ID, ownership.Machine,
+				ownership.Agent, ownership.FilePath,
+			); err != nil {
+				return fmt.Errorf(
+					"copying exact session source baseline: %w", err,
+				)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing source baseline copy: %w", err)
+	}
+	return nil
+}
+
+// RemoveSessionSourceOwnershipBaselines revokes deletion proof only for the
+// supplied exact ownerships. It preserves other active rows sharing the same
+// source path.
+func (db *DB) RemoveSessionSourceOwnershipBaselines(
+	ctx context.Context,
+	ownerships []SessionSourceOwnership,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(ownerships) == 0 {
+		return nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting exact source baseline removal: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := removeSessionSourceOwnershipBaselinesTx(
+		ctx, tx, ownerships,
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing exact source baseline removal: %w", err)
+	}
+	return nil
+}
+
+// RemoveSessionSourceBaselines revokes deletion proof for the supplied source
+// paths across every stored machine attribution.
+func (db *DB) RemoveSessionSourceBaselines(
+	ctx context.Context,
+	sources []SessionSourcePath,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	tx, err := db.getWriter().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting source baseline removal: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := deleteSessionSourceBaselinesAcrossMachinesTx(
+		ctx, tx, sources, "rejected",
+	); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing source baseline removal: %w", err)
+	}
+	return nil
+}
+
 // ReplaceActiveSessionSourceBaselines makes admitted the exact subset of a
-// bounded candidate page that carries deletion proof. Existing proof for
-// rejected candidates is removed in the same transaction that admits the
-// successful candidates.
+// bounded candidate page that carries deletion proof. Machine is an exact
+// stored key, including the empty key retained by legacy sessions. Existing
+// proof for rejected candidates is removed in the same transaction that admits
+// the successful candidates.
 //
 // The replacement is a diff, not a rewrite: warm no-op syncs replay every
 // unchanged archived source as an admitted candidate each pass, so unchanged
@@ -2484,10 +4991,28 @@ func (db *DB) ReplaceActiveSessionSourceBaselines(
 	candidates []SessionSourcePath,
 	admitted []SessionSourcePath,
 ) error {
+	return db.ReplaceActiveSessionSourceBaselinesWithExceptions(
+		ctx, machine, candidates, admitted, nil, nil,
+	)
+}
+
+// ReplaceActiveSessionSourceBaselinesWithExceptions replaces source-wide
+// deletion proof and applies per-session CWD exceptions in one transaction.
+// This prevents a canceled or failed pass from committing broad proof before
+// it revokes proof from rejected members of the same source.
+func (db *DB) ReplaceActiveSessionSourceBaselinesWithExceptions(
+	ctx context.Context,
+	machine string,
+	candidates []SessionSourcePath,
+	admitted []SessionSourcePath,
+	exactAdmitted []SessionSourceOwnership,
+	exactRejected []SessionSourceOwnership,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if machine == "" || len(candidates) == 0 {
+	if len(candidates) == 0 && len(exactAdmitted) == 0 &&
+		len(exactRejected) == 0 {
 		return nil
 	}
 	rejected := rejectedSourceCandidates(candidates, admitted)
@@ -2517,12 +5042,77 @@ func (db *DB) ReplaceActiveSessionSourceBaselines(
 				  AND s.agent = local_session_source_baselines.agent
 				  AND s.file_path = local_session_source_baselines.file_path
 				  AND s.deleted_at IS NULL
+				  AND s.source_missing_at IS NULL
 			  )`, "stale admitted",
+	); err != nil {
+		return err
+	}
+	if err := removeSessionSourceOwnershipBaselinesTx(
+		ctx, tx, exactRejected,
+	); err != nil {
+		return err
+	}
+	if err := baselineActiveSessionSourceOwnershipsTx(
+		ctx, tx, exactAdmitted,
 	); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing source baseline replacement: %w", err)
+	}
+	return nil
+}
+
+func baselineActiveSessionSourceOwnershipsTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	ownerships []SessionSourceOwnership,
+) error {
+	for _, ownership := range ownerships {
+		if ownership.ID == "" || ownership.Agent == "" || ownership.FilePath == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO local_session_source_baselines
+				(session_id, machine, agent, file_path)
+			SELECT id, machine, agent, file_path
+			FROM sessions
+			WHERE id = ? AND machine = ? AND agent = ? AND file_path = ?
+			  AND deleted_at IS NULL
+			  AND source_missing_at IS NULL
+			ON CONFLICT(session_id) DO UPDATE SET
+				machine = excluded.machine,
+				agent = excluded.agent,
+				file_path = excluded.file_path
+			WHERE local_session_source_baselines.machine IS NOT excluded.machine
+			   OR local_session_source_baselines.agent IS NOT excluded.agent
+			   OR local_session_source_baselines.file_path IS NOT excluded.file_path`,
+			ownership.ID, ownership.Machine,
+			ownership.Agent, ownership.FilePath,
+		); err != nil {
+			return fmt.Errorf("baselining exact active session ownership: %w", err)
+		}
+	}
+	return nil
+}
+
+func removeSessionSourceOwnershipBaselinesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	ownerships []SessionSourceOwnership,
+) error {
+	for _, ownership := range ownerships {
+		if ownership.ID == "" || ownership.Agent == "" || ownership.FilePath == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM local_session_source_baselines
+			WHERE session_id = ? AND machine = ? AND agent = ? AND file_path = ?`,
+			ownership.ID, ownership.Machine,
+			ownership.Agent, ownership.FilePath,
+		); err != nil {
+			return fmt.Errorf("removing exact session source baseline: %w", err)
+		}
 	}
 	return nil
 }
@@ -2576,6 +5166,31 @@ func deleteSessionSourceBaselinesTx(
 	return nil
 }
 
+func deleteSessionSourceBaselinesAcrossMachinesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	sources []SessionSourcePath,
+	what string,
+) error {
+	for start := 0; start < len(sources); start += baselinePairChunk {
+		end := min(start+baselinePairChunk, len(sources))
+		filter, args, ok := buildSourcePairFilter(sources[start:end])
+		if !ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM local_session_source_baselines
+			WHERE `+filter, args...,
+		); err != nil {
+			return fmt.Errorf(
+				"removing %s session source baselines across machines: %w",
+				what, err,
+			)
+		}
+	}
+	return nil
+}
+
 // baselinePairChunk bounds how many (agent, file_path) pairs bind into one
 // set-based baseline statement. Warm no-op reconciliation replays a full
 // discovery page (up to reconciliationPageSize) of unchanged sources every
@@ -2610,6 +5225,82 @@ func buildSourcePairFilter(sources []SessionSourcePath) (string, []any, bool) {
 	return sb.String(), args, true
 }
 
+// ListActiveSessionSourceAttributions returns every distinct machine label
+// represented by active rows at the requested exact sources. A shared provider
+// database may contain sessions admitted under multiple immutable labels, so
+// the result is intentionally not collapsed to one machine per path.
+func (db *DB) ListActiveSessionSourceAttributions(
+	ctx context.Context,
+	sources []SessionSourcePath,
+) ([]SessionSourceAttribution, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	seen := make(map[SessionSourceAttribution]struct{})
+	for start := 0; start < len(sources); start += baselinePairChunk {
+		end := min(start+baselinePairChunk, len(sources))
+		filter, args, ok := buildSourcePairFilter(sources[start:end])
+		if !ok {
+			continue
+		}
+		if err := func() error {
+			rows, err := db.getReader().QueryContext(ctx, `
+			SELECT DISTINCT machine, agent, file_path
+			FROM sessions
+			WHERE `+filter+`
+			  AND file_path IS NOT NULL
+			  AND deleted_at IS NULL
+			  AND source_missing_at IS NULL`, args...)
+			if err != nil {
+				return fmt.Errorf("listing active session source attributions: %w", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var attribution SessionSourceAttribution
+				if err := rows.Scan(
+					&attribution.Machine,
+					&attribution.Agent,
+					&attribution.FilePath,
+				); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf(
+						"scanning active session source attribution: %w", err,
+					)
+				}
+				seen[attribution] = struct{}{}
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf(
+					"iterating active session source attributions: %w", err,
+				)
+			}
+			if err := rows.Close(); err != nil {
+				return fmt.Errorf(
+					"closing active session source attributions: %w", err,
+				)
+			}
+			return nil
+		}(); err != nil {
+			return nil, err
+		}
+	}
+	attributions := make([]SessionSourceAttribution, 0, len(seen))
+	for attribution := range seen {
+		attributions = append(attributions, attribution)
+	}
+	sort.Slice(attributions, func(i, j int) bool {
+		if attributions[i].Machine != attributions[j].Machine {
+			return attributions[i].Machine < attributions[j].Machine
+		}
+		if attributions[i].Agent != attributions[j].Agent {
+			return attributions[i].Agent < attributions[j].Agent
+		}
+		return attributions[i].FilePath < attributions[j].FilePath
+	})
+	return attributions, nil
+}
+
 func baselineActiveSessionSourcePathsTx(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -2630,6 +5321,7 @@ func baselineActiveSessionSourcePathsTx(
 			FROM sessions
 			WHERE machine = ? AND `+filter+`
 			  AND file_path IS NOT NULL AND deleted_at IS NULL
+			  AND source_missing_at IS NULL
 			ON CONFLICT(session_id) DO UPDATE SET
 				machine = excluded.machine,
 				agent = excluded.agent,
@@ -2645,9 +5337,10 @@ func baselineActiveSessionSourcePathsTx(
 	return nil
 }
 
-// SoftDeleteSessionSourceOwnership tombstones a session only while the row is
-// still owned by the exact agent and source observed by reconciliation.
-func (db *DB) SoftDeleteSessionSourceOwnership(
+// MarkSessionSourceMissing records unavailable source material only while the
+// row is still owned by the exact agent and source observed by reconciliation.
+// It deliberately does not change user-owned deletion state.
+func (db *DB) MarkSessionSourceMissing(
 	ctx context.Context,
 	machine string,
 	agent string,
@@ -2658,11 +5351,13 @@ func (db *DB) SoftDeleteSessionSourceOwnership(
 	defer db.mu.Unlock()
 	result, err := db.getWriter().ExecContext(ctx, `
 		UPDATE sessions
-		SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-		    deletion_cause = ?,
+		SET source_missing_at = COALESCE(
+		        source_missing_at,
+		        strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		    ),
 		    local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		WHERE machine = ? AND agent = ? AND id = ? AND file_path = ?
-		  AND deleted_at IS NULL
+		  AND source_missing_at IS NULL
 		  AND EXISTS (
 			SELECT 1 FROM local_session_source_baselines AS b
 			WHERE b.session_id = sessions.id
@@ -2670,14 +5365,14 @@ func (db *DB) SoftDeleteSessionSourceOwnership(
 			  AND b.agent = sessions.agent
 			  AND b.file_path = sessions.file_path
 		  )`,
-		deletionCauseSourceMissing, machine, agent, id, filePath,
+		machine, agent, id, filePath,
 	)
 	if err != nil {
-		return false, fmt.Errorf("soft-deleting exact session source ownership: %w", err)
+		return false, fmt.Errorf("marking exact session source missing: %w", err)
 	}
 	count, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("counting exact session source tombstone: %w", err)
+		return false, fmt.Errorf("counting exact missing session source: %w", err)
 	}
 	return count > 0, nil
 }
@@ -2716,34 +5411,41 @@ func (db *DB) ListStoredSourcePathHintsContext(
 	seen := make(map[string]struct{})
 	var hints []string
 	for start := 0; start < len(scopes); start += storedSourcePathHintRootBatchSize {
-		end := min(start+storedSourcePathHintRootBatchSize, len(scopes))
-		batch := scopes[start:end]
-		query, args := storedSourcePathHintQuery(agent, batch)
-		rows, err := db.getReader().QueryContext(ctx, query, args...)
-		if err != nil {
-			return nil, fmt.Errorf("listing stored source path hints: %w", err)
-		}
-		for rows.Next() {
-			var path string
-			if err := rows.Scan(&path); err != nil {
-				_ = rows.Close()
-				return nil, fmt.Errorf("scanning stored source path hint: %w", err)
+		if err := func() error {
+			end := min(start+storedSourcePathHintRootBatchSize, len(scopes))
+			batch := scopes[start:end]
+			query, args := storedSourcePathHintQuery(agent, batch)
+			rows, err := db.getReader().QueryContext(ctx, query, args...)
+			if err != nil {
+				return fmt.Errorf("listing stored source path hints: %w", err)
 			}
-			path = cleanStoredSourcePathHint(path)
-			if !storedSourcePathHintInAnyRoot(path, batch) {
-				continue
+			defer rows.Close()
+			for rows.Next() {
+				var path string
+				if err := rows.Scan(&path); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf("scanning stored source path hint: %w", err)
+				}
+				path = cleanStoredSourcePathHint(path)
+				if !storedSourcePathHintInAnyRoot(path, batch) {
+					continue
+				}
+				if _, ok := seen[path]; ok {
+					continue
+				}
+				seen[path] = struct{}{}
+				hints = append(hints, path)
 			}
-			if _, ok := seen[path]; ok {
-				continue
+			if err := rows.Close(); err != nil {
+				return fmt.Errorf("closing stored source path hint rows: %w", err)
 			}
-			seen[path] = struct{}{}
-			hints = append(hints, path)
-		}
-		if err := rows.Close(); err != nil {
-			return nil, fmt.Errorf("closing stored source path hint rows: %w", err)
-		}
-		if err := rows.Err(); err != nil {
-			return nil, fmt.Errorf("iterating stored source path hints: %w", err)
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("iterating stored source path hints: %w", err)
+			}
+
+			return nil
+		}(); err != nil {
+			return nil, err
 		}
 	}
 	sort.Strings(hints)
@@ -2785,6 +5487,7 @@ func storedSourcePathHintQuery(
 			WHERE agent = ?
 			  AND file_path IS NOT NULL
 			  AND deleted_at IS NULL
+			  AND source_missing_at IS NULL
 			  AND `+predicate)
 		args = append(args, agent)
 		args = append(args, values...)
@@ -2810,6 +5513,13 @@ func storedSourcePathHintQuery(
 }
 
 func cleanStoredSourcePathHint(path string) string {
+	// Remote source paths are stored with forward slashes even when the
+	// collector runs on Windows. Keep those paths in their stored syntax so a
+	// collector never rewrites a remote host's separators before the indexed
+	// lookup. Native Windows paths contain backslashes and still use filepath.
+	if strings.Contains(path, "/") {
+		return pathpkg.Clean(path)
+	}
 	return filepath.Clean(path)
 }
 
@@ -2825,17 +5535,51 @@ func storedSourcePathHintInAnyRoot(
 	return false
 }
 
+// StoredSourcePathHintScopesContain reports whether one stored or discovered
+// source path lies inside any of the bounded scopes, using the same
+// platform-aware containment the SQLite queries in this file re-check. It is
+// the single Go-side authority for path-to-scope membership: the SQL LIKE
+// prefilters stay a superset of this predicate for ASCII paths, and every
+// caller that pages or admits by scope must apply it rather than comparing
+// prefixes itself.
+func StoredSourcePathHintScopesContain(
+	path string, scopes []StoredSourcePathHintScope,
+) bool {
+	return storedSourcePathHintInAnyRoot(path, scopes)
+}
+
 func storedSourcePathHintInRoot(path string, scope StoredSourcePathHintScope) bool {
 	path = cleanStoredSourcePathHint(path)
 	root := cleanStoredSourcePathHint(scope.Path)
-	if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+	if storedSourcePathSameOrDescendant(path, root) {
 		return true
 	}
-	suffix, ok := strings.CutPrefix(path, root+"#")
-	return ok &&
-		scope.IncludeVirtualMembers &&
-		suffix != "" &&
-		!strings.ContainsAny(suffix, `/\`)
+	if !scope.IncludeVirtualMembers || len(path) < len(root)+2 ||
+		path[len(root)] != '#' {
+		return false
+	}
+	// A virtual member is the container plus '#' and a nonempty single
+	// segment. The container prefix folds with the same platform semantics as
+	// the directory branch; the member segment rule stays byte-exact.
+	if rel, err := filepath.Rel(root, path[:len(root)]); err != nil || rel != "." {
+		return false
+	}
+	member := path[len(root)+1:]
+	return !strings.ContainsAny(member, `/\`)
+}
+
+// storedSourcePathSameOrDescendant compares with filepath.Rel semantics so
+// containment matches platform path equality: case-folded per element on
+// Windows, byte-exact on Unix. This keeps the Go predicate aligned with the
+// ASCII-case-insensitive SQL LIKE prefilter on Windows while staying exact on
+// case-sensitive filesystems.
+func storedSourcePathSameOrDescendant(path, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || rel != ".." &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func sqliteLikeEscape(value string) string {
@@ -2845,16 +5589,66 @@ func sqliteLikeEscape(value string) string {
 	return value
 }
 
+// ListOwnedSessionIDsForExport returns the IDs of locally-owned, non-deleted
+// sessions for artifact export, ordered by id. Unlike ListSessions it does not
+// apply the sidebar visibility filter (message_count > 0), so zero-message
+// usage-only sessions are still published.
+func (db *DB) ListOwnedSessionIDsForExport(ctx context.Context) ([]string, error) {
+	rows, err := db.getReader().QueryContext(ctx,
+		`SELECT id FROM sessions
+		 WHERE (
+			machine = 'local' OR machine IN (
+				SELECT value FROM pg_sync_state
+				WHERE key IN ('artifact_local_machine_name', 'artifact_local_installation_id')
+			)
+		 ) AND deleted_at IS NULL
+		 ORDER BY id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing sessions for artifact export: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scanning export session ID: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating export session IDs: %w", err)
+	}
+	return ids, nil
+}
+
 // GetDataVersionByPath returns the minimum data_version for non-source-missing
 // sessions matching a file_path. Returns 0 when no eligible session exists.
-func (db *DB) GetDataVersionByPath(path string) int {
+func (db *DB) GetDataVersionByPath(ctx context.Context, path string) int {
 	var v int
-	err := db.getReader().QueryRow(
+	err := db.getReader().QueryRow(ctx,
 		"SELECT MIN(data_version) FROM sessions"+
 			" WHERE file_path = ?"+
-			" AND (deletion_cause IS NULL"+
-			" OR deletion_cause <> '"+deletionCauseSourceMissing+"')", path,
+			" AND source_missing_at IS NULL", path,
 	).Scan(&v)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+// GetDataVersionByAgentPath is GetDataVersionByPath scoped to the agent that
+// owns the source path.
+const getDataVersionByAgentPathQuery = "SELECT MIN(data_version) FROM sessions" +
+	" INDEXED BY idx_sessions_file_path" +
+	" WHERE file_path = ? AND agent = ?" +
+	" AND source_missing_at IS NULL"
+
+func (db *DB) GetDataVersionByAgentPath(ctx context.Context, path, agent string) int {
+	var v int
+	err := db.getReader().QueryRow(ctx, getDataVersionByAgentPathQuery, path, agent).
+		Scan(&v)
 	if err != nil {
 		return 0
 	}
@@ -2863,15 +5657,38 @@ func (db *DB) GetDataVersionByPath(path string) int {
 
 // ResetAllMtimes zeroes file_mtime for every session, forcing
 // the next sync to re-process all files regardless of whether
-// their size+mtime matches what was previously stored.
-func (db *DB) ResetAllMtimes() error {
+// their size+mtime matches what was previously stored. It also
+// clears the provider_freshness side-table so the per-component
+// stat digest cannot defeat the forced re-sync: without this, a
+// Codebuff/Freebuff session whose mtime was zeroed would still
+// skip re-processing via the digest shortcut, preserving stale
+// parsed data indefinitely.
+func (db *DB) ResetAllMtimes(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(
-		"UPDATE sessions SET file_mtime = 0",
-	)
+	// Both statements run in one transaction: a failure between them
+	// would otherwise leave mtimes zeroed with digests intact,
+	// letting the stat-digest shortcut defeat the forced re-sync.
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
+		return fmt.Errorf("beginning mtime reset tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE sessions SET file_mtime = 0",
+	); err != nil {
 		return fmt.Errorf("resetting mtimes: %w", err)
+	}
+	// Clear provider_freshness so the stat-digest shortcut cannot
+	// defeat the forced re-sync. A DELETE (not a walk) is safe
+	// because the side-table is rebuilt on the next sync pass.
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM provider_freshness",
+	); err != nil {
+		return fmt.Errorf("clearing provider_freshness: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing mtime reset: %w", err)
 	}
 	return nil
 }
@@ -2882,60 +5699,114 @@ func (db *DB) ResetAllMtimes() error {
 // in a single transaction. The exclusion is only written when
 // a session row was actually deleted, preventing ghost entries
 // for non-existent IDs.
-func (db *DB) DeleteSession(id string) error {
+func (db *DB) DeleteSession(ctx context.Context, id string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
 
-	tx, err := w.Begin()
+	tx, err := w.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin delete tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	aliasIDs, err := sessionAliasIDsTx(tx, "id = ?", id)
-	if err != nil {
+	if _, err := deleteSessionsTx(ctx, tx, "id = ?", id); err != nil {
 		return err
-	}
-	if err := deleteSessionMessagesTx(tx, id); err != nil {
-		return fmt.Errorf(
-			"pre-deleting session %s messages: %w",
-			id, err,
-		)
-	}
-
-	res, err := tx.Exec(
-		"DELETE FROM sessions WHERE id = ?", id,
-	)
-	if err != nil {
-		return fmt.Errorf("deleting session %s: %w", id, err)
-	}
-	n, _ := res.RowsAffected()
-	if n > 0 {
-		if err := excludeSessionIDTx(tx, id); err != nil {
-			return fmt.Errorf("excluding session %s: %w", id, err)
-		}
-		for _, aliasID := range aliasIDs {
-			if err := excludeSessionIDTx(tx, aliasID); err != nil {
-				return fmt.Errorf(
-					"excluding session alias %s: %w", aliasID, err,
-				)
-			}
-		}
 	}
 	return tx.Commit()
 }
 
-func excludeSessionIDTx(tx *sql.Tx, id string) error {
-	_, err := tx.Exec(
-		"INSERT OR IGNORE INTO excluded_sessions (id) VALUES (?)",
-		id,
+// deleteSessionsTx preserves the scope of legacy trash before removing its
+// anchor. Its pages are deleted in this transaction, so none remain restorable
+// under a permanent thread exclusion.
+func deleteSessionsTx(ctx context.Context, tx *sql.Tx, where string, args ...any) (int64, error) {
+	aliasIDs, err := sessionAliasIDsTx(ctx, tx, where, args...)
+	if err != nil {
+		return 0, err
+	}
+	ids, err := sessionIDsTx(ctx, tx, where, args...)
+	if err != nil {
+		return 0, err
+	}
+	children, err := sessionIDsTx(ctx, tx, `id IN (
+		SELECT tc.subagent_session_id FROM tool_calls tc
+		WHERE tc.session_id IN (SELECT id FROM sessions WHERE `+where+`)
+		AND tc.session_id IS NOT tc.subagent_session_id)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	var threadScope bool
+	if err := tx.QueryRowContext(ctx,
+		"SELECT EXISTS (SELECT 1 FROM sessions WHERE ("+where+")"+
+			" AND deleted_at IS NOT NULL AND trash_includes_codex_pages = 1)", args...,
+	).Scan(&threadScope); err != nil {
+		return 0, fmt.Errorf("reading deleted session scope: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO excluded_sessions (id, file_path, include_codex_pages)
+		 SELECT id, file_path, CASE WHEN deleted_at IS NOT NULL THEN trash_includes_codex_pages ELSE 0 END
+		 FROM sessions WHERE `+where+`
+		 ON CONFLICT(id) DO UPDATE SET include_codex_pages =
+		 MAX(excluded_sessions.include_codex_pages, excluded.include_codex_pages)`, args...,
+	); err != nil {
+		return 0, fmt.Errorf("excluding sessions: %w", err)
+	}
+	for _, aliasID := range aliasIDs {
+		if err := excludeSessionIDTx(ctx, tx, aliasID, sql.NullString{}); err != nil {
+			return 0, fmt.Errorf("excluding session alias %s: %w", aliasID, err)
+		}
+	}
+	for _, id := range ids {
+		if err := deleteSessionMessagesTx(tx, id); err != nil {
+			return 0, fmt.Errorf("pre-deleting session %s messages: %w", id, err)
+		}
+	}
+	if err := deleteSessionAnnotationsTx(ctx, tx, where, args...); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, "DELETE FROM sessions WHERE "+where, args...)
+	if err != nil {
+		return 0, fmt.Errorf("deleting sessions: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if threadScope {
+		pages, err := purgeExcludedSessionsTx(ctx, tx)
+		if err != nil {
+			return 0, err
+		}
+		n += pages
+	}
+	if _, err := applySessionExternalParentsFor(ctx, tx.ExecContext,
+		func(ctx context.Context, query string, args ...any) rowScanner {
+			return tx.QueryRowContext(ctx, query, args...)
+		}, append(ids, children...)); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func deleteSessionAnnotationsTx(ctx context.Context, tx *sql.Tx, where string, args ...any) error {
+	for _, table := range []string{"session_labels", "session_external_parents"} {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE session_id IN (SELECT id FROM sessions WHERE "+where+")", args...); err != nil {
+			return fmt.Errorf("deleting %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
+func excludeSessionIDTx(ctx context.Context, tx *sql.Tx, id string, filePath sql.NullString) error {
+	_, err := tx.ExecContext(ctx,
+		"INSERT OR IGNORE INTO excluded_sessions (id, file_path) VALUES (?, ?)",
+		id, filePath,
 	)
 	return err
 }
 
-func sessionAliasIDsTx(tx *sql.Tx, where string, args ...any) ([]string, error) {
-	rows, err := tx.Query(
+func sessionAliasIDsTx(ctx context.Context, tx *sql.Tx, where string, args ...any) ([]string, error) {
+	rows, err := tx.QueryContext(ctx,
 		"SELECT id, agent, file_path FROM sessions WHERE "+where,
 		args...,
 	)
@@ -2961,8 +5832,8 @@ func sessionAliasIDsTx(tx *sql.Tx, where string, args ...any) ([]string, error) 
 	return aliases, nil
 }
 
-func sessionIDsTx(tx *sql.Tx, where string, args ...any) ([]string, error) {
-	rows, err := tx.Query(
+func sessionIDsTx(ctx context.Context, tx *sql.Tx, where string, args ...any) ([]string, error) {
+	rows, err := tx.QueryContext(ctx,
 		"SELECT id FROM sessions WHERE "+where,
 		args...,
 	)
@@ -3007,22 +5878,21 @@ func vibeFallbackAliasID(id, agent string, filePath sql.NullString) string {
 // is currently in the trash (deleted_at IS NOT NULL). Returns the
 // number of rows affected. This avoids a TOCTOU race between
 // checking deleted_at and performing the delete.
-func (db *DB) DeleteSessionIfTrashed(id string) (int64, error) {
+func (db *DB) DeleteSessionIfTrashed(ctx context.Context, id string) (int64, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
 
-	tx, err := w.Begin()
+	tx, err := w.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin delete-if-trashed tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := tx.Exec(
+	res, err := tx.ExecContext(ctx,
 		`UPDATE sessions
 		 SET deleted_at = deleted_at
-		 WHERE id = ? AND deleted_at IS NOT NULL
-		   AND deletion_cause IS NULL`,
+		 WHERE id = ? AND deleted_at IS NOT NULL`,
 		id,
 	)
 	if err != nil {
@@ -3034,39 +5904,9 @@ func (db *DB) DeleteSessionIfTrashed(id string) (int64, error) {
 	if locked == 0 {
 		return 0, nil
 	}
-	aliasIDs, err := sessionAliasIDsTx(
-		tx, "id = ? AND deleted_at IS NOT NULL AND deletion_cause IS NULL", id,
-	)
+	n, err := deleteSessionsTx(ctx, tx, "id = ? AND deleted_at IS NOT NULL", id)
 	if err != nil {
 		return 0, err
-	}
-	if err := deleteSessionMessagesTx(tx, id); err != nil {
-		return 0, fmt.Errorf(
-			"pre-deleting trashed session %s messages: %w",
-			id, err,
-		)
-	}
-
-	res, err = tx.Exec(
-		"DELETE FROM sessions WHERE id = ? AND deleted_at IS NOT NULL"+
-			" AND deletion_cause IS NULL",
-		id,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("deleting trashed session %s: %w", id, err)
-	}
-	n, _ := res.RowsAffected()
-
-	// Record in exclusion list so sync doesn't re-import.
-	if err := excludeSessionIDTx(tx, id); err != nil {
-		return 0, fmt.Errorf("excluding session %s: %w", id, err)
-	}
-	for _, aliasID := range aliasIDs {
-		if err := excludeSessionIDTx(tx, aliasID); err != nil {
-			return 0, fmt.Errorf(
-				"excluding session alias %s: %w", aliasID, err,
-			)
-		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -3275,9 +6115,13 @@ func (db *DB) GetBranches(
 // scanSessionRows iterates rows and scans each using
 // scanSessionRow.
 func scanSessionRows(rows *sql.Rows) ([]Session, error) {
+	return scanSessionRowsWithSource(rows, false)
+}
+
+func scanSessionRowsWithSource(rows *sql.Rows, includeSource bool) ([]Session, error) {
 	sessions := []Session{}
 	for rows.Next() {
-		s, err := scanSessionRow(rows)
+		s, err := scanSessionRowWithSource(rows, includeSource)
 		if err != nil {
 			return nil, fmt.Errorf("scanning session: %w", err)
 		}
@@ -3289,6 +6133,7 @@ func scanSessionRows(rows *sql.Rows) ([]Session, error) {
 // PruneFilter defines criteria for finding sessions to prune.
 // Filters combine with AND. At least one must be set.
 type PruneFilter struct {
+	Agent        string // exact match
 	Project      string // substring match (LIKE '%x%')
 	MaxMessages  *int   // user messages <= N (nil = no filter)
 	Before       string // ended_at < date (YYYY-MM-DD)
@@ -3297,7 +6142,8 @@ type PruneFilter struct {
 
 // HasFilters reports whether at least one filter is set.
 func (f PruneFilter) HasFilters() bool {
-	return f.Project != "" ||
+	return f.Agent != "" ||
+		f.Project != "" ||
 		f.MaxMessages != nil ||
 		f.Before != "" ||
 		f.FirstMessage != ""
@@ -3311,16 +6157,19 @@ func escapeLike(s string) string {
 
 // FindPruneCandidates returns sessions matching all filter
 // criteria. Returns full Session rows including file metadata.
-func (db *DB) FindPruneCandidates(
+func (db *DB) FindPruneCandidates(ctx context.Context,
 	f PruneFilter,
 ) ([]Session, error) {
 	if !f.HasFilters() {
-		return nil, fmt.Errorf("at least one filter is required")
+		return nil, errors.New("at least one filter is required")
 	}
 
 	where := "deleted_at IS NULL"
 	args := []any{}
-
+	if f.Agent != "" {
+		where = "agent = ?"
+		args = append(args, f.Agent)
+	}
 	if f.Project != "" {
 		where += ` AND project LIKE ? ESCAPE '\'`
 		args = append(args, "%"+escapeLike(f.Project)+"%")
@@ -3341,12 +6190,35 @@ func (db *DB) FindPruneCandidates(
 		args = append(args, escapeLike(f.FirstMessage)+"%")
 	}
 
-	// Exclude sessions that are parents of other sessions.
-	where += ` AND NOT EXISTS (
-		SELECT 1 FROM sessions AS child
-		WHERE child.parent_session_id = sessions.id)`
+	prefix := ""
+	if f.Agent != "" {
+		// Kept sessions protect every ancestor, including through matching rows
+		// and legacy whole-thread trash anchors.
+		prefix = `WITH RECURSIVE matched(id) AS (
+			SELECT id FROM sessions WHERE ` + where + `
+		), protected(id) AS (
+			SELECT id FROM sessions
+			WHERE id NOT IN (SELECT id FROM matched)
+			UNION
+			SELECT s.parent_session_id FROM sessions AS s
+			JOIN protected AS p ON s.id = p.id
+			WHERE s.parent_session_id IS NOT NULL
+			UNION
+			SELECT a.id FROM sessions AS p
+			JOIN protected ON p.id = protected.id
+			JOIN sessions AS a ON a.id = substr(p.id, 1, length(p.id) - 37)
+			WHERE substr(p.id, -37, 1) = '_'
+			  AND a.deleted_at IS NOT NULL
+			  AND a.trash_includes_codex_pages = 1
+		) `
+		where = "id IN (SELECT id FROM matched) AND id NOT IN (SELECT id FROM protected)"
+	} else {
+		where += ` AND NOT EXISTS (
+			SELECT 1 FROM sessions AS child
+			WHERE child.parent_session_id = sessions.id)`
+	}
 
-	query := "SELECT " + sessionPruneCols +
+	query := prefix + "SELECT " + sessionPruneCols +
 		" FROM sessions WHERE " + where + `
 		ORDER BY COALESCE(
 			NULLIF(ended_at, ''),
@@ -3354,7 +6226,7 @@ func (db *DB) FindPruneCandidates(
 			created_at
 		) DESC`
 
-	rows, err := db.getReader().Query(query, args...)
+	rows, err := db.getReader().Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("finding prune candidates: %w", err)
 	}
@@ -3365,7 +6237,7 @@ func (db *DB) FindPruneCandidates(
 		var s Session
 		err := rows.Scan(
 			&s.ID, &s.Project, &s.Machine, &s.Agent,
-			&s.AgentLabel, &s.Entrypoint,
+			&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
 			&s.FirstMessage, &s.DisplayName, &s.StartedAt, &s.EndedAt,
 			&s.MessageCount, &s.UserMessageCount,
 			&s.ParentSessionID, &s.RelationshipType,
@@ -3382,6 +6254,7 @@ func (db *DB) FindPruneCandidates(
 			&s.HealthScore, &s.HealthGrade,
 			&s.HasToolCalls, &s.HasContextData,
 			&s.SecretLeakCount, &s.SecretsRulesVersion,
+			&s.FrictionCount, &s.FrictionRulesVersion, &s.FrictionHash,
 			&s.QualitySignalVersion,
 			&s.ShortPromptCount, &s.UnstructuredStart,
 			&s.MissingSuccessCriteriaCount,
@@ -3390,10 +6263,11 @@ func (db *DB) FindPruneCandidates(
 			&s.DataVersion,
 			&s.Cwd, &s.GitBranch,
 			&s.SourceSessionID, &s.SourceVersion,
-			&s.TranscriptFidelity,
+			&s.GroupKey, &s.TranscriptFidelity,
 			&s.ParserMalformedLines, &s.IsTruncated,
 			&s.DeletedAt, &s.TerminationStatus, &s.TranscriptRevision,
 			&s.FilePath, &s.FileSize, &s.CreatedAt,
+			prLinksColumn{&s.PRLinks}, labelsColumn{&s.Labels},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning prune candidate: %w", err)
@@ -3403,27 +6277,23 @@ func (db *DB) FindPruneCandidates(
 	return sessions, rows.Err()
 }
 
-// SoftDeleteSession moves an active session to user trash. A recoverable
-// source-missing tombstone is converted to user trash so later source return
-// cannot revive a session the user explicitly removed.
-func (db *DB) SoftDeleteSession(id string) error {
+// SoftDeleteSession moves an active session to user trash. Source availability
+// is independent and is left unchanged.
+func (db *DB) SoftDeleteSession(ctx context.Context, id string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(
+	_, err := db.getWriter().Exec(ctx,
 		`UPDATE sessions
 		 SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-		     deletion_cause = NULL,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		 WHERE id = ?
-		   AND (deleted_at IS NULL OR deletion_cause = '`+deletionCauseSourceMissing+`')`, id,
+		 WHERE id = ? AND deleted_at IS NULL`, id,
 	)
 	return err
 }
 
 // SoftDeleteSessions moves multiple sessions to user trash. Existing user
-// tombstones are skipped; recoverable source-missing tombstones are converted.
-// Returns the count of newly deleted or converted rows.
-func (db *DB) SoftDeleteSessions(ids []string) (int, error) {
+// deletions are skipped and source availability is left unchanged.
+func (db *DB) SoftDeleteSessions(ctx context.Context, ids []string) (int, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
@@ -3431,7 +6301,7 @@ func (db *DB) SoftDeleteSessions(ids []string) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("beginning soft-delete tx: %w", err)
 	}
@@ -3449,13 +6319,12 @@ func (db *DB) SoftDeleteSessions(ids []string) (int, error) {
 		}
 		placeholders := strings.Repeat(",?", len(batch))[1:]
 
-		res, err := tx.Exec(
+		res, err := tx.ExecContext(ctx,
 			`UPDATE sessions
 			 SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-			     deletion_cause = NULL,
 			     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 			 WHERE id IN (`+placeholders+`)
-			   AND (deleted_at IS NULL OR deletion_cause = '`+deletionCauseSourceMissing+`')`,
+			   AND deleted_at IS NULL`,
 			args...,
 		)
 		if err != nil {
@@ -3471,25 +6340,25 @@ func (db *DB) SoftDeleteSessions(ids []string) (int, error) {
 	return total, nil
 }
 
-// RestoreSession clears deleted_at, making the session visible again.
-// Returns the number of rows affected (0 if session doesn't exist
-// or is not in trash).
-func (db *DB) RestoreSession(id string) (int64, error) {
+// RestoreSession clears deleted_at, makes the session visible again, and
+// invalidates source freshness so changes made while it was trashed are parsed.
+// Returns the number of rows affected (0 if session doesn't exist or is not in
+// trash).
+func (db *DB) RestoreSession(ctx context.Context, id string) (int64, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	tx, err := db.getWriter().BeginTx(context.Background(), nil)
+	tx, err := db.getWriter().BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.Exec(
+	res, err := tx.ExecContext(ctx,
 		`UPDATE sessions
 		 SET deleted_at = NULL,
-		     deletion_cause = NULL,
+		     data_version = ?,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-		 WHERE id = ? AND deleted_at IS NOT NULL
-		   AND deletion_cause IS NULL`,
-		id,
+		 WHERE id = ? AND deleted_at IS NOT NULL`,
+		max(CurrentDataVersion()-1, 0), id,
 	)
 	if err != nil {
 		return 0, err
@@ -3499,8 +6368,35 @@ func (db *DB) RestoreSession(id string) (int64, error) {
 		return 0, err
 	}
 	if n > 0 {
-		if _, err := tx.Exec(
+		if err := invalidateRestoredArchiveSourceTx(ctx, tx, id); err != nil {
+			return 0, err
+		}
+		// Restoring a selected file ends the earlier whole-thread trash action.
+		// Other materialized pages keep their own deleted_at values.
+		if _, err := tx.ExecContext(ctx, `UPDATE sessions
+			SET trash_includes_codex_pages = 0,
+			    local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+			WHERE trash_includes_codex_pages = 1 AND (
+				id = ?1 OR (substr(?1, -37, 1) = '_'
+					AND id = substr(?1, 1, length(?1) - 37))
+			)`, id); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx,
 			"DELETE FROM local_session_source_baselines WHERE session_id = ?", id,
+		); err != nil {
+			return 0, err
+		}
+		// The source may have changed while this member was in trash. Force the
+		// next sync to reparse it instead of trusting a digest persisted while
+		// the member was intentionally skipped. Delete by path because a path can
+		// have provider aliases in the freshness table.
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM provider_freshness
+			 WHERE file_path = (
+				SELECT file_path FROM sessions WHERE id = ?
+			 )`,
+			id,
 		); err != nil {
 			return 0, err
 		}
@@ -3513,17 +6409,33 @@ func (db *DB) RestoreSession(id string) (int64, error) {
 
 // RenameSession sets or clears the display_name for a session.
 // Pass nil to clear a custom name (reverts to session_name or first_message).
-func (db *DB) RenameSession(id string, displayName *string) error {
+func (db *DB) RenameSession(ctx context.Context, id string, displayName *string) error {
+	if db.usageOnlyStorage() {
+		displayName = nil
+	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	_, err := db.getWriter().Exec(
+	tx, err := db.getWriter().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(ctx,
 		`UPDATE sessions
 		 SET display_name = ?,
 		     local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		 WHERE id = ? AND deleted_at IS NULL`,
 		displayName, id,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if db.usageOnlyStorage() {
+		if err := clearUsageOnlyTextTx(tx, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ListTrashedSessions returns sessions that have been soft-deleted.
@@ -3532,7 +6444,6 @@ func (db *DB) ListTrashedSessions(
 ) ([]Session, error) {
 	query := "SELECT " + sessionBaseCols +
 		" FROM sessions WHERE deleted_at IS NOT NULL" +
-		" AND deletion_cause IS NULL" +
 		" ORDER BY deleted_at DESC LIMIT 500"
 	rows, err := db.getReader().QueryContext(ctx, query)
 	if err != nil {
@@ -3547,69 +6458,30 @@ func (db *DB) ListTrashedSessions(
 // engine does not re-import them. Both operations run in a
 // single transaction to prevent ghost exclusions when the
 // delete fails. Returns the count of deleted rows.
-func (db *DB) EmptyTrash() (int, error) {
+func (db *DB) EmptyTrash(ctx context.Context) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	w := db.getWriter()
 
-	tx, err := w.Begin()
+	tx, err := w.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin empty-trash tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.Exec(
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE sessions
 		 SET deleted_at = deleted_at
-		 WHERE deleted_at IS NOT NULL AND deletion_cause IS NULL`,
+		 WHERE deleted_at IS NOT NULL`,
 	); err != nil {
 		return 0, fmt.Errorf("locking trashed sessions: %w", err)
 	}
 
-	aliasIDs, err := sessionAliasIDsTx(
-		tx, "deleted_at IS NOT NULL AND deletion_cause IS NULL",
-	)
-	if err != nil {
-		return 0, err
-	}
-	ids, err := sessionIDsTx(
-		tx, "deleted_at IS NOT NULL AND deletion_cause IS NULL",
-	)
+	n, err := deleteSessionsTx(ctx, tx, "deleted_at IS NOT NULL")
 	if err != nil {
 		return 0, err
 	}
 
-	// Record all trashed session IDs before deleting.
-	if _, err := tx.Exec(
-		`INSERT OR IGNORE INTO excluded_sessions (id)
-		 SELECT id FROM sessions
-		 WHERE deleted_at IS NOT NULL AND deletion_cause IS NULL`,
-	); err != nil {
-		return 0, fmt.Errorf("excluding trashed sessions: %w", err)
-	}
-	for _, aliasID := range aliasIDs {
-		if err := excludeSessionIDTx(tx, aliasID); err != nil {
-			return 0, fmt.Errorf(
-				"excluding trashed session alias %s: %w", aliasID, err,
-			)
-		}
-	}
-	for _, id := range ids {
-		if err := deleteSessionMessagesTx(tx, id); err != nil {
-			return 0, fmt.Errorf(
-				"pre-deleting trashed session %s messages: %w",
-				id, err,
-			)
-		}
-	}
-	res, err := tx.Exec(
-		"DELETE FROM sessions WHERE deleted_at IS NOT NULL" +
-			" AND deletion_cause IS NULL",
-	)
-	if err != nil {
-		return 0, fmt.Errorf("emptying trash: %w", err)
-	}
-	n, _ := res.RowsAffected()
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("commit empty-trash: %w", err)
 	}
@@ -3621,7 +6493,7 @@ func (db *DB) EmptyTrash() (int, error) {
 // under SQLite variable limits. Deleted IDs are recorded in
 // excluded_sessions so the sync engine does not re-import
 // them. Returns count of deleted rows.
-func (db *DB) DeleteSessions(ids []string) (int, error) {
+func (db *DB) DeleteSessions(ctx context.Context, ids []string) (int, error) {
 	if err := db.requireWritable(); err != nil {
 		return 0, err
 	}
@@ -3632,7 +6504,7 @@ func (db *DB) DeleteSessions(ids []string) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("beginning transaction: %w", err)
 	}
@@ -3650,45 +6522,10 @@ func (db *DB) DeleteSessions(ids []string) (int, error) {
 		}
 		placeholders := strings.Repeat(",?", len(batch))[1:]
 
-		aliasIDs, err := sessionAliasIDsTx(
-			tx, "id IN ("+placeholders+")", args...,
-		)
+		n, err := deleteSessionsTx(ctx, tx, "id IN ("+placeholders+")", args...)
 		if err != nil {
 			return 0, err
 		}
-
-		// Exclude only IDs that exist before we delete them.
-		if _, err := tx.Exec(
-			"INSERT OR IGNORE INTO excluded_sessions (id) "+
-				"SELECT id FROM sessions WHERE id IN ("+placeholders+")",
-			args...,
-		); err != nil {
-			return 0, fmt.Errorf("excluding batch: %w", err)
-		}
-		for _, aliasID := range aliasIDs {
-			if err := excludeSessionIDTx(tx, aliasID); err != nil {
-				return 0, fmt.Errorf(
-					"excluding batch session alias %s: %w", aliasID, err,
-				)
-			}
-		}
-		for _, id := range batch {
-			if err := deleteSessionMessagesTx(tx, id); err != nil {
-				return 0, fmt.Errorf(
-					"pre-deleting batch session %s messages: %w",
-					id, err,
-				)
-			}
-		}
-
-		res, err := tx.Exec(
-			"DELETE FROM sessions WHERE id IN ("+placeholders+")",
-			args...,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("deleting batch: %w", err)
-		}
-		n, _ := res.RowsAffected()
 		total += int(n)
 	}
 
@@ -3789,10 +6626,10 @@ func (db *DB) ListSessionsModifiedBetween(
 		var s Session
 		err := rows.Scan(
 			&s.ID, &s.Project, &s.Machine, &s.Agent,
-			&s.AgentLabel, &s.Entrypoint,
+			&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
 			&s.FirstMessage, &s.DisplayName, &s.SessionName, &s.StartedAt, &s.EndedAt,
 			&s.MessageCount, &s.UserMessageCount,
-			&s.ParentSessionID, &s.RelationshipType,
+			&s.ParentSessionID, &s.ParserParentSessionID, &s.RelationshipType,
 			&s.TotalOutputTokens, &s.PeakContextTokens,
 			&s.HasTotalOutputTokens, &s.HasPeakContextTokens,
 			&s.IsAutomated,
@@ -3806,6 +6643,7 @@ func (db *DB) ListSessionsModifiedBetween(
 			&s.HealthScore, &s.HealthGrade,
 			&s.HasToolCalls, &s.HasContextData,
 			&s.SecretLeakCount, &s.SecretsRulesVersion,
+			&s.FrictionCount, &s.FrictionRulesVersion, &s.FrictionHash,
 			&s.QualitySignalVersion,
 			&s.ShortPromptCount, &s.UnstructuredStart,
 			&s.MissingSuccessCriteriaCount,
@@ -3814,15 +6652,16 @@ func (db *DB) ListSessionsModifiedBetween(
 			&s.DataVersion,
 			&s.Cwd, &s.GitBranch,
 			&s.SourceSessionID, &s.SourceVersion,
-			&s.TranscriptFidelity,
+			&s.GroupKey, &s.TranscriptFidelity,
 			&s.ParserMalformedLines, &s.IsTruncated,
 			&s.LastWriteIncremental,
-			&s.DeletedAt, &s.DeletionCause,
+			&s.DeletedAt, &s.DeletionCause, &s.SourceMissingAt, &s.TrashIncludesCodexPages,
 			&s.TerminationStatus, &s.FilePath, &s.FileSize,
 			&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
 			&s.FileInode, &s.FileDevice,
 			&s.FileHash, &s.LocalModifiedAt,
-			&s.TranscriptRevision, &s.CreatedAt,
+			&s.TranscriptRevision, &s.CreatedAt, &s.ProjectAssigned,
+			prLinksColumn{&s.PRLinks}, labelsColumn{&s.Labels},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning session: %w", err)
@@ -3898,10 +6737,10 @@ func (db *DB) ListSessionsForMirrorWindow(
 		var s Session
 		err := rows.Scan(
 			&s.ID, &s.Project, &s.Machine, &s.Agent,
-			&s.AgentLabel, &s.Entrypoint,
+			&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
 			&s.FirstMessage, &s.DisplayName, &s.SessionName, &s.StartedAt, &s.EndedAt,
 			&s.MessageCount, &s.UserMessageCount,
-			&s.ParentSessionID, &s.RelationshipType,
+			&s.ParentSessionID, &s.ParserParentSessionID, &s.RelationshipType,
 			&s.TotalOutputTokens, &s.PeakContextTokens,
 			&s.HasTotalOutputTokens, &s.HasPeakContextTokens,
 			&s.IsAutomated,
@@ -3915,6 +6754,7 @@ func (db *DB) ListSessionsForMirrorWindow(
 			&s.HealthScore, &s.HealthGrade,
 			&s.HasToolCalls, &s.HasContextData,
 			&s.SecretLeakCount, &s.SecretsRulesVersion,
+			&s.FrictionCount, &s.FrictionRulesVersion, &s.FrictionHash,
 			&s.QualitySignalVersion,
 			&s.ShortPromptCount, &s.UnstructuredStart,
 			&s.MissingSuccessCriteriaCount,
@@ -3923,15 +6763,16 @@ func (db *DB) ListSessionsForMirrorWindow(
 			&s.DataVersion,
 			&s.Cwd, &s.GitBranch,
 			&s.SourceSessionID, &s.SourceVersion,
-			&s.TranscriptFidelity,
+			&s.GroupKey, &s.TranscriptFidelity,
 			&s.ParserMalformedLines, &s.IsTruncated,
 			&s.LastWriteIncremental,
-			&s.DeletedAt, &s.DeletionCause,
+			&s.DeletedAt, &s.DeletionCause, &s.SourceMissingAt, &s.TrashIncludesCodexPages,
 			&s.TerminationStatus, &s.FilePath, &s.FileSize,
 			&s.FileMtime, &s.NextOrdinal, &s.LastEntryUUID,
 			&s.FileInode, &s.FileDevice,
 			&s.FileHash, &s.LocalModifiedAt,
-			&s.TranscriptRevision, &s.CreatedAt,
+			&s.TranscriptRevision, &s.CreatedAt, &s.ProjectAssigned,
+			prLinksColumn{&s.PRLinks}, labelsColumn{&s.Labels},
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning session: %w", err)
@@ -3979,6 +6820,87 @@ func (db *DB) CountSessionsForMirrorScope(
 	return count, nil
 }
 
+// MirrorPushCutoff returns the cutoff a mirror push records as its next
+// window's lower bound. It reads the clock while holding the write lock, so
+// no write transaction is open: every write stamped before the cutoff has
+// committed and is visible to the push's later listing, and every later write
+// is stamped at or after the cutoff. A cutoff read without the lock can fall
+// after the stamp of a write that commits only after the push lists sessions;
+// no later window would list that write.
+//
+// It also waits while the writer is closed for a worker handoff. A sync-worker
+// child writes the archive then, outside this process's write lock, so a
+// cutoff taken during the handoff has the same gap. MirrorPushCutoff returns
+// ctx.Err() if ctx ends first, including while a long write holds the lock.
+func (db *DB) MirrorPushCutoff(ctx context.Context) (string, error) {
+	for {
+		if err := db.WaitForWriter(ctx); err != nil {
+			return "", err
+		}
+		if err := db.lockWriterCtx(ctx); err != nil {
+			return "", err
+		}
+		if !db.writerClosed.Load() {
+			cutoff := time.Now().UTC().Format(mirrorWindowBoundLayout)
+			db.mu.Unlock()
+			return cutoff, nil
+		}
+		db.mu.Unlock()
+	}
+}
+
+// lockWriterCtx takes the write lock, or returns once ctx ends.
+func (db *DB) lockWriterCtx(ctx context.Context) error {
+	if err := lockctx.Lock(ctx, &db.mu); err != nil {
+		return fmt.Errorf("stopped while waiting for an archive write to finish: %w", err)
+	}
+	return nil
+}
+
+// WaitForWriter blocks while the writer is closed for a worker handoff. It
+// returns ctx.Err() if ctx ends first. A write can still fail if a new
+// handoff starts after it returns. A wait that lasts writerHandoffNoticeAfter
+// is logged and reported to the notice set by WithWriterWaitNotice.
+func (db *DB) WaitForWriter(ctx context.Context) error {
+	start := time.Now()
+	announced := false
+	for db.writerClosed.Load() {
+		if !announced && time.Since(start) >= writerHandoffNoticeAfter {
+			announced = true
+			log.Printf("waiting for a local sync to finish before writing the archive")
+			if notice, ok := ctx.Value(writerWaitNoticeKey{}).(func()); ok {
+				notice()
+			}
+		}
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("gave up waiting for the local sync to finish: %w", ctx.Err())
+			}
+			return fmt.Errorf("stopped while waiting for the local sync to finish: %w", ctx.Err())
+		case <-time.After(writerHandoffPollInterval):
+		}
+	}
+	return nil
+}
+
+type writerWaitNoticeKey struct{}
+
+// WithWriterWaitNotice returns a context whose WaitForWriter calls notice when
+// a wait for a worker handoff lasts long enough to log. A daemon push uses it
+// to tell its client why the push paused.
+func WithWriterWaitNotice(ctx context.Context, notice func()) context.Context {
+	return context.WithValue(ctx, writerWaitNoticeKey{}, notice)
+}
+
+// writerHandoffPollInterval spaces checks for the end of a worker handoff.
+// Handoffs last seconds to minutes.
+const writerHandoffPollInterval = 50 * time.Millisecond
+
+// writerHandoffNoticeAfter is how long WaitForWriter waits before it logs that
+// it is waiting, so a short handoff stays quiet.
+const writerHandoffNoticeAfter = 5 * time.Second
+
 // normalizeMirrorWindowBound parses an RFC3339Nano timestamp and formats it
 // as ms-precision UTC text matching the sync_marker column format, so the
 // bound compares correctly against trigger-maintained markers.
@@ -3987,8 +6909,11 @@ func normalizeMirrorWindowBound(bound string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parsing mirror window bound %q: %w", bound, err)
 	}
-	return parsed.UTC().Format("2006-01-02T15:04:05.000Z"), nil
+	return parsed.UTC().Format(mirrorWindowBoundLayout), nil
 }
+
+// mirrorWindowBoundLayout matches the trigger-maintained sync_marker text.
+const mirrorWindowBoundLayout = "2006-01-02T15:04:05.000Z"
 
 // SessionProjectsByIDs returns each session's current project keyed by session
 // ID. IDs with no sessions row are absent from the result, so a caller can tell
@@ -4003,7 +6928,7 @@ func (db *DB) SessionProjectsByIDs(
 		return out, nil
 	}
 	err := queryChunked(ids, func(chunk []string) error {
-		placeholders, args := inPlaceholders(chunk)
+		placeholders, args := InPlaceholders(chunk)
 		rows, err := db.getReader().QueryContext(ctx,
 			"SELECT id, project FROM sessions WHERE id IN "+placeholders, args...)
 		if err != nil {
@@ -4042,4 +6967,65 @@ const (
 
 func sqliteSyncTimestampExpr(expr trustedSQLiteExpr) string {
 	return "strftime('%Y-%m-%dT%H:%M:%fZ', " + string(expr) + ")"
+}
+
+// SessionMirrorSnapshot keeps the raw session names, dependent rows, and
+// fingerprint inputs from the same committed archive version.
+type SessionMirrorSnapshot struct {
+	Session             Session
+	Messages            []Message
+	Usage               []UsageEvent
+	Findings            []SecretFinding
+	Pins                []PinnedMessage
+	PlanUsage           *SessionPlanUsage // nil when the session has none
+	UsageFingerprint    string
+	ToolCallFingerprint string
+}
+
+func (db *DB) LoadSessionMirrorSnapshot(ctx context.Context, id string) (*SessionMirrorSnapshot, error) {
+	return db.loadSessionMirrorSnapshot(ctx, id, nil)
+}
+
+func (db *DB) loadSessionMirrorSnapshot(ctx context.Context, id string, afterSession func()) (*SessionMirrorSnapshot, error) {
+	tx, err := db.getReader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("beginning mirror source snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	session, err := scanSessionFullRow(tx.QueryRowContext(ctx,
+		"SELECT "+sessionFullCols+" FROM sessions WHERE id = ?", id), id)
+	if err != nil || session == nil {
+		return nil, err
+	}
+	if afterSession != nil {
+		afterSession()
+	}
+	result := &SessionMirrorSnapshot{Session: *session}
+	if result.Messages, err = allMessagesWithQuerier(ctx, tx, id, selectMessageCols); err != nil {
+		return nil, err
+	}
+	if result.Usage, err = usageEventsWithQuerier(ctx, tx, id, 0); err != nil {
+		return nil, err
+	}
+	if result.Findings, err = sessionSecretFindingsWithQuerier(ctx, tx, id); err != nil {
+		return nil, err
+	}
+	if result.Pins, err = pinnedMessagesWithQuerier(ctx, tx, id, ""); err != nil {
+		return nil, err
+	}
+	if result.PlanUsage, err = sessionPlanUsageWithQuerier(ctx, tx, id); err != nil {
+		return nil, err
+	}
+	usage := make(map[string]string, 1)
+	if err := appendUsageEventFingerprints(ctx, tx, usage, []string{id}, nil, false); err != nil {
+		return nil, err
+	}
+	result.UsageFingerprint = usage[id]
+	if result.ToolCallFingerprint, err = toolCallFingerprintWithQuerier(ctx, tx, id); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("finishing mirror source snapshot: %w", err)
+	}
+	return result, nil
 }

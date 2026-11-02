@@ -19,8 +19,44 @@ const (
 // unsupported results, but scheduling and validation should trust this
 // declaration once a provider has migrated off the legacy adapter.
 type Capabilities struct {
-	Source  SourceCapabilities
-	Content ContentCapabilities
+	Source     SourceCapabilities
+	Content    ContentCapabilities
+	Sync       ProviderSyncSemantics
+	RawCapture RawCaptureCapabilities
+}
+
+// UnchangedResultPolicy controls how the engine compares parsed members from a
+// shared source with their stored rows. The zero value keeps every result.
+type UnchangedResultPolicy uint8
+
+const (
+	UnchangedResultNone UnchangedResultPolicy = iota
+	UnchangedResultMTime
+	UnchangedResultMTimeAndHash
+)
+
+// ProviderSyncSemantics declares stable provider-wide cache and result
+// freshness policy. Its zero value opts out of every specialized behavior.
+type ProviderSyncSemantics struct {
+	FingerprintHashInCacheKey           bool
+	FingerprintHashRequiredForFreshness bool
+	// BatchFingerprintCache shares member fingerprint reads within a sync pass.
+	BatchFingerprintCache bool
+	// PartialDiscovery means discovery and changed-path resolution can
+	// return usable sources together with DiscoveryIncompleteError. The
+	// engine syncs those sources and still reports the failure.
+	PartialDiscovery bool
+	// MemberFreshnessOverridesFileForce means one physical file expands into
+	// per-session member sources, and each member's own freshness check
+	// decides whether it is rewritten. A file-level ForceFullParse, such as
+	// a remote import marking a fetched database, does not force every
+	// member to be rewritten. The provider's standalone sources, which are
+	// physical files themselves, keep the force.
+	MemberFreshnessOverridesFileForce bool
+	// SkipCacheFreshWithoutStoredRow permits a matching skip-cache entry to
+	// remain fresh before this provider has persisted a row for the source.
+	SkipCacheFreshWithoutStoredRow bool
+	UnchangedResults               UnchangedResultPolicy
 }
 
 // SourceCapabilities declares optional source mechanics implemented by a
@@ -30,12 +66,18 @@ type SourceCapabilities struct {
 	StreamingDiscovery   CapabilitySupport
 	WatchSources         CapabilitySupport
 	WatchRoots           CapabilitySupport
+	ActivityHints        CapabilitySupport
 	ClassifyChangedPath  CapabilitySupport
+	ChangedPathRelevance CapabilitySupport
 	StoredSourceHints    CapabilitySupport
 	FindSource           CapabilitySupport
 	CompositeFingerprint CapabilitySupport
 	IncrementalAppend    CapabilitySupport
 	MultiSessionSource   CapabilitySupport
+	// AppOwnedStore means the stored file_path can be the app's shared
+	// state.db, so prune leaves it in place. OwnsAppStore recognizes only
+	// state.db stores; a provider with another store layout must extend it.
+	AppOwnedStore CapabilitySupport
 	// SharedContainerSource means streaming discovery emits multiple logical
 	// virtual members from one physical container and exact reconciliation
 	// rehydration is required to avoid reopening or rescanning that container.
@@ -48,6 +90,42 @@ type SourceCapabilities struct {
 	// its stored virtual members. A still-present container remains
 	// authoritative for member deletion.
 	PersistentArchive CapabilitySupport
+	// ExplicitDeletionOnly means source discovery and reconciliation may
+	// refresh sessions but must never mark an archived session missing. The
+	// user deletes these sessions explicitly from AgentsView.
+	ExplicitDeletionOnly CapabilitySupport
+	// MultiFileStatHash declares that a provider's on-disk source layout
+	// spans multiple sibling files (Codebuff's chat-messages.json plus
+	// run-state.json and chat-meta.json, for example) and that the engine
+	// should consult its per-component provider_freshness digest on
+	// warm passes instead of the legacy size/max-mtime composite
+	// freshness gate. Providers that do not have a multi-file layout
+	// leave this at CapabilityUnsupported; a SourceSetProvider wrapper
+	// still satisfies parser.MultiFileStatHasher unconditionally, so
+	// the engine reads this capability before registering a hasher
+	// in providerStatHashers to avoid short-circuiting every
+	// SourceSet-wrapped agent on a 0==0 digest match.
+	MultiFileStatHash CapabilitySupport
+	// S3Discovery means the provider can enumerate and ingest sessions
+	// from an s3:// root under .../<machine>/raw/<agent>/ and implements
+	// S3Provider. Providers leave this at CapabilityUnsupported unless
+	// they opt in; the sync engine uses the flag instead of a hardcoded
+	// Claude/Codex whitelist.
+	S3Discovery CapabilitySupport
+	// SharedSessionIDs means two of the provider's files can carry the same
+	// session id as separate sessions (Gemini CLI chat segments, Cursor
+	// transcripts copied between projects). The sync engine then keeps the
+	// stored file on the id and stores the other under parser.AltSessionID.
+	SharedSessionIDs CapabilitySupport
+	// StoredMemberFreshnessListing means the provider answers a changed-path
+	// event for a shared container with only the members whose change marker
+	// ChangedPathRequest.StoredMemberFreshnessPage does not cover, and resolves
+	// that container through ResolveStoredMemberFreshnessContainer. The listing
+	// must read one database snapshot: the engine skips its post-listing
+	// re-list for these providers, since a commit during the listing arrives as
+	// its own watcher event. The OpenCode family receives the pager through its
+	// own engine route; other providers receive it only by declaring this.
+	StoredMemberFreshnessListing CapabilitySupport
 }
 
 // ContentCapabilities declares optional normalized content fields a provider

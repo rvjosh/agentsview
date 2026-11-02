@@ -1,5 +1,6 @@
 <script lang="ts">
   import { analytics } from "../../stores/analytics.svelte.js";
+  import { sessions } from "../../stores/sessions.svelte.js";
   import {
     CalendarIcon,
     ClockIcon,
@@ -10,7 +11,7 @@
     XIcon,
   } from "../../icons.js";
   import { agentColor, agentLabel } from "../../utils/agents.js";
-  import { m } from "../../i18n/index.js";
+  import { formatDateTime, m } from "../../i18n/index.js";
 
   const selectedAgents = $derived(
     analytics.agent
@@ -22,11 +23,7 @@
       ? analytics.model.split(",").filter((model) => model.length > 0)
       : [],
   );
-  const selectedMachines = $derived(
-    analytics.machine
-      ? analytics.machine.split(",")
-      : [],
-  );
+  const selectedMachines = $derived(sessions.selectedMachines);
 
   const selectedStatuses = $derived(
     analytics.termination
@@ -74,6 +71,20 @@
     return "";
   });
 
+  const activityRangeLabel = $derived.by(() => {
+    const range = analytics.selectedActivityRange;
+    if (!range) return "";
+    const options: Intl.DateTimeFormatOptions = {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    };
+    return m.data_workspace_activity_range({
+      first: formatDateTime(`${range.from}T00:00:00`, options),
+      last: formatDateTime(`${range.to}T00:00:00`, options),
+    });
+  });
+
   const hasTime = $derived(
     analytics.selectedDow !== null ||
     analytics.selectedHour !== null,
@@ -81,6 +92,7 @@
 
   const filterCount = $derived(
     (analytics.selectedDate !== null ? 1 : 0) +
+    (analytics.selectedActivityRange !== null ? 1 : 0) +
     (analytics.project !== "" ? 1 : 0) +
     selectedMachines.length +
     selectedAgents.length +
@@ -114,6 +126,22 @@
       </button>
     {/if}
 
+    {#if analytics.selectedActivityRange}
+      <button
+        class="filter-chip"
+        onclick={() => analytics.clearActivitySelection()}
+        title={m.sidebar_clear_selection()}
+      >
+        <span class="chip-icon">
+          <CalendarIcon size="10" strokeWidth="1.8" aria-hidden="true" />
+        </span>
+        {activityRangeLabel}
+        <span class="chip-x">
+          <XIcon size="11" strokeWidth="2.4" aria-hidden="true" />
+        </span>
+      </button>
+    {/if}
+
     {#if analytics.project}
       <button
         class="filter-chip"
@@ -134,12 +162,12 @@
       <button
         class="filter-chip"
         onclick={() => analytics.removeMachine(machine)}
-        title={m.shared_active_filters_remove_machine({ machine })}
+        title={m.shared_active_filters_remove_machine({ machine: sessions.machineLabel(machine) })}
       >
         <span class="chip-icon">
           <MonitorIcon size="10" strokeWidth="1.8" aria-hidden="true" />
         </span>
-        {machine}
+        {sessions.machineLabel(machine)}
         <span class="chip-x">
           <XIcon size="11" strokeWidth="2.4" aria-hidden="true" />
         </span>

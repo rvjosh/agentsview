@@ -3,7 +3,6 @@ package duckdb
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -12,7 +11,7 @@ import (
 
 // MirrorProbe summarizes a DuckDB mirror file's shape and push-scope
 // metadata without mutating it. ProbeMirror is the read-only counterpart to
-// rebuildMirror: callers use it to decide whether a mirror is safe to serve
+// buildMirror: callers use it to decide whether a mirror is safe to serve
 // as-is or needs a full rebuild.
 type MirrorProbe struct {
 	FileExists bool
@@ -48,12 +47,16 @@ type MirrorProbe struct {
 	// the mirror was built from (see mirrorMetadata.SourceDatabaseID). "" on
 	// mirrors written before the id was recorded.
 	SourceDatabaseID string
-	Scope            string // canonical scope string, see canonicalPushScope
+	// SourceArchiveID is the provenance id stamped onto mirror rows. "" on
+	// mirrors written before the id was recorded.
+	SourceArchiveID  string
+	Scope            string // canonical scope string, see db.CanonicalPushScope
 	LastPushCutoff   string
 	LastPushAt       string
 	LastPushMachine  string
 	DeletionRevision int64
 	IdentityRevision int64
+	MappingRevision  int64
 }
 
 // ProbeMirror inspects the mirror file at path without creating or mutating
@@ -71,7 +74,7 @@ func ProbeMirror(ctx context.Context, path string) (MirrorProbe, error) {
 		return MirrorProbe{}, fmt.Errorf("statting duckdb mirror %s: %w", path, err)
 	}
 
-	conn, err := OpenReadOnly(path)
+	conn, err := OpenReadOnly(ctx, path)
 	if err != nil {
 		return MirrorProbe{
 			FileExists:   true,
@@ -112,19 +115,6 @@ func isMirrorLockConflictError(err error) bool {
 		strings.Contains(msg, "Conflicting lock")
 }
 
-// isMirrorOpenInSameProcessError reports whether err is duckdb-go's
-// same-process double-open rejection ("Can't open a connection to same
-// database file with a different configuration than existing connections"):
-// duckdb-go caches instances per literal DSN, so opening the same path with
-// a DIFFERENT access mode than an existing in-process handle is rejected. A
-// read-only probe hits it when the same process holds the mirror read-write
-// (a push in flight), and a push's write open hits it when the same process
-// holds the mirror read-only (a serving Store). Same-DSN opens share the
-// cached instance instead and never hit this.
-func isMirrorOpenInSameProcessError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "same database file")
-}
-
 func probeOpenMirror(ctx context.Context, conn *sql.DB) MirrorProbe {
 	probe := MirrorProbe{FileExists: true}
 
@@ -159,12 +149,14 @@ func probeOpenMirror(ctx context.Context, conn *sql.DB) MirrorProbe {
 	probe.SchemaVersion = meta.SchemaVersion
 	probe.DataVersion = meta.DataVersion
 	probe.SourceDatabaseID = meta.SourceDatabaseID
+	probe.SourceArchiveID = meta.SourceArchiveID
 	probe.Scope = meta.Scope
 	probe.LastPushCutoff = meta.LastPushCutoff
 	probe.LastPushAt = meta.LastPushAt
 	probe.LastPushMachine = meta.LastPushMachine
 	probe.DeletionRevision = meta.DeletionRevision
 	probe.IdentityRevision = meta.IdentityRevision
+	probe.MappingRevision = meta.MappingRevision
 	return probe
 }
 
@@ -233,7 +225,7 @@ func mirrorShapeIssueFromColumns(existing map[string]map[string]bool) string {
 }
 
 // NeedsRebuild reports whether the probed mirror can serve scope/
-// sourceDataVersion as-is, or must be rebuilt with rebuildMirror. A missing
+// sourceDataVersion as-is, or must be rebuilt with buildMirror. A missing
 // file, a shape problem, a schema version mismatch in either direction, a
 // stale source data version, or a different push scope all require a
 // rebuild; there is no in-place migration path for the mirror schema.
@@ -278,23 +270,18 @@ func (p MirrorProbe) NeedsRebuild(scope string, sourceDataVersion int) bool {
 // rebuilds: identity-less mirrors only come from earlier builds of this
 // unreleased branch, so they simply rebuild once and record the id.
 //
-// The machine-change check exists because mirror rows are machine-stamped
-// (see the sessions.machine column and duckSessionFingerprintFields): an
-// incremental push only rewrites sessions whose LOCAL content changed
-// within the current mirror window, so a session that has not changed
-// since the mirror's last push stays permanently labeled with the OLD
-// machine name even after the push metadata's LastPushMachine flips to the
-// new one — silently stranding it under a machine filter (see
-// readMachineStatus) that will never again select it. A full rebuild
-// re-pushes every session under the new machine name instead.
+// The machine-change check remains necessary for legacy sessions whose local
+// machine is empty or "local": mirroring substitutes the current push machine
+// for those values, so a full rebuild must restamp every such row when that
+// configured name changes. Explicit per-source machine labels remain unchanged.
 //
 // localDeletionRevision is the caller's local.SessionDeletionPublicationRevision
-// read, and localDatabaseID the caller's local.GetDatabaseID read; both are
-// passed in rather than threaded through NeedsRebuild's pure scope/version
-// signature.
+// read, localDatabaseID the caller's local.GetDatabaseID read, and
+// localArchiveID the caller's local.GetArchiveID read; they are passed in
+// rather than threaded through NeedsRebuild's pure scope/version signature.
 func rebuildReason(
 	probe MirrorProbe, scope string, sourceDataVersion int, full bool,
-	localDeletionRevision int64, machine string, localDatabaseID string,
+	localDeletionRevision int64, machine, localDatabaseID, localArchiveID string,
 ) string {
 	switch {
 	case full:
@@ -319,42 +306,11 @@ func rebuildReason(
 		)
 	case probe.SourceDatabaseID != localDatabaseID:
 		return "mirror was built from a different archive (source database id changed)"
+	case probe.SourceArchiveID != localArchiveID:
+		return "mirror provenance changed (source archive id changed)"
 	case probe.DeletionRevision > localDeletionRevision:
 		return "mirror deletion cursor ahead of archive; archive was rebuilt"
 	default:
 		return ""
 	}
-}
-
-// canonicalPushScope renders a push's project filters into a deterministic
-// string suitable for storing in mirror metadata and comparing across runs.
-// Unfiltered pushes (no include/exclude projects) canonicalize to "" so the
-// common case never round-trips through JSON.
-func canonicalPushScope(projects, excludeProjects []string) string {
-	if len(projects) == 0 && len(excludeProjects) == 0 {
-		return ""
-	}
-	scope := struct {
-		Projects []string `json:"projects,omitempty"`
-		Exclude  []string `json:"exclude,omitempty"`
-	}{
-		Projects: sortedCopy(projects),
-		Exclude:  sortedCopy(excludeProjects),
-	}
-	data, err := json.Marshal(scope)
-	if err != nil {
-		// json.Marshal only fails on unsupported types; []string always
-		// marshals, so this is unreachable in practice.
-		return ""
-	}
-	return string(data)
-}
-
-func sortedCopy(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := append([]string(nil), values...)
-	sort.Strings(out)
-	return out
 }

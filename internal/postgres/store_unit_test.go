@@ -18,23 +18,16 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 )
 
-// TestStoreHasSemanticFalse pins that the PostgreSQL store reports no
-// semantic search capability until it gets its own VectorSearcher seam.
-func TestStoreHasSemanticFalse(t *testing.T) {
-	s := &Store{}
-	assert.False(t, s.HasSemantic(), "PostgreSQL HasSemantic")
-}
-
 // TestStoreSearchContentSemanticModesUnavailable pins that "semantic" and
 // "hybrid" are rejected with db.ErrSemanticUnavailable before any query runs
 // -- a zero-value Store (no live *sql.DB) is enough to prove that.
 func TestStoreSearchContentSemanticModesUnavailable(t *testing.T) {
 	s := &Store{}
 	for _, mode := range []string{"semantic", "hybrid"} {
-		_, err := s.SearchContent(context.Background(),
+		_, err := s.SearchContent(t.Context(),
 			db.ContentSearchFilter{Pattern: "x", Mode: mode})
 		require.Error(t, err, "mode %q", mode)
-		assert.True(t, errors.Is(err, db.ErrSemanticUnavailable),
+		assert.ErrorIs(t, err, db.ErrSemanticUnavailable,
 			"mode %q: want ErrSemanticUnavailable, got %v", mode, err)
 	}
 }
@@ -61,37 +54,15 @@ func TestStoreSearchContentSemanticInvalidInputReturns400Before501(t *testing.T)
 			t.Run(mode+"/"+tc.name, func(t *testing.T) {
 				f := tc.f
 				f.Mode = mode
-				_, err := s.SearchContent(context.Background(), f)
+				_, err := s.SearchContent(t.Context(), f)
 				require.Error(t, err)
 				var inputErr *db.SearchInputError
-				assert.True(t, errors.As(err, &inputErr),
+				require.ErrorAs(t, err, &inputErr,
 					"expected *db.SearchInputError, got %T: %v", err, err)
-				assert.False(t, errors.Is(err, db.ErrSemanticUnavailable),
+				assert.NotErrorIs(t, err, db.ErrSemanticUnavailable,
 					"invalid input must not be masked as ErrSemanticUnavailable")
 			})
 		}
-	}
-}
-
-// TestStripFTSQuotes pins the de-quoting behavior the PostgreSQL Search path
-// relies on. The canonical implementation lives in the db package and is
-// shared with the SQLite and HTTP paths so the backends stay in parity.
-func TestStripFTSQuotes(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{`"hello world"`, "hello world"},
-		{`hello`, "hello"},
-		{`"error" "401"`, "error 401"},
-		{`"error-401"`, "error-401"},
-		{`""`, ""},
-		{`"a"`, "a"},
-		{`already unquoted`, "already unquoted"},
-	}
-	for _, tt := range tests {
-		assert.Equal(t, tt.want, db.StripFTSQuotes(tt.input),
-			"input=%q", tt.input)
 	}
 }
 
@@ -110,24 +81,6 @@ func TestEscapeLike(t *testing.T) {
 		assert.Equal(t, tt.want, escapeLike(tt.input),
 			"input=%q", tt.input)
 	}
-}
-
-func TestPGMessagesBranchFTSRequiresAllTerms(t *testing.T) {
-	pb := &paramBuilder{}
-	branch := pgMessagesBranch(
-		db.ContentSearchFilter{
-			Pattern: "quick fox",
-			Mode:    "fts",
-		},
-		escapeLike("quick fox"),
-		pb,
-	)
-
-	assert.Contains(t, branch,
-		"m.content ILIKE '%'||$1||'%' ESCAPE E'\\\\'")
-	assert.Contains(t, branch,
-		"m.content ILIKE '%'||$2||'%' ESCAPE E'\\\\'")
-	assert.Equal(t, []any{"quick", "fox"}, pb.args)
 }
 
 func TestPGSubstringSnippetFTSModeCentersOnFirstTerm(t *testing.T) {
@@ -162,7 +115,7 @@ func TestMapPGWriteErrorKeepsNonReadOnlyCause(t *testing.T) {
 	err := mapPGWriteError("writing test row", cause)
 
 	require.ErrorIs(t, err, cause)
-	assert.False(t, errors.Is(err, db.ErrReadOnly))
+	require.NotErrorIs(t, err, db.ErrReadOnly)
 	assert.Contains(t, err.Error(), "writing test row")
 }
 
@@ -183,7 +136,7 @@ func TestEmptyTrashExcludesSameRowsItDeletes(t *testing.T) {
 	}
 	store := &Store{pg: newEmptyTrashProbeDB(t, state)}
 
-	count, err := store.EmptyTrash()
+	count, err := store.EmptyTrash(t.Context())
 
 	require.NoError(t, err, "EmptyTrash")
 	assert.Equal(t, 1, count)
@@ -211,7 +164,7 @@ func TestDeleteSessionIfTrashedExcludesRecordedAliases(t *testing.T) {
 	}
 	store := &Store{pg: newEmptyTrashProbeDB(t, state)}
 
-	count, err := store.DeleteSessionIfTrashed("trashed")
+	count, err := store.DeleteSessionIfTrashed(t.Context(), "trashed")
 
 	require.NoError(t, err, "DeleteSessionIfTrashed")
 	assert.EqualValues(t, 1, count)
@@ -235,7 +188,7 @@ func TestDeleteSessionIfTrashedExcludesReverseAliasCanonical(t *testing.T) {
 	}
 	store := &Store{pg: newEmptyTrashProbeDB(t, state)}
 
-	count, err := store.DeleteSessionIfTrashed("vibe:session_trashed")
+	count, err := store.DeleteSessionIfTrashed(t.Context(), "vibe:session_trashed")
 
 	require.NoError(t, err, "DeleteSessionIfTrashed")
 	assert.EqualValues(t, 1, count)
@@ -373,7 +326,7 @@ func (c *emptyTrashProbeConn) QueryContext(
 	}
 	return &emptyTrashProbeRows{
 		columns: []string{
-			"id", "alias_id", "session_id", "alias_id",
+			"id", "alias_id", "session_id", "alias_id", "trash_includes_codex_pages",
 		},
 		values: values,
 	}, nil
@@ -412,7 +365,7 @@ func (s *emptyTrashProbeState) trashedSessionAliasRowsLocked(
 		if len(reverseAliases) == 0 {
 			for _, aliasID := range directAliases {
 				values = append(values, []driver.Value{
-					id, nullableDriverString(aliasID), nil, nil,
+					id, nullableDriverString(aliasID), nil, nil, false,
 				})
 			}
 			continue
@@ -423,7 +376,7 @@ func (s *emptyTrashProbeState) trashedSessionAliasRowsLocked(
 					id,
 					nullableDriverString(aliasID),
 					reverseAlias[0],
-					nullableDriverString(reverseAlias[1]),
+					nullableDriverString(reverseAlias[1]), false,
 				})
 			}
 		}

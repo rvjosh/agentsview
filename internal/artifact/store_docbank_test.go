@@ -8,17 +8,18 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.kenn.io/docbank"
+	"go.kenn.io/docbank/docbank"
 )
 
 func TestDocbankStoreUsesCanonicalNamespaceAndMovesQuarantineNode(t *testing.T) {
+	t.Parallel()
+
 	vault, store := newTestDocbankStore(t, docbank.Config{})
 	ref := requireContractRef(t, contractOrigin, KindCheckpoints, "cp-0000000042.json")
 	body := []byte(`{"origin":"contract-a1b2c3","sequence":42}`)
@@ -31,14 +32,13 @@ func TestDocbankStoreUsesCanonicalNamespaceAndMovesQuarantineNode(t *testing.T) 
 
 	require.NoError(t, store.Quarantine(t.Context(), ref, "semantic validation failed"))
 	_, err = vault.Stat(t.Context(), livePath)
-	assert.ErrorIs(t, err, docbank.ErrNotFound)
+	require.ErrorIs(t, err, docbank.ErrNotFound)
 
 	quarantined := walkDocbankTestEntries(t, vault, docbankQuarantineRoot)
 	require.Len(t, quarantined, 1)
 	assert.Equal(t, live.ID, quarantined[0].Node.ID, "quarantine must move the stable node")
 	assert.Equal(t, live.BlobHash, quarantined[0].Node.BlobHash, "quarantine must not copy content")
-	assert.Regexp(t,
-		regexp.MustCompile(`^/\.quarantine/v1/contract-a1b2c3/checkpoints/[0-9a-f]{32}-cp-0000000042\.json$`),
+	assert.Regexp(t, `^/\.quarantine/v1/contract-a1b2c3/checkpoints/[0-9a-f]{32}-cp-0000000042\.json$`,
 		quarantined[0].Path,
 	)
 
@@ -50,6 +50,8 @@ func TestDocbankStoreUsesCanonicalNamespaceAndMovesQuarantineNode(t *testing.T) 
 }
 
 func TestDocbankStoreRejectsReferenceAndNodeIdentityMismatchBeforeRead(t *testing.T) {
+	t.Parallel()
+
 	vault, store := newTestDocbankStore(t, docbank.Config{})
 	body := []byte("catalog-authorized but incorrectly named content")
 	identity := identityForBytes(t, body)
@@ -63,26 +65,28 @@ func TestDocbankStoreRejectsReferenceAndNodeIdentityMismatchBeforeRead(t *testin
 	require.NoError(t, err)
 
 	_, err = store.Stat(t.Context(), ref)
-	assert.ErrorIs(t, err, ErrArtifactCorrupt)
+	require.ErrorIs(t, err, ErrArtifactCorrupt)
 	_, reader, err := store.Open(t.Context(), ref)
 	assert.Nil(t, reader)
 	assert.ErrorIs(t, err, ErrArtifactCorrupt)
 }
 
 func TestDocbankStorePreservesTypedDocbankCauses(t *testing.T) {
+	t.Parallel()
+
 	_, store := newTestDocbankStore(t, docbank.Config{})
 	ref := requireContractRef(t, contractOrigin, KindCheckpoints, "cp-0000000001.json")
 
 	_, err := store.Stat(t.Context(), ref)
-	assert.ErrorIs(t, err, ErrArtifactNotFound)
-	assert.ErrorIs(t, err, docbank.ErrNotFound)
+	require.ErrorIs(t, err, ErrArtifactNotFound)
+	require.ErrorIs(t, err, docbank.ErrNotFound)
 
 	body := []byte("actual bytes")
 	expected := identityForBytes(t, bytes.Repeat([]byte("x"), len(body)))
-	require.Equal(t, int64(len(body)), expected.Size)
+	require.Equal(t, expected.Size, int64(len(body)))
 	_, err = store.Create(t.Context(), ref, expected, "application/json", bytes.NewReader(body))
-	assert.ErrorIs(t, err, ErrArtifactInvalid)
-	assert.ErrorIs(t, err, docbank.ErrDigestMismatch)
+	require.ErrorIs(t, err, ErrArtifactInvalid)
+	require.ErrorIs(t, err, docbank.ErrDigestMismatch)
 
 	created := createContractArtifact(t, store, ref, body)
 	_, err = store.Create(t.Context(), ref, created.Entry.Identity,
@@ -91,6 +95,8 @@ func TestDocbankStorePreservesTypedDocbankCauses(t *testing.T) {
 }
 
 func TestDocbankStoreClosedOperationsReturnErrClosed(t *testing.T) {
+	t.Parallel()
+
 	_, store := newTestDocbankStore(t, docbank.Config{})
 	ref := requireContractRef(t, contractOrigin, KindCheckpoints, "cp-0000000001.json")
 	body := []byte("closed store")
@@ -100,15 +106,17 @@ func TestDocbankStoreClosedOperationsReturnErrClosed(t *testing.T) {
 
 	_, err := store.Create(t.Context(), ref, identityForBytes(t, body),
 		canonicalArtifactMediaType(ref.Kind), bytes.NewReader(body))
-	assert.ErrorIs(t, err, fs.ErrClosed)
+	require.ErrorIs(t, err, fs.ErrClosed)
 	_, err = store.Stat(t.Context(), ref)
-	assert.ErrorIs(t, err, fs.ErrClosed)
+	require.ErrorIs(t, err, fs.ErrClosed)
 	_, reader, err := store.Open(t.Context(), ref)
 	assert.Nil(t, reader)
 	assert.ErrorIs(t, err, fs.ErrClosed)
 }
 
 func TestDocbankStoreIdempotentRetryDoesNotReportPhysicalWrite(t *testing.T) {
+	t.Parallel()
+
 	_, store := newTestDocbankStore(t, docbank.Config{})
 	ref := requireContractRef(t, contractOrigin, KindCheckpoints, "cp-0000000001.json")
 	body := []byte(`{"origin":"contract-a1b2c3","sequence":1}`)
@@ -127,6 +135,8 @@ func TestDocbankStoreIdempotentRetryDoesNotReportPhysicalWrite(t *testing.T) {
 }
 
 func TestDocbankStoreDistinctReferencesCountOnePhysicalWrite(t *testing.T) {
+	t.Parallel()
+
 	_, store := newTestDocbankStore(t, docbank.Config{})
 
 	body := []byte(`{"origin":"contract-a1b2c3","shared":"physical-content"}`)
@@ -140,7 +150,11 @@ func TestDocbankStoreDistinctReferencesCountOnePhysicalWrite(t *testing.T) {
 }
 
 func TestDocbankIteratorClosesWalkerExactlyOnce(t *testing.T) {
+	t.Parallel()
+
 	t.Run("explicit close", func(t *testing.T) {
+		t.Parallel()
+
 		walker := &docbankWalkerStub{}
 		iterator := &docbankOriginIterator{
 			iterator: docbankIterator{
@@ -157,6 +171,7 @@ func TestDocbankIteratorClosesWalkerExactlyOnce(t *testing.T) {
 	})
 
 	t.Run("cancellation", func(t *testing.T) {
+		t.Parallel()
 		walker := &docbankWalkerStub{}
 		iterator := &docbankOriginIterator{
 			iterator: docbankIterator{
@@ -168,13 +183,15 @@ func TestDocbankIteratorClosesWalkerExactlyOnce(t *testing.T) {
 		cancel()
 
 		_, err := iterator.Next(ctx, 1)
-		assert.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, context.Canceled)
 		assert.Equal(t, 1, walker.closeCalls)
 		_, err = iterator.Next(t.Context(), 1)
 		assert.ErrorIs(t, err, fs.ErrClosed)
 	})
 
 	t.Run("end of iteration", func(t *testing.T) {
+		t.Parallel()
+
 		walker := &docbankWalkerStub{}
 		iterator := &docbankOriginIterator{
 			iterator: docbankIterator{
@@ -184,10 +201,10 @@ func TestDocbankIteratorClosesWalkerExactlyOnce(t *testing.T) {
 		}
 
 		_, err := iterator.Next(t.Context(), 1)
-		assert.ErrorIs(t, err, io.EOF)
+		require.ErrorIs(t, err, io.EOF)
 		assert.Equal(t, 1, walker.closeCalls)
 		_, err = iterator.Next(t.Context(), 1)
-		assert.ErrorIs(t, err, io.EOF)
+		require.ErrorIs(t, err, io.EOF)
 		assert.Equal(t, 1, walker.closeCalls)
 	})
 }
@@ -232,6 +249,23 @@ func newTestDocbankStore(t *testing.T, config docbank.Config) (*docbank.Vault, *
 	store := newDocbankContent(vault)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	return vault, store
+}
+
+func newTestArtifactStore(t *testing.T) *docbankStore {
+	t.Helper()
+	_, store := newTestDocbankStore(t, docbank.Config{})
+	return store
+}
+
+// newProtocolTestStore opens a real isolated Docbank store at root without
+// registering test cleanup. Callers use it for explicit close/reopen protocol
+// and transport scenarios.
+func newProtocolTestStore(root string) (*docbankStore, error) {
+	vault, err := docbank.New(context.Background(), docbank.Config{Root: root})
+	if err != nil {
+		return nil, err
+	}
+	return newDocbankContent(vault), nil
 }
 
 func walkDocbankTestEntries(

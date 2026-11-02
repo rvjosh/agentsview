@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -10,6 +13,7 @@ import (
 	"net/http"
 	httppprof "net/http/pprof"
 	"net/url"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,13 +23,22 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 
+	"go.kenn.io/agentsview/internal/apiclient"
+	"go.kenn.io/agentsview/internal/archivesource"
+	"go.kenn.io/agentsview/internal/codexcloud"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/friction/filing"
+	"go.kenn.io/agentsview/internal/friction/review"
 	"go.kenn.io/agentsview/internal/insight"
-	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/kata"
+	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pricingrefresh"
+	"go.kenn.io/agentsview/internal/rawsync"
+	"go.kenn.io/agentsview/internal/recall/extract"
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/storage"
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/web"
 	"go.kenn.io/kit/daemon"
@@ -37,37 +50,84 @@ type VersionInfo struct {
 	Commit                     string `json:"commit"`
 	BuildDate                  string `json:"build_date"`
 	ReadOnly                   bool   `json:"read_only,omitempty"`
-	InsightGenerationAvailable bool   `json:"insight_generation_available,omitempty"`
-	APIVersion                 int    `json:"api_version"`
-	DataVersion                int    `json:"data_version"`
+	ArchiveOnly                bool   `json:"archive_only,omitempty"`
+	InsightGenerationAvailable bool   `json:"insight_generation_available"`
+	SessionStatsAvailable      bool   `json:"session_stats_available"`
+	FrictionAvailable          bool   `json:"friction_available"`
+	// FrictionReadable reports that this store serves the Friction Log
+	// read routes; mirrors without friction tables omit it.
+	FrictionReadable bool `json:"friction_readable,omitempty"`
+	// FrictionBuildAllowed reports that this request may start a build:
+	// the server has a friction runner and accepts runs from this caller.
+	FrictionBuildAllowed bool `json:"friction_build_allowed"`
+	KataAvailable        bool `json:"kata_available"`
+	APIVersion           int  `json:"api_version"`
+	DataVersion          int  `json:"data_version"`
 }
 
 // APIVersion is shared by HTTP version reporting and local daemon discovery.
 // Bump it when a client-visible contract cannot be decoded safely by an older
 // CLI or daemon.
-const APIVersion = 4
+const (
+	APIVersion = 14
+	// KataAPIVersion is the first daemon API that serves /api/v1/kata/status.
+	KataAPIVersion = 14
+	// FrictionAPIVersion is the first daemon API that serves
+	// /api/v1/friction digests, findings, patterns and runs.
+	FrictionAPIVersion = 13
+	// ScopedWatchPushAPIVersion is the first daemon API that accepts bounded
+	// watcher batches and their authoritative recovery scope on push requests.
+	ScopedWatchPushAPIVersion = 7
+	// SubagentUsageAPIVersion is the first daemon API that guarantees
+	// combined session-usage scope and targeted descendant synchronization.
+	SubagentUsageAPIVersion = 6
+	// UsageRefreshAPIVersion supports usage refresh without waiting for ingestion.
+	UsageRefreshAPIVersion = 12
+)
 
 const daemonService = "agentsview"
 
 const (
 	defaultInsightLogDrainTimeout    = 2 * time.Second
 	defaultInsightLogStopWaitTimeout = 500 * time.Millisecond
+	defaultHTTPReadTimeout           = 10 * time.Second
+	corsAllowedRequestHeaders        = "Content-Type, Authorization, " +
+		service.SemanticSearchIntentHeader + ", " + rawSyncDeviceIDHeader +
+		", " + rawSyncUploadOffsetHeader
+	corsExposedResponseHeaders = rawSyncUploadOffsetHeader + ", " +
+		rawSyncUploadLengthHeader + ", " + rawSyncUploadCompleteHeader + ", Location, " + apiclient.ArchiveStaleHeader
 )
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
-	mu             gosync.RWMutex
-	cfg            config.Config
-	db             db.Store
-	engine         *sync.Engine
-	onDemandEngine *sync.Engine
-	sessions       service.SessionService
-	broadcaster    *Broadcaster
-	mux            *http.ServeMux
-	api            huma.API
-	httpSrv        *http.Server
-	version        VersionInfo
-	dataDir        string
+	modelGroups          service.ModelGroups
+	mu                   gosync.RWMutex
+	cfg                  config.Config
+	activeDisabledAgents []parser.AgentType
+	// ingestionReloader applies saved provider settings to the running
+	// daemon; settingsApplyMu keeps saves and their reloads in order.
+	ingestionReloader IngestionReloader
+	settingsApplyMu   gosync.Mutex
+	// onDemandReconfigureMu serializes source updates to onDemandEngine.
+	onDemandReconfigureMu gosync.Mutex
+	// pushTurn lets one archive push run at a time.
+	pushTurn              pushTurn
+	db                    db.Store
+	activityReports       *activityReportCache
+	assetCache            *assetCache
+	activityReportFlights *activityReportBuildGroup
+	engine                *sync.Engine
+	onDemandEngine        *sync.Engine
+	sessions              service.SessionService
+	broadcaster           *Broadcaster
+	mux                   *http.ServeMux
+	api                   huma.API
+	httpSrv               *http.Server
+	restrictedListener    *RestrictedListener
+	startupProbeKey       []byte
+	version               VersionInfo
+	chrome                chromeHost
+	dataDir               string
 
 	httpRemoteCleanupRegistry *remotesync.CleanupRegistry
 
@@ -82,6 +142,7 @@ type Server struct {
 
 	insightLogDrainTimeout    time.Duration
 	insightLogStopWaitTimeout time.Duration
+	httpReadTimeout           time.Duration
 
 	// handlerDelay is injected before each timeout-wrapped
 	// handler, used only by tests to guarantee handlers
@@ -107,9 +168,11 @@ type Server struct {
 	// activity would otherwise surface. Called synchronously; it must not
 	// block.
 	sessionMutationNotify func()
-	// recallCorpusMutationNotify, when set, is called after an import adds or
-	// supersedes accepted recall entries so semantic mirrors can refresh.
+	// recallCorpusMutationNotify, when set, is called after an import or
+	// extraction-generation action changes accepted recall entries so semantic
+	// mirrors can refresh.
 	recallCorpusMutationNotify func()
+	recallExtractionStatus     RecallExtractionStatusProvider
 
 	// pprofEnabled registers net/http/pprof handlers under
 	// /debug/pprof/ so a running daemon can be profiled. Off by
@@ -136,17 +199,72 @@ type Server struct {
 	// vectorPushSource, when set, supplies the local vectors.db active
 	// generation to the daemon's pg push handler. Nil leaves the vector
 	// push phase skipped, e.g. when [vector] is disabled.
-	vectorPushSource postgres.VectorPushSource
+	vectorPushSource storage.VectorPushSource
+
+	// replicas and mirror are the push backends registered by the
+	// composition root; each gets a daemon push route.
+	replicas []storage.Replica
+	mirror   storage.Mirror
 
 	// localSyncRunner, when set, backs the foreground local-sync HTTP handler
 	// with the worker-backed pass instead of running SyncThenRun in process.
-	localSyncRunner LocalSyncRunner
+	localSyncRunner        LocalSyncRunner
+	archiveSources         *archivesource.Manager
+	onDemandArchiveSources *archivesource.Manager
 
 	// localResyncRunner, when set, backs the foreground full-resync HTTP handler
 	// with the worker-backed build-and-swap instead of an in-process resync.
 	localResyncRunner LocalResyncRunner
 
+	// memoryRefreshRequest queues a background reconciliation for the local
+	// conversation-memory lifecycle hook. It must return immediately and
+	// coalesce duplicate requests outside the HTTP handler.
+	memoryRefreshRequest func()
+
+	// localCompactRunner, when set, backs archive compaction with the daemon's
+	// maintenance barrier instead of allowing a CLI to bypass the writer.
+	localCompactRunner LocalCompactRunner
+
+	// telemetryCapture receives UI telemetry events; nil leaves the route unregistered.
+	telemetryCapture http.Handler
+
+	artifactExchangeRunner ArtifactExchangeRunner
+	rawSyncTenant          string
+	frictionRunner         *review.Runner
+	// kata is the optional Kata spoke connection; never nil after New.
+	kata              *kata.Conn
+	frictionExclusive func(func() error) error
+	rawSyncDeviceAuth RawSyncDeviceAuth
+	rawSyncCustody    RawSyncCustody
+	rawSyncStatus     RawSyncStatusReader
+	codexCloudStatus  *codexcloud.StatusBoard
+	rawSyncSchemaOnly bool
+	rawSyncUploads    RawSyncUploads
+	rawSyncJobHealth  RawSyncJobHealth
+
 	ensurePricing func(context.Context, *db.DB) error
+}
+
+type insightGenerationOptionsContextKey struct{}
+
+func (s *Server) currentInsightGenerateOptions(
+	ctx context.Context,
+) insight.GenerateOptions {
+	if options, ok := ctx.Value(insightGenerationOptionsContextKey{}).(insight.GenerateOptions); ok {
+		return options
+	}
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	return insightGenerateOptions(cfg)
+}
+
+func (s *Server) defaultInsightGenerateStream(
+	ctx context.Context, agent, prompt string, onLog insight.LogFunc,
+) (insight.Result, error) {
+	return insight.GenerateStreamWithOptions(
+		ctx, agent, prompt, onLog, s.currentInsightGenerateOptions(ctx),
+	)
 }
 
 // New creates a new Server.
@@ -164,52 +282,223 @@ func New(
 	// returns db.ErrReadOnly without an engine, while read APIs such as stats
 	// still need the local handle. Non-SQLite stores use the generic read-only
 	// backend.
+	modelGroups := service.NewModelGroups(cfg.ModelAliases)
 	var sessions service.SessionService
 	if local, ok := database.(*db.DB); ok {
-		sessions = service.NewDirectBackend(local, engine)
+		local.SetArchiveContent(cfg.ArchiveContent)
+		sessions = service.NewDirectBackend(local, engine, service.WithModelGroups(modelGroups))
 	} else {
-		sessions = service.NewReadOnlyBackend(database)
+		sessions = service.NewReadOnlyBackend(database, service.WithModelGroups(modelGroups))
 	}
 
 	s := &Server{
 		cfg:                       cfg,
+		modelGroups:               modelGroups,
+		activeDisabledAgents:      append([]parser.AgentType(nil), cfg.DisabledAgents...),
 		db:                        database,
+		activityReports:           newActivityReportCache(),
+		activityReportFlights:     newActivityReportBuildGroup(),
 		engine:                    engine,
 		sessions:                  sessions,
 		mux:                       http.NewServeMux(),
 		httpRemoteCleanupRegistry: new(remotesync.CleanupRegistry),
 		insightLogDrainTimeout:    defaultInsightLogDrainTimeout,
 		insightLogStopWaitTimeout: defaultInsightLogStopWaitTimeout,
+		httpReadTimeout:           defaultHTTPReadTimeout,
 		ensurePricing:             pricingrefresh.EnsureCurrent,
-		generateStreamFunc: func(
-			ctx context.Context, agent, prompt string,
-			onLog insight.LogFunc,
-		) (insight.Result, error) {
-			return insight.GenerateStreamWithOptions(
-				ctx, agent, prompt, onLog,
-				insight.GenerateOptions{
-					Agents: insightAgentConfig(cfg.Agent),
-				},
-			)
-		},
-		spaFS:      dist,
-		spaHandler: http.FileServerFS(dist),
+		spaFS:                     dist,
+		spaHandler:                http.FileServerFS(dist),
 	}
+	s.generateStreamFunc = s.defaultInsightGenerateStream
 	for _, opt := range opts {
 		opt(s)
 	}
+	if s.kata == nil {
+		// Only a local SQLite archive with no PG push target is its own hub.
+		// pg serve passes its own hub Conn; read-only replicas are not hubs.
+		_, local := database.(*db.DB)
+		hub := local && filing.EligibleHost(false, cfg.HasPGPushTarget())
+		s.kata = kata.NewConn(kata.ConfigFrom(cfg.Kata, hub))
+	}
+	eligibility := "disabled"
+	if kataCfg := s.kata.Config(); kataCfg.Enabled {
+		if kataCfg.Hub {
+			eligibility = "hub"
+		} else {
+			eligibility = "not_hub"
+		}
+	}
+	log.Printf("kata: hub eligibility %s", eligibility)
 	if s.version.APIVersion == 0 {
 		s.version.APIVersion = APIVersion
 	}
 	if s.version.DataVersion == 0 {
 		s.version.DataVersion = db.CurrentDataVersion()
 	}
+	s.assetCache = newAssetCache()
 	s.routes()
 	return s
 }
 
+func insightGenerateOptions(cfg config.Config) insight.GenerateOptions {
+	opts := insight.GenerateOptions{Agents: insightAgentConfig(cfg.Agent)}
+	if strings.TrimSpace(cfg.Insights.Endpoint) != "" &&
+		strings.TrimSpace(cfg.Insights.Model) != "" {
+		opts.Endpoint = &insight.EndpointConfig{
+			Endpoint:  cfg.Insights.Endpoint,
+			Model:     cfg.Insights.Model,
+			APIKey:    cfg.Insights.APIKey(),
+			AllowHTTP: cfg.Insights.AllowHTTP,
+		}
+	}
+	return opts
+}
+
+// resolvedInsightDefaultAgent reports the agent insight generation falls back
+// to when a request does not choose one: the configured [insights]
+// default_agent, or the built-in default. Config loading normalizes and
+// validates the configured name.
+func resolvedInsightDefaultAgent(cfg config.Config) string {
+	if cfg.Insights.DefaultAgent != "" {
+		return cfg.Insights.DefaultAgent
+	}
+	return config.DefaultInsightAgent
+}
+
+// insightDefaultAgent reports the default agent for generation requests on
+// this server's current configuration.
+func (s *Server) insightDefaultAgent() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return resolvedInsightDefaultAgent(s.cfg)
+}
+
+// ingestionConfig returns the configuration for local filesystem provider
+// selection as the running daemon applies it. Without an IngestionReloader,
+// settings updates are persisted and reflected by GET immediately, but the
+// running local engine, watchers, and polling keep the startup provider set.
+// Remote import and export ignore DisabledAgents.
+func (s *Server) ingestionConfig() config.Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cfg := s.cfg
+	cfg.DisabledAgents = append(
+		[]parser.AgentType(nil), s.activeDisabledAgents...,
+	)
+	return cfg
+}
+
 // Option configures a Server.
 type Option func(*Server)
+
+// IngestionReloader reloads the saved session provider settings and applies
+// them to the running daemon's sync engine, watchers, and polling. It returns
+// the reloaded configuration once accepted; applying it to the engine may
+// finish in the background.
+type IngestionReloader func(ctx context.Context) (config.Config, error)
+
+// WithIngestionReloader applies provider settings changes without a daemon
+// restart.
+func WithIngestionReloader(r IngestionReloader) Option {
+	return func(s *Server) { s.ingestionReloader = r }
+}
+
+// RawSyncDeviceAuth exchanges device credentials and authenticates scoped
+// raw-transport tokens.
+type RawSyncDeviceAuth interface {
+	AuthenticateCredential(
+		context.Context, string, string,
+	) (rawsync.AuthIdentity, error)
+	IssueToken(
+		context.Context, string, string, rawsync.DeviceTokenScope,
+	) (rawsync.IssuedDeviceToken, error)
+	AuthenticateToken(
+		context.Context, string, rawsync.DeviceTokenScope,
+	) (rawsync.AuthIdentity, error)
+}
+
+// RawSyncCustody exposes authenticated raw-custody control-plane operations.
+type RawSyncCustody interface {
+	MissingObjects(
+		context.Context,
+		rawsync.AuthIdentity,
+		parser.AgentType,
+		[]rawsync.ObjectRef,
+	) ([]rawsync.ObjectRef, error)
+	CommitManifest(
+		context.Context,
+		rawsync.AuthIdentity,
+		rawsync.Manifest,
+	) (rawsync.CommitResult, error)
+}
+
+// RawSyncStatusReader reads authenticated tenant-scoped raw-sync status.
+type RawSyncStatusReader interface {
+	ReadRawSyncStatus(
+		context.Context,
+		rawsync.AuthIdentity,
+	) (rawsync.Status, error)
+}
+
+// RawSyncUploads exposes authenticated resumable raw-object transfers.
+type RawSyncUploads interface {
+	Start(
+		context.Context,
+		rawsync.AuthIdentity,
+		parser.AgentType,
+		rawsync.ObjectRef,
+	) (rawsync.UploadSession, bool, error)
+	Status(
+		context.Context,
+		rawsync.AuthIdentity,
+		string,
+	) (rawsync.UploadSession, error)
+	Append(
+		context.Context,
+		rawsync.AuthIdentity,
+		string,
+		int64,
+		[]byte,
+	) (rawsync.UploadSession, error)
+}
+
+// RawSyncJobHealth exposes read-only tenant-scoped raw parse-job health.
+type RawSyncJobHealth interface {
+	RawJobHealth(
+		context.Context,
+		rawsync.AuthIdentity,
+		rawsync.JobHealthQuery,
+	) (rawsync.JobHealthReport, error)
+}
+
+// WithRawSyncServices enables authenticated raw-sync machine routes.
+func WithRawSyncServices(auth RawSyncDeviceAuth, custody RawSyncCustody) Option {
+	return func(s *Server) {
+		s.rawSyncDeviceAuth = auth
+		s.rawSyncCustody = custody
+	}
+}
+
+// WithRawSyncUploads enables the scoped resumable raw-object data plane.
+func WithRawSyncUploads(uploads RawSyncUploads) Option {
+	return func(s *Server) {
+		s.rawSyncUploads = uploads
+	}
+}
+
+// WithRawSyncStatus enables the authenticated raw-sync status route.
+func WithRawSyncStatus(status RawSyncStatusReader) Option {
+	return func(s *Server) {
+		s.rawSyncStatus = status
+	}
+}
+
+// WithRawSyncJobHealth enables the scoped raw parse-job health read.
+func WithRawSyncJobHealth(health RawSyncJobHealth) Option {
+	return func(s *Server) {
+		s.rawSyncJobHealth = health
+	}
+}
 
 func insightAgentConfig(
 	cfg map[string]config.AgentConfig,
@@ -307,6 +596,16 @@ func WithGenerateStreamFunc(f insight.GenerateStreamFunc) Option {
 	}
 }
 
+// WithFriction attaches the Friction Log review runner. A nil runner leaves
+// the feature unavailable. exclusive serializes on-demand runs with the
+// scheduled catch-up job; nil runs them directly.
+func WithFriction(runner *review.Runner, exclusive func(func() error) error) Option {
+	return func(s *Server) {
+		s.frictionRunner = runner
+		s.frictionExclusive = exclusive
+	}
+}
+
 // WithInsightLogDrainTimeouts overrides SSE insight log stream drain timeouts.
 // Zero or negative values keep the production defaults.
 func WithInsightLogDrainTimeouts(drain, stopWait time.Duration) Option {
@@ -347,10 +646,32 @@ func WithSessionMutationNotifier(fn func()) Option {
 }
 
 // WithRecallCorpusMutationNotifier registers fn to run after a successful
-// import changes the accepted recall corpus. fn must not block; a scheduler's
-// coalescing Notify method is the intended shape.
+// import or generation action changes the accepted recall corpus. fn must not
+// block; a scheduler's coalescing Notify method is the intended shape.
 func WithRecallCorpusMutationNotifier(fn func()) Option {
 	return func(s *Server) { s.recallCorpusMutationNotify = fn }
+}
+
+// RecallExtractionStatusProvider supplies read-only extraction coverage for
+// the Recall page. The model-backed manager satisfies this interface directly.
+type RecallExtractionStatusProvider interface {
+	Status(context.Context) (extract.Status, error)
+}
+
+// RecallExtractionLifecycleController supplies the guarded generation
+// mutations exposed by the Recall page. The model-backed manager implements
+// this interface without exposing force retirement.
+type RecallExtractionLifecycleController interface {
+	Activate(context.Context) error
+	Retire(context.Context, string) error
+}
+
+// WithRecallExtractionStatusProvider exposes extraction coverage through the
+// HTTP API. A nil provider leaves the endpoint available but unconfigured.
+func WithRecallExtractionStatusProvider(
+	provider RecallExtractionStatusProvider,
+) Option {
+	return func(s *Server) { s.recallExtractionStatus = provider }
 }
 
 // WithPprof enables the net/http/pprof handlers under
@@ -373,6 +694,12 @@ func WithLocalSyncRunner(r LocalSyncRunner) Option {
 	return func(s *Server) { s.localSyncRunner = r }
 }
 
+// WithArchiveSources shares the daemon's attached-archive manager with manual
+// sync requests that include local sources.
+func WithArchiveSources(manager *archivesource.Manager) Option {
+	return func(s *Server) { s.archiveSources = manager }
+}
+
 // LocalResyncRunner runs the daemon's foreground full resync, streaming progress
 // to the optional callback and returning the resulting stats. When injected, the
 // resync HTTP handler routes through it (the worker-backed build-and-swap)
@@ -387,13 +714,43 @@ func WithLocalResyncRunner(r LocalResyncRunner) Option {
 	return func(s *Server) { s.localResyncRunner = r }
 }
 
+// WithMemoryRefreshRequester enables the narrow SessionStart refresh route.
+// fn must only enqueue work; the request path must never run reconciliation.
+func WithMemoryRefreshRequester(fn func()) Option {
+	return func(s *Server) { s.memoryRefreshRequest = fn }
+}
+
+// LocalCompactRunner runs staged maintenance against the local SQLite archive.
+// The daemon injects this runner so the command shares the archive-wide
+// maintenance barrier with sync and resync.
+type LocalCompactRunner func(
+	ctx context.Context, options db.CompactOptions,
+) (db.CompactResult, error)
+
+// WithLocalCompactRunner injects the daemon-managed compact runner.
+func WithLocalCompactRunner(r LocalCompactRunner) Option {
+	return func(s *Server) { s.localCompactRunner = r }
+}
+
 func (s *Server) humaConfig() huma.Config {
 	version := s.version.Version
 	if version == "" {
 		version = "dev"
 	}
 	cfg := huma.DefaultConfig("AgentsView API", version)
-	cfg.Info.Description = "HTTP API for browsing, searching, syncing, and managing local agent sessions."
+	jsonFormat := huma.Format{
+		Marshal: func(w io.Writer, value any) error {
+			return json.MarshalWrite(w, value)
+		},
+		Unmarshal: func(data []byte, value any) error {
+			return json.Unmarshal(data, value)
+		},
+	}
+	cfg.Formats = map[string]huma.Format{
+		"application/json": jsonFormat,
+		"json":             jsonFormat,
+	}
+	cfg.Info.Description = "HTTP API for browsing, searching, syncing, and managing local agent sessions. Responses carry X-Agentsview-Archive-Stale: true while a required archive rebuild is pending; GET /api/v1/sync/status reports its state."
 	cfg.OpenAPIPath = "/api/openapi"
 	cfg.DocsPath = ""
 	cfg.SchemasPath = ""
@@ -401,6 +758,14 @@ func (s *Server) humaConfig() huma.Config {
 	cfg.Components.Schemas = huma.NewMapRegistry(
 		"#/components/schemas/",
 		agentsViewSchemaNamer,
+	)
+	cfg.Components.Schemas.RegisterTypeAlias(
+		reflect.TypeFor[jsontext.Value](),
+		reflect.TypeFor[humaArbitraryJSON](),
+	)
+	cfg.Components.Schemas.RegisterTypeAlias(
+		reflect.TypeFor[config.ZoomLevel](),
+		reflect.TypeFor[humaZoomLevel](),
 	)
 	if s.basePath != "" {
 		cfg.Servers = []*huma.Server{{
@@ -411,40 +776,35 @@ func (s *Server) humaConfig() huma.Config {
 	return cfg
 }
 
+// humaArbitraryJSON gives Huma the OpenAPI shape for jsontext.Value. Runtime
+// encoding still uses jsontext.Value directly through JSON v2.
+type humaArbitraryJSON []byte
+
+func (humaArbitraryJSON) Schema(huma.Registry) *huma.Schema {
+	return &huma.Schema{}
+}
+
 func (s *Server) routes() {
-	configureHumaErrors()
+	configureHuma()
 	s.api = humago.New(s.mux, s.humaConfig())
 	s.registerTypedAPIRoutes()
+	s.registerMemoryRefreshRoute()
+	s.registerTelemetryCaptureRoute()
 
 	if s.pprofEnabled {
-		s.mux.HandleFunc("/debug/pprof/", httppprof.Index)
-		s.mux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
-		s.mux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
-		s.mux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
-		s.mux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
+		s.handleHTTP(&huma.Operation{Method: http.MethodGet, Path: "/debug/pprof/", Hidden: true}, httppprof.Index)
+		s.handleHTTP(&huma.Operation{Method: http.MethodGet, Path: "/debug/pprof/cmdline", Hidden: true}, httppprof.Cmdline)
+		s.handleHTTP(&huma.Operation{Method: http.MethodGet, Path: "/debug/pprof/profile", Hidden: true}, httppprof.Profile)
+		s.handleHTTP(&huma.Operation{Method: http.MethodGet, Path: "/debug/pprof/symbol", Hidden: true}, httppprof.Symbol)
+		s.handleHTTP(&huma.Operation{Method: http.MethodPost, Path: "/debug/pprof/symbol", Hidden: true}, httppprof.Symbol)
+		s.handleHTTP(&huma.Operation{Method: http.MethodGet, Path: "/debug/pprof/trace", Hidden: true}, httppprof.Trace)
 	}
 
-	s.mux.Handle("GET /api/v1/recall/entries", s.withTimeout(
-		"GET /api/v1/recall/entries",
-		s.handleListRecallEntries,
-	))
-	s.mux.Handle("GET /api/v1/recall/entries/{id}", s.withTimeout(
-		"GET /api/v1/recall/entries/{id}",
-		s.handleGetRecallEntry,
-	))
-	s.mux.Handle("POST /api/v1/recall/query", s.withTimeout(
-		"POST /api/v1/recall/query",
-		s.handleQueryRecallEntries,
-	))
-	s.mux.Handle("POST /api/v1/recall/import", s.withTimeout(
-		"POST /api/v1/recall/import",
-		s.handleImportRecallEntries,
-	))
 	s.registerEvalIngestRoutes()
 
 	// SPA fallback: serve embedded frontend
 	// Do not use timeout handler for static assets to avoid buffering.
-	s.mux.Handle("/", http.HandlerFunc(s.handleSPA))
+	s.handleHTTP(&huma.Operation{Method: http.MethodGet, Path: "/", Hidden: true}, s.handleSPA)
 }
 
 func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
@@ -577,7 +937,7 @@ func (s *Server) Handler() http.Handler {
 				s.protectedPath,
 				corsMiddleware(
 					allowedOrigins, bindAll, s.cfg.Port, bindAllIPs,
-					gzipMiddleware(logMiddleware(s.mux)),
+					gzipMiddleware(logMiddleware(s.archiveStaleMiddleware(s.mux))),
 				),
 			),
 		),
@@ -607,6 +967,65 @@ func (s *Server) Handler() http.Handler {
 	}
 	h = s.idle.Wrap(h)
 	return h
+}
+
+// Archive probes report readiness rather than archive results.
+func archiveFreshnessProbe(path string) bool {
+	switch path {
+	case "/api/ping", "/api/v1/version", "/api/v1/sync/status":
+		return true
+	}
+	return false
+}
+
+func (s *Server) archiveStaleMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			if !archiveFreshnessProbe(r.URL.Path) && s.archiveStale() {
+				w.Header().Set(apiclient.ArchiveStaleHeader, "true")
+				// Session sync returns its stale-archive conflict through the route.
+				if archiveWriteRequest(r) && r.URL.Path != "/api/v1/sessions/sync" {
+					if local, ok := s.db.(*db.DB); ok && local.WriterClosed() {
+						response := writerClosedResponse(w.Header().Add, true)
+						writeError(w, response.Status, response.Message)
+						return
+					}
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Read-style POSTs and writes outside SQLite remain available during a rebuild.
+func archiveWriteRequest(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+	default:
+		return false
+	}
+	path := r.URL.Path
+	switch path {
+	case "/api/v1/sync":
+		query := r.URL.Query()
+		value := query.Get("startup_only")
+		startupOnly, _ := strconv.ParseBool(value)
+		startupOnly = startupOnly || query.Has("startup_only") && value == ""
+		return !startupOnly
+	case "/api/v1/recall/import":
+		return r.URL.Query().Get("dry_run") != "true"
+	case "/api/v1/settings", "/api/v1/recall/query", "/api/v1/settings/worktree-mappings/preview", "/api/v1/data/strip-images/preview", "/api/v1/memory/refresh", "/api/v1/raw-sync/tokens":
+		return false
+	}
+	for _, prefix := range []string{"/api/v1/config/", "/api/v1/telemetry/", "/api/v1/remote-sync/", "/api/v1/embeddings/", "/api/v1/raw-sync/uploads", "/api/v1/import/claude-ai/sync/results/"} {
+		if strings.HasPrefix(path, prefix) {
+			return false
+		}
+	}
+	if strings.HasSuffix(path, "/publish") && (strings.HasPrefix(path, "/api/v1/sessions/") || strings.HasPrefix(path, "/api/v1/insights/")) {
+		return false
+	}
+	return !strings.HasPrefix(path, "/api/v1/sessions/") || (!strings.HasSuffix(path, "/resume") && !strings.HasSuffix(path, "/open"))
 }
 
 // cspMiddleware sets a Content-Security-Policy header on non-API
@@ -673,7 +1092,7 @@ func buildCSPPolicy(
 		"default-src %[1]s; "+
 			"script-src %[1]s; "+
 			"connect-src 'self' http: https: ws: wss:; "+
-			"img-src %[1]s data:; "+
+			"img-src %[1]s data: blob:; "+
 			"style-src %[1]s 'unsafe-inline' https://fonts.googleapis.com; "+
 			"font-src %[1]s data: https://fonts.gstatic.com; "+
 			"object-src 'none'; "+
@@ -1014,7 +1433,7 @@ func (s *Server) ListenAndServe() error {
 			Network: daemon.NetworkTCP,
 			Address: addr,
 		},
-		daemon.WithRuntimeStore(daemon.RuntimeStore{Dir: s.dataDir}),
+		daemon.WithRuntimeStore(daemon.RuntimeStore{Dir: config.RuntimeDir(s.dataDir)}),
 	)
 	if err != nil {
 		return err
@@ -1028,7 +1447,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	srv := &http.Server{
 		Addr:        addr,
 		Handler:     s.Handler(),
-		ReadTimeout: 10 * time.Second,
+		ReadTimeout: s.httpReadTimeout,
 		IdleTimeout: 120 * time.Second,
 	}
 	if s.baseCtx != nil {
@@ -1040,56 +1459,177 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.mu.Lock()
 	s.httpSrv = srv
 	s.mu.Unlock()
+	if cache := s.activityReports; cache != nil {
+		cacheCtx := context.Background()
+		if s.baseCtx != nil {
+			cacheCtx = s.baseCtx
+		}
+		cacheCtx, stopCache := context.WithCancel(cacheCtx)
+		go cache.Run(cacheCtx)
+		defer stopCache()
+	}
+	if cache := s.assetCache; cache != nil {
+		cacheCtx := context.Background()
+		if s.baseCtx != nil {
+			cacheCtx = s.baseCtx
+		}
+		cacheCtx, stopCache := context.WithCancel(cacheCtx)
+		cacheDone := make(chan struct{})
+		go func() {
+			cache.Run(cacheCtx)
+			close(cacheDone)
+		}()
+		defer func() {
+			stopCache()
+			<-cacheDone
+		}()
+	}
 	log.Printf("Starting server at http://%s", addr)
 	return srv.Serve(ln)
 }
 
-// Shutdown gracefully shuts down the HTTP server, then closes the
-// server-owned on-demand sync engine (if one was lazily created) so
-// its pending debounced signal recomputes flush while the DB is
-// still open. Injected engines are closed by their owner.
+// Shutdown gracefully shuts down the HTTP server, stops its on-demand archive
+// drain, then closes its on-demand engine so pending signal recomputes flush
+// while the DB is still open. Injected managers and engines keep their owner.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.RLock()
 	srv := s.httpSrv
+	ingress := s.restrictedListener
 	s.mu.RUnlock()
 	var err error
-	if srv != nil {
-		err = srv.Shutdown(ctx)
+	shutdownErrors := make(chan error, 2)
+	shutdownCount := 0
+	if ingress != nil {
+		shutdownCount++
+		go func() { shutdownErrors <- ingress.shutdown(ctx) }()
 	}
+	if srv != nil {
+		shutdownCount++
+		go func() { shutdownErrors <- srv.Shutdown(ctx) }()
+	}
+	for range shutdownCount {
+		err = errors.Join(err, <-shutdownErrors)
+	}
+	s.chrome.shutdown()
 	s.mu.Lock()
 	engine := s.onDemandEngine
 	s.onDemandEngine = nil
+	attachments := s.onDemandArchiveSources
+	s.onDemandArchiveSources = nil
 	s.mu.Unlock()
+	if attachments != nil {
+		attachments.Close()
+	}
 	if engine != nil {
 		engine.Close()
 	}
 	return err
 }
 
-// FindAvailablePort finds an available port starting from the
-// given port, binding to the specified host.
-func FindAvailablePort(host string, start int) int {
+// FindAvailablePort finds an available port starting from the given port,
+// binding to the specified host. It returns an error instead of reusing an
+// occupied port when the candidate range is exhausted.
+func FindAvailablePort(ctx context.Context, host string, start int) (int, error) {
+	return findAvailablePort(ctx, host, start, selectEphemeralPort)
+}
+
+func findAvailablePort(ctx context.Context,
+	host string,
+	start int,
+	selectEphemeral func(context.Context, string) (int, error),
+) (int, error) {
 	if start == 0 {
-		addr := net.JoinHostPort(host, "0")
-		ln, err := net.Listen("tcp", addr)
-		if err == nil {
-			defer ln.Close()
-			if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
-				return tcpAddr.Port
+		if !isWildcardListenHost(host) {
+			return selectEphemeral(ctx, host)
+		}
+		probes := listenProbes(ctx, host)
+		for range 100 {
+			port, err := selectEphemeral(ctx, host)
+			if err != nil {
+				return 0, err
+			}
+			if listenProbesFree(ctx, probes, port) {
+				return port, nil
 			}
 		}
-		return start
+		return 0, fmt.Errorf(
+			"no available ephemeral port on %s after 100 attempts", host,
+		)
 	}
 
-	for port := start; port < start+100; port++ {
-		addr := net.JoinHostPort(host, strconv.Itoa(port))
-		ln, err := net.Listen("tcp", addr)
-		if err == nil {
-			ln.Close()
-			return port
+	probes := listenProbes(ctx, host)
+	last := min(start+99, 65535)
+	for port := start; port <= last; port++ {
+		if listenProbesFree(ctx, probes, port) {
+			return port, nil
 		}
 	}
-	return start
+	return 0, fmt.Errorf(
+		"no available port on %s in range %d-%d", host, start, last,
+	)
+}
+
+func selectEphemeralPort(ctx context.Context, host string) (int, error) {
+	addr := net.JoinHostPort(host, "0")
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
+	if err != nil {
+		return 0, fmt.Errorf("select ephemeral port on %s: %w", host, err)
+	}
+	defer ln.Close()
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
+		return tcpAddr.Port, nil
+	}
+	return 0, fmt.Errorf("listener on %s did not return a TCP address", host)
+}
+
+type listenProbe struct {
+	network string
+	host    string
+}
+
+func isWildcardListenHost(host string) bool {
+	return host == "" || host == "0.0.0.0" || host == "::"
+}
+
+// listenProbes returns the bind attempts that must all succeed before a
+// port counts as available on host. Wildcard hosts probe the IPv4 and IPv6
+// wildcard addresses separately: a combined dual-stack listen can succeed
+// on one family while an unrelated process still owns the port on the
+// other (observed on macOS), handing out a port the server cannot fully
+// claim. A family that cannot bind at all (for example IPv6-disabled
+// hosts) is excluded from the check rather than treated as occupied.
+func listenProbes(ctx context.Context, host string) []listenProbe {
+	if !isWildcardListenHost(host) {
+		return []listenProbe{{network: "tcp", host: host}}
+	}
+	var probes []listenProbe
+	for _, probe := range []listenProbe{
+		{network: "tcp4", host: "0.0.0.0"},
+		{network: "tcp6", host: "::"},
+	} {
+		ln, err := (&net.ListenConfig{}).Listen(ctx, probe.network, net.JoinHostPort(probe.host, "0"))
+		if err != nil {
+			continue
+		}
+		ln.Close()
+		probes = append(probes, probe)
+	}
+	if len(probes) == 0 {
+		return []listenProbe{{network: "tcp", host: host}}
+	}
+	return probes
+}
+
+func listenProbesFree(ctx context.Context, probes []listenProbe, port int) bool {
+	for _, probe := range probes {
+		addr := net.JoinHostPort(probe.host, strconv.Itoa(port))
+		ln, err := (&net.ListenConfig{}).Listen(ctx, probe.network, addr)
+		if err != nil {
+			return false
+		}
+		ln.Close()
+	}
+	return true
 }
 
 // isMutating returns true for HTTP methods that change state.
@@ -1117,12 +1657,13 @@ func corsMiddleware(
 				ensureVaryHeader(w.Header(), "Origin")
 				w.Header().Set(
 					"Access-Control-Allow-Methods",
-					"GET, POST, PUT, PATCH, DELETE, OPTIONS",
+					"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
 				)
 				w.Header().Set(
 					"Access-Control-Allow-Headers",
-					"Content-Type, Authorization, "+service.SemanticSearchIntentHeader,
+					corsAllowedRequestHeaders,
 				)
+				w.Header().Set("Access-Control-Expose-Headers", corsExposedResponseHeaders)
 				if r.Method == http.MethodOptions {
 					w.WriteHeader(http.StatusNoContent)
 					return
@@ -1154,12 +1695,13 @@ func corsMiddleware(
 			ensureVaryHeader(w.Header(), "Origin")
 			w.Header().Set(
 				"Access-Control-Allow-Methods",
-				"GET, POST, PUT, PATCH, DELETE, OPTIONS",
+				"GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
 			)
 			w.Header().Set(
 				"Access-Control-Allow-Headers",
-				"Content-Type, Authorization, "+service.SemanticSearchIntentHeader,
+				corsAllowedRequestHeaders,
 			)
+			w.Header().Set("Access-Control-Expose-Headers", corsExposedResponseHeaders)
 			if r.Method == http.MethodOptions {
 				if !safeForReads {
 					http.Error(
@@ -1203,7 +1745,7 @@ func isAllowedBindAllOrigin(origin string, port int, allowedIPs map[string]bool)
 		return false
 	}
 	gotPort := u.Port()
-	portOK := false
+	var portOK bool
 	if port == 80 {
 		portOK = gotPort == "" || gotPort == "80"
 	} else {
@@ -1255,3 +1797,6 @@ func logMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// WithRawSyncTenant binds every raw credential/token identity before route work.
+func WithRawSyncTenant(tenant string) Option { return func(s *Server) { s.rawSyncTenant = tenant } }

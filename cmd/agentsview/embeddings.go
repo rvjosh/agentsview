@@ -3,15 +3,15 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net/http"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -19,8 +19,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/kit/embedconfig"
+	"go.kenn.io/kit/embedmodel"
 	kitvec "go.kenn.io/kit/vector"
 
+	"go.kenn.io/agentsview/internal/apiclient"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/vector"
@@ -42,7 +45,7 @@ const fingerprintDisplayLen = 12
 // embeddingsDaemonHTTPClient bounds each individual request the embeddings
 // daemon client makes (build/status/list/activate/retire) so a wedged
 // daemon cannot hang the CLI forever, matching the timeout other daemon
-// HTTP clients in this codebase use (internal/service/http.go's
+// HTTP clients in this codebase use (internal/servicehttp/http.go's
 // httpBackend.client). This is a per-request timeout, not a deadline on the
 // overall command: buildViaDaemon's poll loop issues one status call every
 // embeddingsPollInterval, so a build that legitimately runs for longer than
@@ -109,13 +112,13 @@ func newEmbeddingsBuildCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&opts.RepairInvalid, "repair-invalid", false,
 		"Regenerate only documents with malformed, non-finite, or zero-norm stored vectors")
 	cmd.Flags().BoolVar(&opts.Yes, "yes", false,
-		"Skip the full-rebuild confirmation prompt")
+		"Skip the full-rebuild confirmation prompt; local downloads still ask")
 	cmd.Flags().StringVar(&opts.Using, "using", "",
 		"Named embeddings server from [vector.embeddings.servers] to run this "+
 			"build against (default: the config's default_server)")
 	cmd.Flags().BoolVar(&opts.IncludeAutomated, "include-automated", false,
 		"Override [vector].include_automated for this build only: bare "+
-			"--include-automated embeds automated (non-interactive) sessions "+
+			"--include-automated embeds roborev-tagged or prompt-pattern matched runs "+
 			"too, and --include-automated=false force-excludes them even if "+
 			"the config default is true. Prefer setting the config key for "+
 			"scheduled builds: mixing this flag with a different config "+
@@ -229,6 +232,9 @@ func parseGenerationID(raw string) (int64, error) {
 // requireVectorEnabled rejects every embeddings subcommand up front when
 // [vector] is not configured, with the exact message the brief specifies.
 func requireVectorEnabled(cfg config.Config) error {
+	if cfg.ArchiveContent.UsageOnly() {
+		return fmt.Errorf("%w: embeddings require transcript content", db.ErrArchiveContentExcluded)
+	}
 	if !cfg.Vector.Enabled {
 		return errors.New(
 			"vector search is not enabled: set [vector] enabled = true in config.toml",
@@ -241,9 +247,9 @@ func requireVectorEnabled(cfg config.Config) error {
 // Generation identity Build/Fill fingerprint against. Defined once here so
 // the daemon serve wiring (Task 16) can reuse the exact same mapping.
 // doc_unit_scheme and chunk_overlap_chars are part of the fingerprint so
-// that changing the run-grouped document scheme or the chunk overlap
-// formula (vector.ChunkOverlap) cuts a new generation rather than silently
-// reusing embeddings built under the old scheme.
+// that changing either value cuts a new generation. Run caps preserve
+// run_v1 and reuse embeddings by content hash; run_max_runes metadata and
+// mirror schema version "4" track the cap separately.
 func vectorGeneration(c config.VectorEmbeddingsConfig) kitvec.Generation {
 	params := map[string]string{
 		"max_input_chars":     strconv.Itoa(c.MaxInputChars),
@@ -289,59 +295,92 @@ func recallVectorGeneration(
 	return gen
 }
 
-// newVectorEncoder builds the OpenAI-compatible embeddings encoder for one
-// named server ("" means the default), combining the global model identity
-// and caller-selected role prefix with that server's transport settings.
+// vectorSpace describes gen's embedding space with kit's shared descriptor.
+// Generations stay keyed by agentsview's own fingerprint, which covers both
+// the vector space and the input recipe (unit scheme, chunk size and overlap,
+// corpus), so Legacy holds gen's fingerprint and existing generations keep
+// matching without a re-embed. A genuine model or recipe change produces a
+// different fingerprint and still cuts a new generation.
+func vectorSpace(c config.VectorEmbeddingsConfig, gen kitvec.Generation) embedmodel.Descriptor {
+	return embedmodel.Descriptor{
+		Model: c.EmbedModel(),
+		Roles: c.EmbedRoles(),
+		Input: embedconfig.InputLimits{
+			Recipe: fmt.Sprintf("agentsview/%s/max_input_chars=%s/chunk_overlap_chars=%s",
+				gen.Params["doc_unit_scheme"], gen.Params["max_input_chars"],
+				gen.Params["chunk_overlap_chars"]),
+			ContentID: gen.Params[vector.CorpusFingerprintParam],
+		},
+		Legacy: []string{gen.Fingerprint()},
+	}
+}
+
+// newVectorEncoder builds the embeddings encoder for role on one named
+// server ("" means the default), combining the global model identity with
+// that server's transport settings.
 func newVectorEncoder(
-	c config.VectorEmbeddingsConfig, serverName, inputPrefix string,
+	c config.VectorEmbeddingsConfig, serverName string, role embedconfig.Role, retryRateLimits bool,
 ) (kitvec.EncodeFunc, error) {
 	name, server, err := c.Server(serverName)
 	if err != nil {
 		return nil, err
 	}
-	timeout, err := time.ParseDuration(server.Timeout)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"parsing [vector.embeddings.servers.%s] timeout %q: %w", name, server.Timeout, err)
+	if server.Endpoint == "" {
+		return lazyLocalEncoder(c, name, server, role, retryRateLimits), nil
 	}
-	return vector.NewEncoder(vector.EncoderConfig{
-		Endpoint:          server.Endpoint,
-		APIKey:            server.APIKey(),
-		Model:             c.Model,
-		Dimension:         c.Dimension,
-		RequestDimensions: c.RequestDimensions,
-		Timeout:           timeout,
-		MaxRetries:        server.MaxRetries,
-		InputPrefix:       inputPrefix,
-		InputSuffix:       c.InputSuffix,
-	}), nil
+	transport, err := server.EmbedTransport()
+	if err != nil {
+		return nil, fmt.Errorf("[vector.embeddings.servers.%s] %w", name, err)
+	}
+	enc, err := vector.NewEncoder(vector.EncoderConfig{
+		Model:               c.EmbedModel(),
+		Roles:               c.EmbedRoles(),
+		Deployment:          server.EmbedDeployment(),
+		Transport:           transport,
+		APIKey:              server.APIKey(),
+		OllamaMetalRecovery: server.OllamaCPUFallback,
+		MaxRetries:          server.MaxRetries,
+		RetryRateLimits:     retryRateLimits,
+	}, role)
+	if err != nil {
+		return nil, fmt.Errorf("[vector.embeddings.servers.%s] %w", name, err)
+	}
+	return enc, nil
 }
 
 // newVectorQueryEncoder builds the default or named server encoder used only
-// for search queries.
+// for search queries. Queries are latency-sensitive, so a 429 fails fast
+// through the normal MaxRetries budget rather than retrying indefinitely.
 func newVectorQueryEncoder(
 	c config.VectorEmbeddingsConfig, serverName string,
 ) (kitvec.EncodeFunc, error) {
-	return newVectorEncoder(c, serverName, c.QueryPrefix)
+	return newVectorEncoder(c, serverName, embedconfig.RoleQuery, false)
 }
 
 // newVectorDocumentEncoder builds the default or named server encoder used
-// only for document builds and repairs.
+// only for document builds and repairs. Document builds are long-running and
+// durable (progress survives a restart), so a 429 is retried until it clears
+// rather than aborting the whole build.
 func newVectorDocumentEncoder(
 	c config.VectorEmbeddingsConfig, serverName string,
 ) (kitvec.EncodeFunc, error) {
-	return newVectorEncoder(c, serverName, c.DocumentPrefix)
+	return newVectorEncoder(c, serverName, embedconfig.RoleDocument, true)
 }
 
-// vectorDocumentEncoderSet builds one document encoder per configured
+// vectorDocumentEncoderSet builds one document encoder per available
 // embeddings server, so a Manager can run any build against the server the
 // request names without sharing the query recipe.
 func vectorDocumentEncoderSet(c config.VectorEmbeddingsConfig) (vector.EncoderSet, error) {
+	names := c.ServerNames()
 	set := vector.EncoderSet{
 		Default: c.ResolvedDefaultServer(),
-		ByName:  make(map[string]vector.ManagedEncoder, len(c.Servers)),
+		ByName:  make(map[string]vector.ManagedEncoder, len(names)),
 	}
-	for name, server := range c.Servers {
+	for _, name := range names {
+		_, server, err := c.Server(name)
+		if err != nil {
+			return vector.EncoderSet{}, err
+		}
 		enc, err := newVectorDocumentEncoder(c, name)
 		if err != nil {
 			return vector.EncoderSet{}, err
@@ -349,8 +388,10 @@ func vectorDocumentEncoderSet(c config.VectorEmbeddingsConfig) (vector.EncoderSe
 		set.ByName[name] = vector.ManagedEncoder{
 			Encode: enc,
 			Settings: vector.EncodeSettings{
-				BatchSize:   server.BatchSize,
-				Concurrency: server.Concurrency,
+				BatchSize:          server.BatchSize,
+				ModelContextTokens: c.ModelContextTokens,
+				MaxBatchTokens:     server.MaxBatchTokens,
+				Concurrency:        server.Concurrency,
 			},
 		}
 	}
@@ -364,7 +405,7 @@ func vectorDocumentEncoderSet(c config.VectorEmbeddingsConfig) (vector.EncoderSe
 func runEmbeddingsBuild(
 	ctx context.Context, out io.Writer, in io.Reader, opts EmbeddingsBuildOptions,
 ) error {
-	cfg, err := config.LoadMinimal()
+	cfg, err := loadDaemonClientConfig(config.ScopeVector)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -382,9 +423,10 @@ func runEmbeddingsBuild(
 	}
 	includeAutomated = spec.NormalizeIncludeAutomated(includeAutomated)
 
+	confirmation := bufio.NewScanner(in)
 	if opts.FullRebuild && !opts.Yes {
 		proceed, err := confirmFullRebuild(
-			ctx, in, out, cfg, includeAutomated, spec.Name,
+			ctx, confirmation, out, cfg, includeAutomated, spec.Name,
 		)
 		if err != nil {
 			return err
@@ -395,9 +437,7 @@ func runEmbeddingsBuild(
 		}
 	}
 
-	// Resolve --using against this config up front so a mistyped name fails
-	// with the full server list instead of a daemon-side error.
-	if _, _, err := cfg.Vector.Embeddings.Server(opts.Using); err != nil {
+	if err := prepareLocalEmbeddings(ctx, cfg.Vector.Embeddings, opts.Using, confirmation, out); err != nil {
 		return err
 	}
 
@@ -420,7 +460,7 @@ func runEmbeddingsBuild(
 // documents (user messages and assistant runs) in the archive under
 // includeAutomated's scope — the exact set a full rebuild re-embeds.
 func confirmFullRebuild(
-	ctx context.Context, in io.Reader, out io.Writer, cfg config.Config,
+	ctx context.Context, in *bufio.Scanner, out io.Writer, cfg config.Config,
 	includeAutomated bool, store string,
 ) (bool, error) {
 	n, err := countEmbeddingStoreUnits(ctx, cfg, includeAutomated, store)
@@ -428,13 +468,13 @@ func confirmFullRebuild(
 		return false, fmt.Errorf("counting documents: %w", err)
 	}
 	msg := fmt.Sprintf("This re-embeds all %d documents. Continue?", n)
-	return confirm(in, out, msg), nil
+	return confirmScanned(in, out, msg), nil
 }
 
 func countEmbeddingStoreUnits(
 	ctx context.Context, cfg config.Config, includeAutomated bool, store string,
 ) (int, error) {
-	archiveDB, err := openReadOnlyDB(cfg)
+	archiveDB, err := openReadOnlyDB(ctx, cfg)
 	if err != nil {
 		return 0, err
 	}
@@ -446,7 +486,7 @@ func countEmbeddingStoreUnits(
 	}
 	var n int
 	if _, err := source.ScanEmbeddableUnits(
-		ctx, "", includeAutomated, func(db.EmbeddableUnit) error {
+		ctx, "", includeAutomated, vector.RunMaxRunes(cfg.Vector.Embeddings.MaxInputChars), func(db.EmbeddableUnit) error {
 			n++
 			return nil
 		},
@@ -468,7 +508,7 @@ func runEmbeddingsBuildDirect(
 	}
 	defer lock.Close()
 
-	archiveDB, err := openReadOnlyDB(cfg)
+	archiveDB, err := openReadOnlyDB(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("opening archive database: %w", err)
 	}
@@ -501,7 +541,7 @@ type recallEmbeddingSource struct {
 }
 
 func (s recallEmbeddingSource) ScanEmbeddableUnits(
-	ctx context.Context, since string, _ bool,
+	ctx context.Context, since string, _ bool, _ int,
 	fn func(db.EmbeddableUnit) error,
 ) (string, error) {
 	return s.db.ScanRecallEmbeddingUnits(
@@ -547,8 +587,14 @@ func embeddingManager(
 	cfg config.Config, store string,
 ) *vector.Manager {
 	if store != vector.RecallIndexSpec().Name {
-		return vector.NewManager(
-			ix, database, encoders, vectorGeneration(cfg.Vector.Embeddings),
+		gen := vectorGeneration(cfg.Vector.Embeddings)
+		target := vector.BuildTarget{
+			Source: database, Generation: gen,
+			Space: vectorSpace(cfg.Vector.Embeddings, gen),
+		}
+		return vector.NewResolvingManager(
+			ix, encoders, gen,
+			func(context.Context) (vector.BuildTarget, error) { return target, nil },
 		)
 	}
 	return vector.NewResolvingManager(
@@ -561,6 +607,7 @@ func embeddingManager(
 			)
 			return vector.BuildTarget{
 				Source: source, Generation: generation, CorpusRevision: revision,
+				Space: vectorSpace(cfg.Vector.Embeddings, generation),
 			}, err
 		},
 	)
@@ -627,8 +674,8 @@ func buildViaDaemon(
 	ctx context.Context, out io.Writer, client embeddingsDaemonClient, req vector.BuildRequest,
 ) error {
 	if err := client.startBuild(ctx, req); err != nil {
-		var apiErr *daemonAPIError
-		if errors.As(err, &apiErr) && apiErr.status == http.StatusConflict {
+		apiErr, hasApiErr := errors.AsType[*daemonAPIError](err)
+		if hasApiErr && apiErr.status == http.StatusConflict {
 			fmt.Fprintln(out, "a build is already running (daemon)")
 		} else {
 			return err
@@ -745,7 +792,7 @@ func printBuildSummary(w io.Writer, result vector.BuildResult) {
 // display, including entries fetched from the daemon (which does not send
 // one because the selected store is already explicit in the request).
 func runEmbeddingsList(ctx context.Context, out io.Writer, jsonOutput bool, store string) error {
-	cfg, err := config.LoadMinimal()
+	cfg, err := loadDaemonClientConfig(config.ScopeVector)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -782,9 +829,10 @@ func runEmbeddingsList(ctx context.Context, out io.Writer, jsonOutput bool, stor
 		if gens == nil {
 			gens = []vector.GenerationInfo{}
 		}
-		return json.NewEncoder(out).Encode(struct {
+		return json.MarshalEncode(jsontext.NewEncoder(out), struct {
 			Generations []vector.GenerationInfo `json:"generations"`
 		}{gens})
+
 	}
 	printGenerationsTable(out, gens)
 	return nil
@@ -840,7 +888,7 @@ func truncateFingerprint(fp string) string {
 func runEmbeddingsGenerationAction(
 	ctx context.Context, out io.Writer, id int64, force, retire bool, store string,
 ) error {
-	cfg, err := config.LoadMinimal()
+	cfg, err := loadDaemonClientConfig(config.ScopeVector)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -910,6 +958,9 @@ func directGenerationAction(
 // HTTP client for its embeddings API. Callers only reach it after
 // IsLocalDaemonActive reported true.
 func resolveEmbeddingsDaemonClient(cfg config.Config) (embeddingsDaemonClient, error) {
+	if err := cfg.ApplyDeploymentAuth(); err != nil {
+		return embeddingsDaemonClient{}, fmt.Errorf("loading daemon auth: %w", err)
+	}
 	rt := FindWritableDaemonRuntime(cfg.DataDir, cfg.AuthToken)
 	if rt == nil {
 		if _, err := findIncompatibleWritableDaemonRuntime(
@@ -940,55 +991,103 @@ type daemonAPIError struct {
 
 func (e *daemonAPIError) Error() string { return e.message }
 
-// daemonBuildRequest is the wire form of a CLI-initiated daemon build.
-// include_automated is always sent (no omitempty): the CLI has already
-// resolved the config-plus-flag scope, and the daemon treats an omitted
-// field as "use my configured scope" — which would silently discard an
-// explicit `--include-automated=false` override when the daemon's config
-// says true.
-type daemonBuildRequest struct {
-	Store            string `json:"store,omitempty"`
-	FullRebuild      bool   `json:"full_rebuild,omitempty"`
-	Backstop         bool   `json:"backstop,omitempty"`
-	RepairInvalid    bool   `json:"repair_invalid,omitempty"`
-	IncludeAutomated bool   `json:"include_automated"`
-	Using            string `json:"using,omitempty"`
-}
-
 func (c embeddingsDaemonClient) startBuild(ctx context.Context, req vector.BuildRequest) error {
-	wire := daemonBuildRequest{
-		Store:            req.Store,
-		FullRebuild:      req.FullRebuild,
-		Backstop:         req.Backstop,
-		RepairInvalid:    req.RepairInvalid,
-		IncludeAutomated: req.IncludeAutomated,
-		Using:            req.Using,
+	api, err := apiclient.NewHTTPClient(c.baseURL, c.token, embeddingsDaemonHTTPClient)
+	if err != nil {
+		return err
 	}
-	return c.do(ctx, http.MethodPost, "/api/v1/embeddings/build", wire, nil)
+	response, err := api.PostAPIV1EmbeddingsBuildWithResponse(ctx, &apiclient.PostAPIV1EmbeddingsBuildRequestOptions{Body: &apiclient.EmbeddingsBuildRequest{
+		Store: new(req.Store), FullRebuild: new(req.FullRebuild), Backstop: new(req.Backstop), RepairInvalid: new(req.RepairInvalid),
+		// Always send the resolved scope, including an explicit false override.
+		IncludeAutomated: new(req.IncludeAutomated), Using: new(req.Using),
+	}})
+	if response == nil {
+		return err
+	}
+	return embeddingResponseError(response.StatusCode, response.Body, err)
 }
 
 func (c embeddingsDaemonClient) status(ctx context.Context) (vector.BuildStatus, error) {
-	var st vector.BuildStatus
-	err := c.do(ctx, http.MethodGet, c.storePath("/api/v1/embeddings/status"), nil, &st)
-	return st, err
+	var out vector.BuildStatus
+	api, err := apiclient.NewHTTPClient(c.baseURL, c.token, embeddingsDaemonHTTPClient)
+	if err != nil {
+		return out, err
+	}
+	query := &apiclient.GetAPIV1EmbeddingsStatusQuery{}
+	if c.store != "" {
+		query.Store = new(c.store)
+	}
+	response, err := api.GetAPIV1EmbeddingsStatusWithResponse(ctx, &apiclient.GetAPIV1EmbeddingsStatusRequestOptions{Query: query})
+	if response == nil {
+		return out, err
+	}
+	if err := embeddingResponseError(response.StatusCode, response.Body, err); err != nil {
+		return out, err
+	}
+	if len(response.Body) == 0 {
+		return out, io.ErrUnexpectedEOF
+	}
+	return *response.JSON200, nil
 }
 
 func (c embeddingsDaemonClient) generations(ctx context.Context) ([]vector.GenerationInfo, error) {
-	var body struct {
-		Generations []vector.GenerationInfo `json:"generations"`
+	api, err := apiclient.NewHTTPClient(c.baseURL, c.token, embeddingsDaemonHTTPClient)
+	if err != nil {
+		return nil, err
 	}
-	err := c.do(ctx, http.MethodGet, c.storePath("/api/v1/embeddings/generations"), nil, &body)
-	return body.Generations, err
+	query := &apiclient.GetAPIV1EmbeddingsGenerationsQuery{}
+	if c.store != "" {
+		query.Store = new(c.store)
+	}
+	response, err := api.GetAPIV1EmbeddingsGenerationsWithResponse(ctx, &apiclient.GetAPIV1EmbeddingsGenerationsRequestOptions{Query: query})
+	if response == nil {
+		return nil, err
+	}
+	if err := embeddingResponseError(response.StatusCode, response.Body, err); err != nil {
+		return nil, err
+	}
+	if len(response.Body) == 0 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return response.JSON200.Generations, nil
 }
 
 func (c embeddingsDaemonClient) activate(ctx context.Context, id int64, force bool) error {
-	path := fmt.Sprintf("/api/v1/embeddings/generations/%d/activate", id)
-	return c.do(ctx, http.MethodPost, c.storePath(path), map[string]bool{"force": force}, nil)
+	api, err := apiclient.NewHTTPClient(c.baseURL, c.token, embeddingsDaemonHTTPClient)
+	if err != nil {
+		return err
+	}
+	query := &apiclient.PostAPIV1EmbeddingsGenerationsIDActivateQuery{}
+	if c.store != "" {
+		query.Store = new(c.store)
+	}
+	response, err := api.PostAPIV1EmbeddingsGenerationsIDActivateWithResponse(ctx, &apiclient.PostAPIV1EmbeddingsGenerationsIDActivateRequestOptions{
+		PathParams: &apiclient.PostAPIV1EmbeddingsGenerationsIDActivatePath{ID: id}, Query: query,
+		Body: &apiclient.EmbeddingsGenerationActionRequest{Force: new(force)},
+	})
+	if response == nil {
+		return err
+	}
+	return embeddingResponseError(response.StatusCode, response.Body, err)
 }
 
 func (c embeddingsDaemonClient) retire(ctx context.Context, id int64, force bool) error {
-	path := fmt.Sprintf("/api/v1/embeddings/generations/%d/retire", id)
-	return c.do(ctx, http.MethodPost, c.storePath(path), map[string]bool{"force": force}, nil)
+	api, err := apiclient.NewHTTPClient(c.baseURL, c.token, embeddingsDaemonHTTPClient)
+	if err != nil {
+		return err
+	}
+	query := &apiclient.PostAPIV1EmbeddingsGenerationsIDRetireQuery{}
+	if c.store != "" {
+		query.Store = new(c.store)
+	}
+	response, err := api.PostAPIV1EmbeddingsGenerationsIDRetireWithResponse(ctx, &apiclient.PostAPIV1EmbeddingsGenerationsIDRetireRequestOptions{
+		PathParams: &apiclient.PostAPIV1EmbeddingsGenerationsIDRetirePath{ID: id}, Query: query,
+		Body: &apiclient.EmbeddingsGenerationActionRequest{Force: new(force)},
+	})
+	if response == nil {
+		return err
+	}
+	return embeddingResponseError(response.StatusCode, response.Body, err)
 }
 
 func daemonEmbeddingStore(name string) string {
@@ -998,59 +1097,11 @@ func daemonEmbeddingStore(name string) string {
 	return name
 }
 
-func (c embeddingsDaemonClient) storePath(path string) string {
-	if c.store == "" {
-		return path
+func embeddingResponseError(status int, body []byte, err error) error {
+	if status >= 300 {
+		return &daemonAPIError{status: status, message: daemonErrorMessage(status, body)}
 	}
-	return path + "?store=" + url.QueryEscape(c.store)
-}
-
-// do performs one HTTP call against the daemon's embeddings API,
-// marshaling reqBody (when non-nil) as the request body and decoding the
-// response into out (when non-nil). A non-2xx response becomes a
-// *daemonAPIError carrying the status and the server's "error" message.
-func (c embeddingsDaemonClient) do(
-	ctx context.Context, method, path string, reqBody, out any,
-) error {
-	var bodyReader io.Reader
-	if reqBody != nil {
-		data, err := json.Marshal(reqBody)
-		if err != nil {
-			return err
-		}
-		bodyReader = bytes.NewReader(data)
-	}
-	req, err := http.NewRequestWithContext(
-		ctx, method, strings.TrimSuffix(c.baseURL, "/")+path, bodyReader,
-	)
-	if err != nil {
-		return err
-	}
-	if reqBody != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	// The daemon's CSRF guard rejects mutating requests whose Origin is not
-	// in the allowlist. Setting Origin to the daemon's own baseURL satisfies
-	// that check for the CLI, which has no real browser origin.
-	req.Header.Set("Origin", c.baseURL)
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
-	resp, err := embeddingsDaemonHTTPClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return &daemonAPIError{status: resp.StatusCode, message: daemonErrorMessage(resp.StatusCode, body)}
-	}
-	if out == nil {
-		return nil
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return err
 }
 
 // daemonErrorMessage extracts the {"error": "..."} message huma's error

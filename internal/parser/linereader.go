@@ -2,6 +2,8 @@ package parser
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,13 +12,28 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+const contextCheckInterval = 256
+
+func contextErrEvery(ctx context.Context, index int) error {
+	if index%contextCheckInterval == 0 {
+		return ctx.Err()
+	}
+	return nil
+}
+
 // countingReader wraps an io.Reader and counts bytes read.
 type countingReader struct {
-	r io.Reader
-	n int64
+	ctx context.Context
+	r   io.Reader
+	n   int64
 }
 
 func (cr *countingReader) Read(p []byte) (int, error) {
+	if cr.ctx != nil {
+		if err := cr.ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
 	n, err := cr.r.Read(p)
 	cr.n += int64(n)
 	return n, err
@@ -27,12 +44,14 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 // grows on demand up to maxLen. After iteration, call Err() to
 // check for I/O errors (as opposed to normal EOF).
 type lineReader struct {
-	r         *bufio.Reader
-	cr        *countingReader
-	maxLen    int
-	buf       []byte
-	err       error
-	bytesRead int64 // total bytes consumed (from countingReader)
+	r                *bufio.Reader
+	cr               *countingReader
+	maxLen           int
+	buf              []byte
+	err              error
+	bytesRead        int64 // total bytes consumed (from countingReader)
+	terminated       bool  // the returned line ended with a newline
+	skippedOversized bool  // callers requiring complete input must reject skipped records
 }
 
 const maxPooledLineBufferSize = 256 << 10
@@ -48,7 +67,14 @@ var lineReaderPool = sync.Pool{
 }
 
 func newLineReader(r io.Reader, maxLen int) *lineReader {
+	return newLineReaderContext(context.Background(), r, maxLen)
+}
+
+func newLineReaderContext(
+	ctx context.Context, r io.Reader, maxLen int,
+) *lineReader {
 	lr := lineReaderPool.Get().(*lineReader)
+	lr.cr.ctx = ctx
 	lr.cr.r = r
 	lr.cr.n = 0
 	lr.r.Reset(lr.cr)
@@ -56,6 +82,8 @@ func newLineReader(r io.Reader, maxLen int) *lineReader {
 	lr.buf = lr.buf[:0]
 	lr.err = nil
 	lr.bytesRead = 0
+	lr.terminated = false
+	lr.skippedOversized = false
 	return lr
 }
 
@@ -68,11 +96,14 @@ func releaseLineReader(lr *lineReader) {
 		lr.buf = lr.buf[:0]
 	}
 	lr.r.Reset(nil)
+	lr.cr.ctx = nil
 	lr.cr.r = nil
 	lr.cr.n = 0
 	lr.maxLen = 0
 	lr.err = nil
 	lr.bytesRead = 0
+	lr.terminated = false
+	lr.skippedOversized = false
 	lineReaderPool.Put(lr)
 }
 
@@ -95,7 +126,7 @@ func (lr *lineReader) nextBytes() ([]byte, bool) {
 	for {
 		line, err := lr.readLineBytes()
 		if err != nil {
-			if err != io.EOF {
+			if !errors.Is(err, io.EOF) {
 				lr.err = err
 			}
 			return nil, false
@@ -124,6 +155,8 @@ func (lr *lineReader) updateBytesRead() {
 }
 
 func (lr *lineReader) readLineBytes() ([]byte, error) {
+	start := lr.bytesRead
+	lr.terminated = false
 	lr.buf = lr.buf[:0]
 	oversized := false
 
@@ -150,7 +183,9 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		// a second initialScanBufSize scratch buffer for every file.
 		if len(lr.buf) == 0 && !isPrefix {
 			lr.updateBytesRead()
+			lr.terminated = lr.bytesRead-start > int64(len(chunk))
 			if len(chunk) > lr.maxLen {
+				lr.skippedOversized = true
 				return nil, nil
 			}
 			return chunk, nil
@@ -159,6 +194,7 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		lr.buf = append(lr.buf, chunk...)
 
 		if len(lr.buf) > lr.maxLen {
+			lr.skippedOversized = true
 			oversized = true
 			lr.buf = lr.buf[:0]
 			if !isPrefix {
@@ -174,6 +210,7 @@ func (lr *lineReader) readLineBytes() ([]byte, error) {
 		}
 	}
 
+	lr.terminated = lr.bytesRead-start > int64(len(lr.buf))
 	return lr.buf, nil
 }
 

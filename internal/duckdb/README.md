@@ -17,7 +17,27 @@ tunnel/proxy.
 The DuckDB schema intentionally avoids `TIMESTAMP DEFAULT current_timestamp`
 columns because current Quack attach rejects catalogs with those dynamic
 defaults. Writers supply `current_timestamp` explicitly where the mirror needs a
-created timestamp. Existing mirrors are additively migrated by `EnsureSchema`.
+created timestamp. A schema-version change builds a fresh mirror, validates it,
+and swaps it into place atomically. `EnsureSchema` initializes fresh mirrors; it
+is not an in-place production migration path.
+
+## Mirror writes
+
+Full and incremental pushes replace complete sessions in the existing
+session-batch transactions. Messages, tool calls, result events, and usage
+events use multi-row inserts capped at 100 rows or 1 MiB of variable-sized
+payload per statement. An oversized row is inserted alone, without truncation.
+These limits do not bound the existing whole-session source load.
+
+Errors and cancellation roll back the whole transaction; chunks never commit
+independently.
+
+The generated full-mirror benchmark checks stored row counts outside its timed
+`Push` calls. Run it with:
+
+```bash
+go test -tags fts5 ./internal/duckdb -run '^$' -bench '^BenchmarkMirrorPush$' -benchtime=1x -count=3
+```
 
 Search currently keeps substring/regex fallback behavior. The DuckDB FTS
 extension is available locally in the pinned runtime, but BM25 lookup does not

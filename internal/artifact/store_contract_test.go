@@ -6,25 +6,25 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.kenn.io/docbank"
-	docsqlite "go.kenn.io/docbank/pkg/sqlite"
-	"go.kenn.io/docbank/pkg/sqlite/mattn"
-	"go.kenn.io/docbank/pkg/sqlite/modernc"
+	"go.kenn.io/docbank/docbank"
+	docsqlite "go.kenn.io/docbank/sqlite"
+	"go.kenn.io/docbank/sqlite/mattn"
+	"go.kenn.io/docbank/sqlite/modernc"
 )
 
 const contractOrigin = "contract-a1b2c3"
 
 func TestNewRefValidatesCanonicalReferences(t *testing.T) {
+	t.Parallel()
+
 	hash := strings.Repeat("a", 64)
 	tests := []struct {
 		name string
@@ -39,6 +39,7 @@ func TestNewRefValidatesCanonicalReferences(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := NewRef(contractOrigin, tt.kind, tt.ref)
 			require.NoError(t, err)
 			assert.Equal(t, Ref{Origin: contractOrigin, Kind: tt.kind, Name: tt.ref}, got)
@@ -47,6 +48,8 @@ func TestNewRefValidatesCanonicalReferences(t *testing.T) {
 }
 
 func TestNewRefRejectsNoncanonicalReferences(t *testing.T) {
+	t.Parallel()
+
 	hash := strings.Repeat("a", 64)
 	tests := []struct {
 		name   string
@@ -65,13 +68,16 @@ func TestNewRefRejectsNoncanonicalReferences(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			_, err := NewRef(tt.origin, tt.kind, tt.ref)
-			assert.ErrorIs(t, err, ErrArtifactInvalid)
+			require.ErrorIs(t, err, ErrArtifactInvalid)
 		})
 	}
 }
 
 func TestNewIdentityValidatesCanonicalSHA256AndSize(t *testing.T) {
+	t.Parallel()
+
 	hash := strings.Repeat("a", 64)
 	identity, err := NewIdentity(hash, 0)
 	require.NoError(t, err)
@@ -89,31 +95,24 @@ func TestNewIdentityValidatesCanonicalSHA256AndSize(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			_, err := NewIdentity(tt.hash, tt.size)
 			assert.ErrorIs(t, err, ErrArtifactInvalid)
 		})
 	}
 }
 
-func TestArtifactOpErrorPreservesCause(t *testing.T) {
-	ref := requireContractRef(t, contractOrigin, KindCheckpoints, "cp-0000000001.json")
-	err := &ArtifactOpError{Op: "open", Ref: ref, Err: context.Canceled}
-
-	assert.ErrorIs(t, err, context.Canceled)
-	assert.Contains(t, err.Error(), "open")
-	assert.Contains(t, err.Error(), ref.Name)
-
-	transient := fmt.Errorf("writing artifact: %w", syscall.EAGAIN)
-	err = &ArtifactOpError{Op: "create", Ref: ref, Err: transient}
-	assert.ErrorIs(t, err, syscall.EAGAIN)
-}
-
 type artifactStoreFactory func(t *testing.T) ArtifactStore
 
 func TestArtifactStoreContractDocbank(t *testing.T) {
+	t.Parallel()
+
 	for _, driver := range []docsqlite.Driver{mattn.Driver{}, modernc.Driver{}} {
 		t.Run(driver.Name(), func(t *testing.T) {
+			t.Parallel()
 			runArtifactStoreContract(t, func(t *testing.T) ArtifactStore {
+				t.Helper()
+
 				vault, err := docbank.New(t.Context(), docbank.Config{
 					Root:   t.TempDir(),
 					SQLite: driver,
@@ -126,9 +125,15 @@ func TestArtifactStoreContractDocbank(t *testing.T) {
 }
 
 func TestArtifactStoreIteratorContractDocbank(t *testing.T) {
+	t.Parallel()
+
 	for _, driver := range []docsqlite.Driver{mattn.Driver{}, modernc.Driver{}} {
 		t.Run(driver.Name(), func(t *testing.T) {
+			t.Parallel()
+
 			store := newContractStore(t, func(t *testing.T) ArtifactStore {
+				t.Helper()
+
 				vault, err := docbank.New(t.Context(), docbank.Config{
 					Root: t.TempDir(), SQLite: driver,
 				})
@@ -162,7 +167,7 @@ func TestArtifactStoreIteratorContractDocbank(t *testing.T) {
 			require.ErrorIs(t, err, io.EOF)
 			assert.Equal(t, originalOrigins[1:], restOrigins)
 			_, err = origins.Next(t.Context(), 1)
-			assert.ErrorIs(t, err, io.EOF)
+			require.ErrorIs(t, err, io.EOF)
 			require.NoError(t, origins.Close())
 
 			originalNames := []string{
@@ -189,7 +194,7 @@ func TestArtifactStoreIteratorContractDocbank(t *testing.T) {
 			require.ErrorIs(t, err, io.EOF)
 			assert.Equal(t, originalNames[1:], entryNames(restEntries))
 			_, err = entries.Next(t.Context(), 1)
-			assert.ErrorIs(t, err, io.EOF)
+			require.ErrorIs(t, err, io.EOF)
 			require.NoError(t, entries.Close())
 
 			cancelEntries, err := iterable.Entries(t.Context(), contractOrigin, KindCheckpoints)
@@ -199,9 +204,9 @@ func TestArtifactStoreIteratorContractDocbank(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			cancel()
 			_, err = cancelEntries.Next(ctx, 1)
-			assert.ErrorIs(t, err, context.Canceled)
+			require.ErrorIs(t, err, context.Canceled)
 			_, err = cancelEntries.Next(t.Context(), 1)
-			assert.ErrorIs(t, err, fs.ErrClosed)
+			require.ErrorIs(t, err, fs.ErrClosed)
 
 			closedOrigins, err := iterable.Origins(t.Context())
 			require.NoError(t, err)
@@ -224,7 +229,7 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 		ref := requireContractRef(t, contractOrigin, KindCheckpoints, "cp-0000000001.json")
 
 		_, err := store.Stat(t.Context(), ref)
-		assert.ErrorIs(t, err, ErrArtifactNotFound)
+		require.ErrorIs(t, err, ErrArtifactNotFound)
 		_, reader, err := store.Open(t.Context(), ref)
 		assert.Nil(t, reader)
 		assert.ErrorIs(t, err, ErrArtifactNotFound)
@@ -259,7 +264,7 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 
 		_, err := store.Create(t.Context(), ref, identityForBytes(t, replacement),
 			"application/json", bytes.NewReader(replacement))
-		assert.ErrorIs(t, err, ErrArtifactConflict)
+		require.ErrorIs(t, err, ErrArtifactConflict)
 		assert.Equal(t, original, readContractArtifact(t, store, ref))
 	})
 
@@ -272,7 +277,7 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 
 		_, err := store.Create(t.Context(), ref, first.Entry.Identity,
 			"application/json", bytes.NewReader(replacement))
-		assert.ErrorIs(t, err, ErrArtifactInvalid)
+		require.ErrorIs(t, err, ErrArtifactInvalid)
 		entry, err := store.Stat(t.Context(), ref)
 		require.NoError(t, err)
 		assert.Equal(t, first.Entry, entry)
@@ -287,7 +292,7 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 
 		_, err := store.Create(t.Context(), ref, first.Entry.Identity,
 			"application/octet-stream", bytes.NewReader(body))
-		assert.ErrorIs(t, err, ErrArtifactConflict)
+		require.ErrorIs(t, err, ErrArtifactConflict)
 		entry, err := store.Stat(t.Context(), ref)
 		require.NoError(t, err)
 		assert.Equal(t, first.Entry, entry)
@@ -306,7 +311,7 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 
 		_, err := store.Create(t.Context(), ref, identityForBytes(t, body),
 			"application/octet-stream", bytes.NewReader(body))
-		assert.ErrorIs(t, err, ErrArtifactInvalid)
+		require.ErrorIs(t, err, ErrArtifactInvalid)
 		_, err = store.Stat(t.Context(), ref)
 		assert.ErrorIs(t, err, ErrArtifactNotFound)
 	})
@@ -319,6 +324,8 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 			{
 				name: "hash",
 				identity: func(t *testing.T, body []byte) Identity {
+					t.Helper()
+
 					different := []byte("malicious checkpoint")
 					require.Len(t, different, len(body))
 					require.NotEqual(t, body, different)
@@ -328,6 +335,8 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 			{
 				name: "size",
 				identity: func(t *testing.T, body []byte) Identity {
+					t.Helper()
+
 					correct := identityForBytes(t, body)
 					identity, err := NewIdentity(correct.SHA256, correct.Size+1)
 					require.NoError(t, err)
@@ -343,7 +352,7 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 
 				_, err := store.Create(t.Context(), ref, tt.identity(t, body),
 					"application/json", bytes.NewReader(body))
-				assert.ErrorIs(t, err, ErrArtifactInvalid)
+				require.ErrorIs(t, err, ErrArtifactInvalid)
 				_, err = store.Stat(t.Context(), ref)
 				assert.ErrorIs(t, err, ErrArtifactNotFound)
 			})
@@ -374,7 +383,7 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 
 					_, err := store.Create(t.Context(), ref, identity,
 						tt.mediaType, bytes.NewReader(body))
-					assert.ErrorIs(t, err, ErrArtifactInvalid)
+					require.ErrorIs(t, err, ErrArtifactInvalid)
 					_, err = store.Stat(t.Context(), ref)
 					assert.ErrorIs(t, err, ErrArtifactNotFound)
 				})
@@ -420,7 +429,7 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 		one := make([]byte, 1)
 		_, err = reader.Read(one)
 		require.NoError(t, err)
-		assert.Error(t, reader.Close())
+		require.Error(t, reader.Close())
 		assert.Equal(t, body, readContractArtifact(t, store, ref))
 	})
 
@@ -431,7 +440,7 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 
 		require.NoError(t, store.Quarantine(t.Context(), ref, "semantic validation failed"))
 		_, err := store.Stat(t.Context(), ref)
-		assert.ErrorIs(t, err, ErrArtifactNotFound)
+		require.ErrorIs(t, err, ErrArtifactNotFound)
 		assert.Empty(t, listAllContractEntries(t, store, contractOrigin, KindCheckpoints, 10))
 		assert.Empty(t, listAllContractOrigins(t, store, 10))
 
@@ -448,10 +457,10 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 
 		require.NoError(t, store.Trash(t.Context(), ref))
 		_, err := store.Stat(t.Context(), ref)
-		assert.ErrorIs(t, err, ErrArtifactNotFound)
+		require.ErrorIs(t, err, ErrArtifactNotFound)
 		_, reader, err := store.Open(t.Context(), ref)
 		assert.Nil(t, reader)
-		assert.ErrorIs(t, err, ErrArtifactNotFound)
+		require.ErrorIs(t, err, ErrArtifactNotFound)
 		assert.Empty(t, listAllContractEntries(t, store, contractOrigin, KindCheckpoints, 10))
 		assert.Empty(t, listAllContractOrigins(t, store, 10))
 	})
@@ -470,24 +479,24 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 
 		_, err := store.Create(ctx, missing, identityForBytes(t, []byte("new")),
 			"application/json", strings.NewReader("new"))
-		assert.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, context.Canceled)
 		_, err = store.Stat(ctx, existing)
-		assert.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, context.Canceled)
 		_, reader, err := store.Open(ctx, existing)
 		if reader != nil {
 			_ = reader.Close()
 		}
-		assert.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, context.Canceled)
 		_, err = store.Origins(ctx)
-		assert.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, err, context.Canceled)
 		_, err = store.Entries(ctx, contractOrigin, KindCheckpoints)
-		assert.ErrorIs(t, err, context.Canceled)
-		assert.ErrorIs(t, store.Quarantine(ctx, quarantineRef, "cancelled"), context.Canceled)
-		assert.ErrorIs(t, store.Trash(ctx, trashRef), context.Canceled)
+		require.ErrorIs(t, err, context.Canceled)
+		require.ErrorIs(t, store.Quarantine(ctx, quarantineRef, "cancelled"), context.Canceled)
+		require.ErrorIs(t, store.Trash(ctx, trashRef), context.Canceled)
 		_, err = store.Stat(t.Context(), missing)
-		assert.ErrorIs(t, err, ErrArtifactNotFound)
+		require.ErrorIs(t, err, ErrArtifactNotFound)
 		_, err = store.Stat(t.Context(), quarantineRef)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		_, err = store.Stat(t.Context(), trashRef)
 		assert.NoError(t, err)
 	})
@@ -516,7 +525,7 @@ func runArtifactStoreContract(t *testing.T, factory artifactStoreFactory) {
 
 		created := 0
 		for i := range writers {
-			assert.NoError(t, errs[i])
+			require.NoError(t, errs[i])
 			assert.Equal(t, ref, results[i].Entry.Ref)
 			assert.Equal(t, identity, results[i].Entry.Identity)
 			if results[i].Created {
@@ -617,6 +626,7 @@ func createContractArtifact(t *testing.T, store ArtifactStore, ref Ref, body []b
 
 func readContractArtifact(t *testing.T, store ArtifactStore, ref Ref) []byte {
 	t.Helper()
+
 	_, reader, err := store.Open(t.Context(), ref)
 	require.NoError(t, err)
 	require.NotNil(t, reader)

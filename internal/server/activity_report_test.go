@@ -1,9 +1,14 @@
 package server_test
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -11,12 +16,55 @@ import (
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/pricing"
 )
 
 // activityDate is a fixed past calendar day so the activity report is
 // deterministic and complete (non-partial) regardless of wall clock.
 const activityDate = "2025-06-02"
+
+func TestActivityReportValidatesSizeBeforeResolvingMachine(t *testing.T) {
+	te := setup(t)
+	for _, tt := range []struct {
+		name, message string
+		filters       url.Values
+	}{
+		{"machine", "activity machine filter exceeds 1024 bytes", url.Values{"machine": {strings.Repeat("x", 1025)}}},
+		{"total", "activity filters exceed 3072 bytes total", url.Values{
+			"project": {strings.Repeat("p", 1024)}, "agent": {strings.Repeat("a", 1024)},
+			"git_branch": {strings.Repeat("b", 1024)}, "machine": {"missing"},
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := te.get(t, "/api/v1/activity/report?"+tt.filters.Encode())
+			assertStatus(t, w, http.StatusBadRequest)
+			assert.Contains(t, w.Body.String(), tt.message)
+		})
+	}
+}
+
+func TestActivityReportRejectsFilterWhoseSignedIDExceedsLimit(t *testing.T) {
+	te := setup(t)
+	values := url.Values{
+		"preset":     {"day"},
+		"date":       {activityDate},
+		"timezone":   {"UTC"},
+		"project":    {strings.Repeat("\"", 1024)},
+		"agent":      {strings.Repeat("\"", 1024)},
+		"git_branch": {strings.Repeat("\"", 1024)},
+		"automation": {"all"},
+	}
+
+	req := httptest.NewRequestWithContext(t.Context(),
+		http.MethodGet, "/api/v1/activity/report?"+values.Encode(), nil,
+	)
+	req.Header.Set("Accept", "text/event-stream")
+	response := httptest.NewRecorder()
+	te.handler.ServeHTTP(response, req)
+	assertStatus(t, response, http.StatusBadRequest)
+	assert.Contains(t, response.Body.String(), "report ID")
+}
 
 // seedActivityReportFixture seeds two sessions that overlap in wall-clock
 // on activityDate so peak concurrency is 2. Each session gets distinct,
@@ -88,6 +136,8 @@ func TestActivityReportEndpoint_Presets(t *testing.T) {
 				"preset": "day", "date": activityDate, "timezone": "UTC",
 			},
 			check: func(t *testing.T, resp activity.Report) {
+				t.Helper()
+
 				assert.Equal(t, 2, resp.Peak.Agents)
 				assert.Equal(t, 2, resp.Totals.Sessions)
 				assert.Equal(t, "minute", resp.BucketUnit)
@@ -100,6 +150,8 @@ func TestActivityReportEndpoint_Presets(t *testing.T) {
 				"preset": "week", "date": activityDate, "timezone": "UTC",
 			},
 			check: func(t *testing.T, resp activity.Report) {
+				t.Helper()
+
 				assert.Equal(t, "hour", resp.BucketUnit, "a 7-day week auto-buckets hourly")
 				assert.Equal(t, 168, resp.BucketCount)
 			},
@@ -110,6 +162,8 @@ func TestActivityReportEndpoint_Presets(t *testing.T) {
 				"preset": "month", "date": activityDate, "timezone": "UTC",
 			},
 			check: func(t *testing.T, resp activity.Report) {
+				t.Helper()
+
 				assert.Equal(t, "day", resp.BucketUnit, "a 30-day month auto-buckets daily")
 			},
 		},
@@ -122,6 +176,8 @@ func TestActivityReportEndpoint_Presets(t *testing.T) {
 				"timezone": "UTC",
 			},
 			check: func(t *testing.T, resp activity.Report) {
+				t.Helper()
+
 				assert.Equal(t, 2, resp.Totals.Sessions)
 			},
 		},
@@ -199,17 +255,17 @@ func seedActivityReportMetadataFixture(t *testing.T, te *testEnv) {
 			if i == 1 {
 				m.Role = "assistant"
 				m.Model = fallbackModel
-				m.TokenUsage = json.RawMessage(
+				m.TokenUsage = jsontext.Value(
 					`{"input_tokens":200,"output_tokens":100}`)
 			}
 		})
-	cost := 0.25
+	cost := money.MustParseDollars("0.25")
 	ordinal := 1
-	require.NoError(t, te.db.ReplaceSessionUsageEvents(
+	require.NoError(t, te.db.ReplaceSessionUsageEvents(t.Context(),
 		"activity-meta-reported-cost", []db.UsageEvent{{
 			SessionID: "activity-meta-reported-cost", MessageOrdinal: &ordinal,
 			Source: "session", Model: "gpt-5.1", InputTokens: 100,
-			OutputTokens: 50, CostUSD: &cost,
+			OutputTokens: 50, Cost: &cost,
 			OccurredAt: activityDate + "T10:02:00Z",
 			DedupKey:   "activity-meta-reported-cost:event",
 		}},
@@ -219,7 +275,7 @@ func seedActivityReportMetadataFixture(t *testing.T, te *testEnv) {
 func activityReportFallbackModel(t *testing.T) string {
 	t.Helper()
 	for _, p := range pricing.FallbackPricing() {
-		if p.OutputPerMTok > 0 {
+		if p.OutputPerMTok.Microdollars > 0 {
 			return p.ModelPattern
 		}
 	}
@@ -253,7 +309,6 @@ func seedFallbackModelPricing(t *testing.T, database *db.DB, model string) {
 // MUST appear in the report. A refactor flipping those flags to match
 // the analytics defaults would drop these sessions and fail here.
 func TestActivityReportEndpoint_IncludesOneShotAndAutomated(t *testing.T) {
-
 	te := setup(t)
 
 	// One-shot: a single user message (user_message_count = 1).
@@ -305,7 +360,6 @@ func TestActivityReportEndpoint_IncludesOneShotAndAutomated(t *testing.T) {
 }
 
 func TestActivityReportEndpoint_Validation(t *testing.T) {
-
 	te := setup(t)
 
 	ts := activityDate + "T00:00:00Z"
@@ -385,7 +439,6 @@ func TestActivityReportEndpoint_Validation(t *testing.T) {
 // "automated" drops interactive ones. It also confirms the response Totals
 // carry the automated/interactive session-count split.
 func TestActivityReportEndpoint_AutomationFilter(t *testing.T) {
-
 	te := setup(t)
 
 	// Automated: a single-turn session whose first message matches a known
@@ -466,12 +519,20 @@ func TestActivityReportEndpoint_GitBranchFilter(t *testing.T) {
 		id, branch, started, ended string
 		times                      []string
 	}{
-		{"b1", "main", activityDate + "T10:00:00Z", activityDate + "T10:08:00Z",
-			[]string{activityDate + "T10:00:00Z", activityDate + "T10:02:00Z",
-				activityDate + "T10:05:00Z", activityDate + "T10:07:00Z"}},
-		{"b2", "feature-x", activityDate + "T10:01:00Z", activityDate + "T10:09:00Z",
-			[]string{activityDate + "T10:01:00Z", activityDate + "T10:03:00Z",
-				activityDate + "T10:06:00Z", activityDate + "T10:08:00Z"}},
+		{
+			"b1", "main", activityDate + "T10:00:00Z", activityDate + "T10:08:00Z",
+			[]string{
+				activityDate + "T10:00:00Z", activityDate + "T10:02:00Z",
+				activityDate + "T10:05:00Z", activityDate + "T10:07:00Z",
+			},
+		},
+		{
+			"b2", "feature-x", activityDate + "T10:01:00Z", activityDate + "T10:09:00Z",
+			[]string{
+				activityDate + "T10:01:00Z", activityDate + "T10:03:00Z",
+				activityDate + "T10:06:00Z", activityDate + "T10:08:00Z",
+			},
+		},
 	}
 	for _, e := range seed {
 		started, ended, branch := e.started, e.ended, e.branch
@@ -499,4 +560,161 @@ func TestActivityReportEndpoint_GitBranchFilter(t *testing.T) {
 	assertStatus(t, filtered, http.StatusOK)
 	assert.Equal(t, 1, decode[activity.Report](t, filtered).Totals.Sessions,
 		"git_branch filter restricts the activity report to alpha/main")
+}
+
+func TestActivityReportEndpointNegotiatesProgressAndPagesSessions(t *testing.T) {
+	te := setup(t)
+	seedActivityReportFixture(t, te)
+	path := "/api/v1/activity/report?preset=day&date=" + activityDate + "&timezone=UTC"
+
+	plain := te.get(t, path)
+	assertStatus(t, plain, http.StatusOK)
+	report := decode[activity.Report](t, plain)
+	require.NotEmpty(t, report.ReportID)
+	require.Len(t, report.BySession, 2)
+	assert.Equal(t, 2, report.SessionsTotal)
+	assert.NotContains(t, plain.Body.String(), `"intervals"`)
+
+	pageResponse := te.get(t, "/api/v1/activity/report/"+report.ReportID+
+		"/sessions?limit=1")
+	assertStatus(t, pageResponse, http.StatusOK)
+	var first struct {
+		Sessions   []activity.SessionRow `json:"sessions"`
+		NextCursor string                `json:"next_cursor"`
+		Total      int                   `json:"total"`
+		Report     *activity.Report      `json:"report"`
+	}
+	require.NoError(t, json.Unmarshal(pageResponse.Body.Bytes(), &first))
+	require.Len(t, first.Sessions, 1)
+	require.NotEmpty(t, first.NextCursor)
+	assert.Equal(t, 2, first.Total)
+	assert.Nil(t, first.Report, "ordinary browser pages omit full report metadata")
+
+	metadataResponse := te.get(t, "/api/v1/activity/report/"+report.ReportID+
+		"/sessions?limit=1&include_report=true")
+	assertStatus(t, metadataResponse, http.StatusOK)
+	var metadataPage struct {
+		Sessions []activity.SessionRow `json:"sessions"`
+		Report   *activity.Report      `json:"report"`
+	}
+	require.NoError(t, json.Unmarshal(metadataResponse.Body.Bytes(), &metadataPage))
+	require.NotNil(t, metadataPage.Report)
+	assert.Equal(t, report.ReportID, metadataPage.Report.ReportID)
+	assert.Equal(t, metadataPage.Sessions, metadataPage.Report.BySession)
+	secondResponse := te.get(t, "/api/v1/activity/report/"+report.ReportID+
+		"/sessions?limit=1&cursor="+url.QueryEscape(first.NextCursor))
+	assertStatus(t, secondResponse, http.StatusOK)
+	var second struct {
+		Sessions []activity.SessionRow `json:"sessions"`
+	}
+	require.NoError(t, json.Unmarshal(secondResponse.Body.Bytes(), &second))
+	require.Len(t, second.Sessions, 1)
+	assert.NotEqual(t, first.Sessions[0].SessionID, second.Sessions[0].SessionID)
+
+	nonDefaultResponse := te.get(t, "/api/v1/activity/report/"+report.ReportID+
+		"/sessions?limit=1&sort=project&direction=asc&bucket_start=120&bucket_end=122")
+	assertStatus(t, nonDefaultResponse, http.StatusOK)
+	var nonDefaultFirst struct {
+		Sessions   []activity.SessionRow `json:"sessions"`
+		NextCursor string                `json:"next_cursor"`
+	}
+	require.NoError(t, json.Unmarshal(nonDefaultResponse.Body.Bytes(), &nonDefaultFirst))
+	require.Len(t, nonDefaultFirst.Sessions, 1)
+	require.NotEmpty(t, nonDefaultFirst.NextCursor)
+
+	inheritedResponse := te.get(t, "/api/v1/activity/report/"+report.ReportID+
+		"/sessions?cursor="+url.QueryEscape(nonDefaultFirst.NextCursor))
+	assertStatus(t, inheritedResponse, http.StatusOK)
+	var inherited struct {
+		Sessions []activity.SessionRow `json:"sessions"`
+	}
+	require.NoError(t, json.Unmarshal(inheritedResponse.Body.Bytes(), &inherited))
+	require.Len(t, inherited.Sessions, 1)
+	assert.NotEqual(t, nonDefaultFirst.Sessions[0].SessionID, inherited.Sessions[0].SessionID)
+
+	for name, query := range map[string]string{
+		"sort":         "&sort=agent",
+		"direction":    "&direction=desc",
+		"bucket start": "&bucket_start=121&bucket_end=122",
+		"bucket end":   "&bucket_start=120&bucket_end=123",
+	} {
+		t.Run("cursor rejects explicit "+name+" mismatch", func(t *testing.T) {
+			mismatch := te.get(t, "/api/v1/activity/report/"+report.ReportID+
+				"/sessions?cursor="+url.QueryEscape(nonDefaultFirst.NextCursor)+query)
+			assertStatus(t, mismatch, http.StatusBadRequest)
+		})
+	}
+
+	started, ended := activityDate+"T11:00:00Z", activityDate+"T11:03:00Z"
+	te.seedSession(t, "d3", "gamma", 2, func(s *db.Session) {
+		s.StartedAt, s.EndedAt = &started, &ended
+	})
+	te.seedMessages(t, "d3", 2, func(i int, message *db.Message) {
+		message.Timestamp = []string{started, activityDate + "T11:02:00Z"}[i]
+	})
+	refreshResponse := te.get(t, "/api/v1/activity/report/"+report.ReportID+
+		"/sessions?limit=1")
+	assertStatus(t, refreshResponse, http.StatusOK)
+	var refreshed struct {
+		RefreshRequired bool             `json:"refresh_required"`
+		Report          *activity.Report `json:"report"`
+	}
+	require.NoError(t, json.Unmarshal(refreshResponse.Body.Bytes(), &refreshed))
+	assert.True(t, refreshed.RefreshRequired)
+	require.NotNil(t, refreshed.Report)
+	assert.Equal(t, 3, refreshed.Report.Totals.Sessions)
+	assert.NotEqual(t, report.ReportID, refreshed.Report.ReportID)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
+	req.Header.Set("Accept", "text/event-stream")
+	recorder := httptest.NewRecorder()
+	te.handler.ServeHTTP(recorder, req)
+	assertStatus(t, recorder, http.StatusOK)
+	assert.Contains(t, recorder.Body.String(), "event: progress\n")
+	assert.Contains(t, recorder.Body.String(), "event: report\n")
+}
+
+func TestActivityReportSessionPageRefreshesAfterIdentityOnlyChange(t *testing.T) {
+	te := setup(t)
+	seedActivityReportFixture(t, te)
+	path := "/api/v1/activity/report?preset=day&date=" + activityDate +
+		"&timezone=UTC"
+
+	initialResponse := te.get(t, path)
+	assertStatus(t, initialResponse, http.StatusOK)
+	initial := decode[activity.Report](t, initialResponse)
+	require.NotEmpty(t, initial.ReportID)
+
+	require.NoError(t, te.db.UpsertProjectIdentityObservation(
+		t.Context(), export.ProjectIdentityObservation{
+			Project: "alpha", Machine: "test", RootPath: "/fixtures/alpha",
+			GitRemote:     "https://example.com/acme/alpha.git",
+			GitRemoteName: "origin",
+			ObservedAt:    time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC),
+		},
+	))
+
+	pageResponse := te.get(t, "/api/v1/activity/report/"+initial.ReportID+
+		"/sessions?limit=1")
+	assertStatus(t, pageResponse, http.StatusOK)
+	var page struct {
+		RefreshRequired bool             `json:"refresh_required"`
+		Report          *activity.Report `json:"report"`
+	}
+	require.NoError(t, json.Unmarshal(pageResponse.Body.Bytes(), &page))
+	assert.True(t, page.RefreshRequired)
+	require.NotNil(t, page.Report)
+	assert.NotEqual(t, initial.ReportID, page.Report.ReportID)
+	var alphaProjectKey string
+	for _, row := range page.Report.BySession {
+		if row.Project == "alpha" {
+			alphaProjectKey = row.ProjectKey
+			break
+		}
+	}
+	require.NotEmpty(t, alphaProjectKey)
+	project, ok := page.Report.Projects[alphaProjectKey]
+	require.True(t, ok)
+	require.NotNil(t, project.Identity,
+		"replacement report must carry refreshed project identity metadata")
 }

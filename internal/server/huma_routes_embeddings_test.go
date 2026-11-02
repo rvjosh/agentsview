@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -101,21 +102,6 @@ func newEmbeddingsTestServer(t *testing.T, m EmbeddingsManager) *Server {
 	return testServer(t, 0, opts...)
 }
 
-func TestEmbeddingsRoutesRegisteredWhenManagerNil(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/embeddings/status", nil)
-
-	withoutManager := newEmbeddingsTestServer(t, nil)
-	_, patternWithout := withoutManager.mux.Handler(req)
-	assert.NotEqual(t, "/", patternWithout)
-
-	w := serveGet(t, withoutManager, "/api/v1/embeddings/status")
-	assertRecorderStatus(t, w, http.StatusNotImplemented)
-
-	withManager := newEmbeddingsTestServer(t, &fakeEmbeddingsManager{})
-	_, patternWith := withManager.mux.Handler(req)
-	assert.NotEqual(t, "/", patternWith)
-}
-
 // TestEmbeddingsUnavailableReasonReplacesGeneric501 pins that a recorded
 // unavailability reason (e.g. vector serving disabled at startup because
 // vectors.write.lock was held) reaches the 501 body, so CLI users see why
@@ -170,34 +156,36 @@ func TestEmbeddingsBuildReturnsAcceptedAndStartsBuild(t *testing.T) {
 }
 
 func TestEmbeddingsBuildHoldsIdleLeaseUntilManagerCompletes(t *testing.T) {
-	buildDone := make(chan struct{})
-	var completeOnce sync.Once
-	complete := func() { completeOnce.Do(func() { close(buildDone) }) }
-	defer complete()
-	fake := &fakeEmbeddingsManager{waitForBuild: buildDone}
-	idled := make(chan struct{}, 1)
-	tracker := NewIdleTracker(20*time.Millisecond, func() { idled <- struct{}{} })
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	s := testServer(t, 0, WithEmbeddingsManager(fake), WithIdleTracker(tracker))
-	tracker.Touch()
-	go tracker.Run(ctx)
+	synctest.Test(t, func(t *testing.T) {
+		buildDone := make(chan struct{})
+		var completeOnce sync.Once
+		complete := func() { completeOnce.Do(func() { close(buildDone) }) }
+		defer complete()
+		fake := &fakeEmbeddingsManager{waitForBuild: buildDone}
+		idled := make(chan struct{}, 1)
+		tracker := NewIdleTracker(20*time.Millisecond, func() { idled <- struct{}{} })
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		s := testServer(t, 0, WithEmbeddingsManager(fake), WithIdleTracker(tracker))
+		tracker.Touch()
+		go tracker.Run(ctx)
 
-	w := serveJSON(t, s.mux, http.MethodPost, "/api/v1/embeddings/build",
-		vector.BuildRequest{})
-	assertRecorderStatus(t, w, http.StatusAccepted)
+		w := serveJSON(t, s.mux, http.MethodPost, "/api/v1/embeddings/build",
+			vector.BuildRequest{})
+		assertRecorderStatus(t, w, http.StatusAccepted)
 
-	select {
-	case <-idled:
-		require.Fail(t, "daemon idled while an API-started embedding build was active")
-	case <-time.After(100 * time.Millisecond):
-	}
-	complete()
-	select {
-	case <-idled:
-	case <-time.After(time.Second):
-		require.Fail(t, "daemon did not idle after the API-started build completed")
-	}
+		select {
+		case <-idled:
+			require.Fail(t, "daemon idled while an API-started embedding build was active")
+		case <-time.After(100 * time.Millisecond):
+		}
+		complete()
+		select {
+		case <-idled:
+		case <-time.After(time.Second):
+			require.Fail(t, "daemon did not idle after the API-started build completed")
+		}
+	})
 }
 
 func TestEmbeddingsRoutesSelectRecallStoreManager(t *testing.T) {
@@ -240,10 +228,14 @@ func TestEmbeddingsBuildIncludeAutomatedDefaulting(t *testing.T) {
 	}{
 		{"omitted uses configured true", true, `{}`, true},
 		{"omitted uses configured false", false, `{}`, false},
-		{"explicit false overrides configured true", true,
-			`{"include_automated":false}`, false},
-		{"explicit true overrides configured false", false,
-			`{"include_automated":true}`, true},
+		{
+			"explicit false overrides configured true", true,
+			`{"include_automated":false}`, false,
+		},
+		{
+			"explicit true overrides configured false", false,
+			`{"include_automated":true}`, true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -253,7 +245,7 @@ func TestEmbeddingsBuildIncludeAutomatedDefaulting(t *testing.T) {
 				WithEmbeddingsIncludeAutomatedDefault(tt.configured),
 			)
 
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/embeddings/build",
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/embeddings/build",
 				strings.NewReader(tt.body))
 			req.Header.Set("Content-Type", "application/json")
 			w := httptest.NewRecorder()
@@ -435,7 +427,7 @@ func TestEmbeddingsRetireRefusalReturnsConflict(t *testing.T) {
 	w := serveJSON(t, s.mux, http.MethodPost, "/api/v1/embeddings/generations/7/retire",
 		map[string]bool{"force": false})
 	assertRecorderStatus(t, w, http.StatusConflict)
-	assert.True(t, strings.Contains(w.Body.String(), "is active"))
+	assert.Contains(t, w.Body.String(), "is active")
 }
 
 func TestEmbeddingsRetireUnknownGenerationReturnsNotFound(t *testing.T) {

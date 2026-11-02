@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
   import { Button, Card } from "@kenn-io/kit-ui";
-  import { fetchSessionRecall } from "../../api/recall.js";
+  import { RecallService } from "../../api/generated/index.js";
   import type {
     RecallEntry,
     RecallEvidence,
@@ -25,9 +26,9 @@
     loading = true;
     failed = false;
     try {
-      const next = await fetchSessionRecall(id, signal);
+      const next = await RecallService.getApiV1RecallEntries({ source_session_id: id, limit: 500 }, { signal });
       if (!read.isCurrent(signal)) return;
-      entries = next;
+      entries = next.entries;
     } catch (error) {
       if (isAbortError(error) || !read.isCurrent(signal)) return;
       entries = [];
@@ -69,7 +70,7 @@
   {#if loading}
     <p class="recall-state">{m.session_recall_loading()}</p>
   {:else if failed}
-    <p class="recall-state recall-error">{m.session_recall_error()}</p>
+    <p class="recall-state recall-error" {@attach errorTelemetry("session")}>{m.session_recall_error()}</p>
   {:else if entries.length === 0}
     <p class="recall-state">{m.session_recall_empty()}</p>
   {:else}

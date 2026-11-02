@@ -11,14 +11,18 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
+	"go.kenn.io/agentsview/internal/pathutil"
 	"go.kenn.io/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 type DuckDBPushConfig struct {
@@ -33,9 +37,26 @@ type DuckDBPushConfig struct {
 	// incremental push blocked by read-only serve handles defers instead
 	// of rebuilding the whole archive on every changed batch, and
 	// archive-scale diagnostics are skipped (see
-	// duckdbsync.SyncOptions.Automatic). Explicit `duckdb push` runs leave
+	// storage.MirrorPushOptions.Automatic). Explicit `duckdb push` runs leave
 	// it false and do neither.
 	Automatic bool
+}
+
+// duckDBPusher pushes the archive to the DuckDB mirror from a watch process
+// that owns the archive. Local sync runs separately, so each push sends
+// whatever the archive holds when it starts.
+type duckDBPusher struct {
+	mirrorPush func(context.Context, bool) (storage.MirrorPushResult, error)
+}
+
+func (p *duckDBPusher) push(
+	ctx context.Context, reason pushReason, full bool,
+) error {
+	res, err := p.mirrorPush(ctx, full)
+	if err != nil {
+		return err
+	}
+	return completeDuckDBWatchPush(res, reason, full)
 }
 
 type DuckDBQuackServeConfig struct {
@@ -46,7 +67,7 @@ type DuckDBQuackServeConfig struct {
 }
 
 func runDuckDBPush(cfg DuckDBPushConfig) {
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
 		log.Fatalf("loading config: %v", err)
 	}
@@ -63,7 +84,7 @@ func runDuckDBPush(cfg DuckDBPushConfig) {
 	if err != nil {
 		fatal("duckdb push: %v", err)
 	}
-	if err := duckdbsync.ValidatePushTarget(duckCfg); err != nil {
+	if err := mirrorBackend.ValidatePushTarget(duckCfg); err != nil {
 		fatal("duckdb push: %v", err)
 	}
 	writeDuckDBPushPlan(os.Stdout, duckCfg, cfg, projects, excludeProjects)
@@ -73,7 +94,11 @@ func runDuckDBPush(cfg DuckDBPushConfig) {
 	)
 	defer stop()
 
-	backend, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg)
+	intent := transportIntentArchiveWrite
+	if cfg.Watch {
+		intent = transportIntentLongLived
+	}
+	backend, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg, intent)
 	if err != nil {
 		fatal("opening writer: %v", err)
 	}
@@ -136,17 +161,13 @@ func writeDuckDBPushPlan(
 }
 
 // writeDuckDBPushDiagnostics prints how the push selected sessions. A
-// rebuild (result.Diagnostics.Full) has no incremental candidate/skip
-// counters to report — pushEverything never populates them — so it gets its
-// own branch that always prints, including the reason a rebuild ran instead
-// of the requested incremental push (see rebuildReason in
-// internal/duckdb/probe.go). Earlier code only printed anything when
-// Diagnostics.Cutoff was non-empty, which incremental pushes always set but
-// rebuilds never do; that made every rebuild-instead-of-incremental case
-// (missing file, schema drift, a live serve holding the mirror locked, ...)
-// silently print nothing here, leaving only the generic "Pushed N
-// sessions..." summary with no indication a full rebuild had just run.
-func writeDuckDBPushDiagnostics(w io.Writer, result duckdbsync.PushResult) {
+// rebuild (result.Diagnostics.Full) has no incremental candidate counters,
+// so it gets its own branch that always prints, including the reason a
+// rebuild ran instead of the requested incremental push (see rebuildReason
+// in internal/duckdb/probe.go) and the sessions a resumed rebuild kept from
+// the unfinished one. Rebuilds set no Diagnostics.Cutoff, so keying output
+// on it would print nothing for them.
+func writeDuckDBPushDiagnostics(w io.Writer, result storage.MirrorPushResult) {
 	if result.Diagnostics.Deferred {
 		reason := result.Diagnostics.DeferredReason
 		if reason == "" {
@@ -167,6 +188,14 @@ func writeDuckDBPushDiagnostics(w io.Writer, result duckdbsync.PushResult) {
 			formatDuckDBPushSessionCounts(result.Diagnostics.PushedSessions),
 			result.MessagesPushed,
 		)
+		// A fresh rebuild file is empty, so any skipped session is one the
+		// unfinished rebuild already wrote.
+		if kept := result.Diagnostics.SkippedUnchangedSessions; kept.Total > 0 {
+			fmt.Fprintf(
+				w, "DuckDB push kept: sessions %s already written by the unfinished rebuild\n",
+				formatDuckDBPushSessionCounts(kept),
+			)
+		}
 		return
 	}
 	if result.Diagnostics.Cutoff == "" {
@@ -188,9 +217,9 @@ func writeDuckDBPushDiagnostics(w io.Writer, result duckdbsync.PushResult) {
 // formatDuckDBPushSource renders an incremental push's source counters.
 // The "local N" figure is omitted when LocalSessionCount is 0: automatic
 // pushes skip the archive-scale scope count entirely (see
-// duckdbsync.SyncOptions.Automatic), so 0 means "not counted", not an
+// storage.MirrorPushOptions.Automatic), so 0 means "not counted", not an
 // empty archive.
-func formatDuckDBPushSource(d duckdbsync.PushDiagnostics) string {
+func formatDuckDBPushSource(d storage.MirrorPushDiagnostics) string {
 	source := ""
 	if d.LocalSessionCount > 0 {
 		source = fmt.Sprintf("local %d; ", d.LocalSessionCount)
@@ -214,9 +243,9 @@ func formatDuckDBPushFilters(projects []string, excludeProjects []string) string
 	}
 }
 
-func formatDuckDBPushSessionCounts(counts duckdbsync.PushSessionCounts) string {
+func formatDuckDBPushSessionCounts(counts storage.MirrorSessionCounts) string {
 	if len(counts.ByAgent) == 0 {
-		return fmt.Sprintf("%d", counts.Total)
+		return strconv.Itoa(counts.Total)
 	}
 	agents := make([]string, 0, len(counts.ByAgent))
 	for agent := range counts.ByAgent {
@@ -235,7 +264,7 @@ func duckDBLongRunningSignals() []os.Signal {
 }
 
 func runDuckDBStatus() {
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
 		log.Fatalf("loading config: %v", err)
 	}
@@ -258,7 +287,7 @@ func runDuckDBStatus() {
 	}
 	if status.MirrorMissing {
 		fmt.Printf(
-			"DuckDB mirror not found at %s; run 'agentsview duckdb push' to create it\n",
+			"DuckDB mirror not found at %s; run 'agentsview replica duckdb push' to create it\n",
 			duckCfg.Path,
 		)
 		return
@@ -272,7 +301,7 @@ func runDuckDBStatus() {
 		scope = "all projects"
 	}
 	fmt.Printf("Machine:         %s\n", machine)
-	fmt.Printf("Last push:       %s\n", valueOrNever(status.LastPushAt))
+	fmt.Printf("Last push:       %s\n", db.ValueOrNever(status.LastPushAt))
 	fmt.Printf("Schema version:  %d\n", status.SchemaVersion)
 	fmt.Printf("Data version:    %d\n", status.DataVersion)
 	fmt.Printf("Scope:           %s\n", scope)
@@ -285,7 +314,7 @@ func loadDuckDBServeConfig(cmd *cobra.Command) (config.Config, string, error) {
 	if err != nil {
 		return config.Config{}, "", fmt.Errorf("reading base-path: %w", err)
 	}
-	cfg, err := config.LoadDuckDBServePFlags(cmd.Flags())
+	cfg, err := config.LoadRemoteServePFlags(cmd.Flags())
 	if err != nil {
 		return config.Config{}, "", fmt.Errorf("loading config: %w", err)
 	}
@@ -324,9 +353,10 @@ func runDuckDBServe(appCfg config.Config, basePath string) {
 
 	rtOpts := serveRuntimeOptions{
 		Mode:          "duckdb-serve",
+		BasePath:      basePath,
 		RequestedPort: appCfg.Port,
 	}
-	appCfg, err = prepareServeRuntimeConfig(appCfg, rtOpts)
+	appCfg, err = prepareServeRuntimeConfig(ctx, appCfg, rtOpts)
 	if err != nil {
 		fatal("duckdb serve: %v", err)
 	}
@@ -341,7 +371,7 @@ func runDuckDBServe(appCfg config.Config, basePath string) {
 		server.WithBaseContext(ctx),
 	}
 	if basePath != "" {
-		opts = append(opts, server.WithBasePath(basePath))
+		opts = append(opts, server.WithBasePath(rtOpts.BasePath))
 	}
 	srv := server.New(appCfg, store, nil, opts...)
 	rt, err := startServerWithOptionalCaddy(ctx, appCfg, srv, rtOpts)
@@ -352,7 +382,7 @@ func runDuckDBServe(appCfg config.Config, basePath string) {
 		fatal("duckdb serve: %v", err)
 	}
 	if _, sfErr := writeDaemonRuntimeWithAuth(
-		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, true,
+		rt.Cfg.DataDir, rt.Cfg.Host, rt.Cfg.Port, version, rt.PublicURL, true,
 		rt.Cfg.RequireAuth,
 		rt.Caddy.Pid(),
 	); sfErr != nil {
@@ -374,7 +404,7 @@ func runDuckDBServe(appCfg config.Config, basePath string) {
 		)
 	} else {
 		fmt.Printf(
-			"agentsview %s (duckdb read-only) backend at %s, public at %s\n",
+			"agentsview %s (duckdb read-only) listening at %s, browser URL: %s\n",
 			version,
 			rt.LocalURL,
 			rt.PublicURL,
@@ -410,7 +440,7 @@ func openDuckDBServeStore(
 	}
 
 	applyClassifierConfig(appCfg)
-	store, err := duckdbsync.NewStoreFromConfig(duckCfg)
+	store, err := duckdbsync.NewStoreFromConfig(ctx, duckCfg)
 	if err != nil {
 		fatal("duckdb serve: %v", err)
 	}
@@ -434,7 +464,7 @@ func openDuckDBServeStore(
 	if schemaErr != nil {
 		if duckCfg.URL == "" {
 			fatal("duckdb serve: schema incompatible: %v\n"+
-				"Run 'agentsview duckdb push --full' to repopulate the mirror.", schemaErr)
+				"Run 'agentsview replica duckdb push --full' to repopulate the mirror.", schemaErr)
 		}
 		fatal("duckdb serve: schema incompatible: %v", schemaErr)
 	}
@@ -475,7 +505,7 @@ func duckDBMirrorServeProbeError(probe duckdbsync.MirrorProbe) error {
 				"that process if it predates the read-only serve change", reason,
 		)
 	}
-	return fmt.Errorf("%s; rebuild with 'agentsview duckdb push --full'", reason)
+	return fmt.Errorf("%s; rebuild with 'agentsview replica duckdb push --full'", reason)
 }
 
 // duckDBMirrorProbeFailureReason reports why probe is not safe to serve
@@ -501,7 +531,7 @@ func duckDBMirrorProbeFailureReason(probe duckdbsync.MirrorProbe) string {
 }
 
 func runDuckDBQuackServe(cfg DuckDBQuackServeConfig) {
-	appCfg, err := config.LoadMinimal()
+	appCfg, err := config.LoadMinimalFor(config.ScopeLocal)
 	if err != nil {
 		log.Fatalf("loading config: %v", err)
 	}
@@ -515,7 +545,10 @@ func runDuckDBQuackServe(cfg DuckDBQuackServeConfig) {
 		fatal("duckdb quack serve: %v", err)
 	}
 	if cfg.Path != "" {
-		duckCfg.Path = cfg.Path
+		duckCfg.Path, err = pathutil.ExpandHome(cfg.Path)
+		if err != nil {
+			fatal("duckdb quack serve: expanding --path: %v", err)
+		}
 	}
 	if cfg.AllowInsecure {
 		duckCfg.AllowInsecure = true
@@ -618,7 +651,7 @@ func serveQuackOnce(
 		return quackServeSession{}, fmt.Errorf("statting duckdb mirror: %w", err)
 	}
 	duckdbsync.PrimeFileIdentity(info)
-	conn, err := duckdbsync.OpenReadOnly(duckCfg.Path)
+	conn, err := duckdbsync.OpenReadOnly(ctx, duckCfg.Path)
 	if err != nil {
 		return quackServeSession{}, err
 	}
@@ -745,9 +778,7 @@ func resolveQuackServeToken(
 	if configuredToken != "" {
 		return configuredToken, nil
 	}
-	return "", fmt.Errorf(
-		"token is required; set --token, AGENTSVIEW_DUCKDB_TOKEN, or [duckdb].token",
-	)
+	return "", errors.New("token is required; set --token, AGENTSVIEW_DUCKDB_TOKEN, or [duckdb].token")
 }
 
 func identifyQuackNode(ctx context.Context, conn *sql.DB, machine string) {
@@ -798,15 +829,11 @@ func resolveDuckDBPushProjects(
 	duckCfg config.DuckDBConfig, cfg DuckDBPushConfig,
 ) (projects, exclude []string, err error) {
 	if cfg.ProjectsFlag != "" && cfg.ExcludeProjects != "" {
-		return nil, nil, fmt.Errorf(
-			"--projects and --exclude-projects are mutually exclusive",
-		)
+		return nil, nil, errors.New("--projects and --exclude-projects are mutually exclusive")
 	}
 	if cfg.AllProjects &&
 		(cfg.ProjectsFlag != "" || cfg.ExcludeProjects != "") {
-		return nil, nil, fmt.Errorf(
-			"--all-projects cannot be combined with --projects or --exclude-projects",
-		)
+		return nil, nil, errors.New("--all-projects cannot be combined with --projects or --exclude-projects")
 	}
 	projects = duckCfg.Projects
 	exclude = duckCfg.ExcludeProjects
@@ -823,9 +850,7 @@ func resolveDuckDBPushProjects(
 		projects = nil
 	}
 	if len(projects) > 0 && len(exclude) > 0 {
-		return nil, nil, fmt.Errorf(
-			"projects and exclude_projects are mutually exclusive",
-		)
+		return nil, nil, errors.New("projects and exclude_projects are mutually exclusive")
 	}
 	return projects, exclude, nil
 }

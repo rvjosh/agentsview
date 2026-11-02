@@ -1,11 +1,13 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -31,8 +33,8 @@ type VibeToolCall struct {
 
 // VibeToolCallFunction represents the function details of a tool call
 type VibeToolCallFunction struct {
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
+	Name      string         `json:"name"`
+	Arguments jsontext.Value `json:"arguments"`
 }
 
 // VibeSessionMetadata represents session-level metadata from meta.json
@@ -60,9 +62,11 @@ type VibeStats struct {
 	Steps                    int   `json:"steps"`
 	SessionPromptTokens      int   `json:"session_prompt_tokens"`
 	SessionCompletionTokens  int   `json:"session_completion_tokens"`
+	SessionCachedTokens      int   `json:"session_cached_tokens"`
 	ContextTokens            int   `json:"context_tokens"`
 	LastTurnPromptTokens     int   `json:"last_turn_prompt_tokens"`
 	LastTurnCompletionTokens int   `json:"last_turn_completion_tokens"`
+	LastTurnCachedTokens     int   `json:"last_turn_cached_tokens"`
 	SessionTotalLLMTokens    int64 `json:"session_total_llm_tokens"`
 	LastTurnTotalTokens      int   `json:"last_turn_total_tokens"`
 }
@@ -88,91 +92,16 @@ func parseVibeResultFile(path string, fileInfo FileInfo) (ParseResult, error) {
 	result.Session.ID = "vibe:" + filepath.Base(dir)
 	result.Session.Project = "vibe"
 
-	// Try to parse meta.json for additional metadata
-	var sessionModel string
-	var sessionStats VibeStats
-	var hasMetaData bool
-	metaPath := filepath.Join(dir, "meta.json")
-	metaData, metaErr := parseVibeMetadata(metaPath)
-	switch {
-	case metaErr != nil && errors.Is(metaErr, os.ErrNotExist):
-		// meta.json has not been written yet (a freshly created session):
-		// keep the directory-name fallback ID set above.
-	case metaErr != nil:
-		// meta.json exists but the full parse failed: a partial write or a
-		// single malformed optional field. Recover the canonical session_id
-		// from a tolerant minimal parse so a transient error does not abandon
-		// the canonical session row for the directory-name fallback (which
-		// would exclude and re-create the row, dropping pins and usage). If
-		// even the minimal parse fails, surface the error so the sync retries
-		// and leaves the existing row untouched rather than replacing it.
-		id, idErr := parseVibeSessionID(metaPath)
-		if idErr != nil {
-			return result, fmt.Errorf(
-				"parsing Vibe meta.json %s: %w", metaPath, metaErr,
-			)
-		}
-		if id != "" {
-			result.Session.ID = "vibe:" + id
-			result.Session.SourceSessionID = id
-		}
-	default:
-		hasMetaData = true
-		sessionStats = metaData.Stats
-		// Use the actual session_id from meta.json as the canonical ID
-		if metaData.SessionID != "" {
-			result.Session.ID = "vibe:" + metaData.SessionID
-			result.Session.SourceSessionID = metaData.SessionID
-		}
-		if metaData.Title != "" {
-			result.Session.SessionName = metaData.Title
-		}
-		if !metaData.StartTime.IsZero() {
-			result.Session.StartedAt = metaData.StartTime
-		}
-		if !metaData.EndTime.IsZero() {
-			result.Session.EndedAt = metaData.EndTime
-		}
-		if metaData.Model != "" {
-			sessionModel = metaData.Model
-		}
-		if metaData.WorkingDir != "" {
-			result.Session.Cwd = metaData.WorkingDir
-			// Derive a human-readable project name from the working
-			// directory (the enclosing git repo, or its basename),
-			// matching how Claude sessions are grouped. Falls back to
-			// "vibe" when no working directory is recorded.
-			if p := ExtractProjectFromCwdWithBranch(
-				metaData.WorkingDir, metaData.GitBranch,
-			); p != "" {
-				result.Session.Project = p
-			}
-		}
-		if metaData.GitBranch != "" {
-			result.Session.GitBranch = metaData.GitBranch
-		}
-		if metaData.GitCommit != "" {
-			result.Session.SourceVersion = metaData.GitCommit
-		}
-		// Extract token usage from stats
-		if metaData.Stats.SessionCompletionTokens > 0 {
-			result.Session.HasTotalOutputTokens = true
-			result.Session.TotalOutputTokens = metaData.Stats.SessionCompletionTokens
-		}
-		if metaData.Stats.ContextTokens > 0 {
-			result.Session.HasPeakContextTokens = true
-			result.Session.PeakContextTokens = metaData.Stats.ContextTokens
-		} else if metaData.Stats.SessionPromptTokens > 0 {
-			result.Session.HasPeakContextTokens = true
-			result.Session.PeakContextTokens = metaData.Stats.SessionPromptTokens
-		}
-
-		// Handle parent session relationship. The parent reference is a
-		// bare session_id, so prefix it to match the canonical ID scheme.
-		if metaData.ParentSessionID != nil && *metaData.ParentSessionID != "" {
-			result.Session.ParentSessionID = "vibe:" + *metaData.ParentSessionID
-			result.Session.RelationshipType = RelContinuation
-		}
+	sessionModel, sessionStats, hasMetaData, err := applyVibeMetadata(&result, dir)
+	if err != nil {
+		return result, err
+	}
+	if sessionStats.ContextTokens > 0 {
+		result.Session.HasPeakContextTokens = true
+		result.Session.PeakContextTokens = sessionStats.ContextTokens
+	} else if sessionStats.SessionPromptTokens > 0 {
+		result.Session.HasPeakContextTokens = true
+		result.Session.PeakContextTokens = sessionStats.SessionPromptTokens
 	}
 
 	// Parse messages.jsonl
@@ -185,7 +114,6 @@ func parseVibeResultFile(path string, fileInfo FileInfo) (ParseResult, error) {
 	lr := newLineReader(file, maxLineSize)
 	defer releaseLineReader(lr)
 	messageOrdinal := 0
-	var firstUserContent string
 
 	for {
 		line, ok := lr.next()
@@ -237,14 +165,6 @@ func parseVibeResultFile(path string, fileInfo FileInfo) (ParseResult, error) {
 		msg, _ := convertVibeMessage(vibeMsg, messageOrdinal, sessionModel)
 		result.Messages = append(result.Messages, msg)
 
-		// Track first user message content for session metadata. Skip
-		// system/injected context so it never becomes the session's first
-		// message.
-		if firstUserContent == "" && msg.Role == RoleUser &&
-			!msg.IsSystem && msg.Content != "" {
-			firstUserContent = msg.Content
-		}
-
 		messageOrdinal++
 	}
 
@@ -252,20 +172,7 @@ func parseVibeResultFile(path string, fileInfo FileInfo) (ParseResult, error) {
 		return result, fmt.Errorf("failed to read Vibe session file: %w", err)
 	}
 
-	// Set session metadata from messages
-	if len(result.Messages) > 0 {
-		result.Session.MessageCount = len(result.Messages)
-		result.Session.FirstMessage = firstUserContent
-	}
-
-	// Count real user messages, excluding system/injected context and the
-	// empty tool-result carrier messages emitted for "tool" records (which
-	// carry RoleUser to satisfy pairToolResults).
-	for _, msg := range result.Messages {
-		if msg.Role == RoleUser && !msg.IsSystem && len(msg.ToolResults) == 0 {
-			result.Session.UserMessageCount++
-		}
-	}
+	setVibeMessageMetadata(&result)
 
 	// Create usage events from session stats if we have stats, a model, and any token data
 	if hasMetaData && sessionModel != "" {
@@ -278,6 +185,111 @@ func parseVibeResultFile(path string, fileInfo FileInfo) (ParseResult, error) {
 	}
 
 	return result, nil
+}
+
+func applyVibeMetadata(result *ParseResult, dir string) (string, VibeStats, bool, error) {
+	var sessionModel string
+	var sessionStats VibeStats
+	var hasMetaData bool
+	metaPath := filepath.Join(dir, "meta.json")
+	metaData, metaErr := parseVibeMetadata(metaPath)
+	switch {
+	case metaErr != nil && errors.Is(metaErr, os.ErrNotExist):
+		// meta.json has not been written yet (a freshly created session):
+		// keep the directory-name fallback ID set above.
+	case metaErr != nil:
+		// meta.json exists but the full parse failed: a partial write or a
+		// single malformed optional field. Recover the identity-bearing fields
+		// through a tolerant minimal parse so a transient error cannot replace
+		// the canonical row or its repository classification with fallbacks. If
+		// even the minimal parse fails, surface the error so sync retries and
+		// leaves the existing row untouched.
+		identity, identityErr := parseVibeIdentityMetadata(metaPath)
+		if identityErr != nil {
+			return "", VibeStats{}, false, fmt.Errorf(
+				"parsing Vibe meta.json %s: %w", metaPath, metaErr,
+			)
+		}
+		if identity.SessionID != "" {
+			result.Session.ID = "vibe:" + identity.SessionID
+			result.Session.SourceSessionID = identity.SessionID
+		}
+		if identity.WorkingDir != "" {
+			result.Session.Cwd = identity.WorkingDir
+			if project := ExtractProjectFromCwdWithBranch(
+				identity.WorkingDir, identity.GitBranch,
+			); project != "" {
+				result.Session.Project = project
+			}
+		}
+		if identity.GitBranch != "" {
+			result.Session.GitBranch = identity.GitBranch
+		}
+	default:
+		hasMetaData = true
+		sessionStats = metaData.Stats
+		// Use the actual session_id from meta.json as the canonical ID
+		if metaData.SessionID != "" {
+			result.Session.ID = "vibe:" + metaData.SessionID
+			result.Session.SourceSessionID = metaData.SessionID
+		}
+		if metaData.Title != "" {
+			result.Session.SessionName = metaData.Title
+		}
+		if !metaData.StartTime.IsZero() {
+			result.Session.StartedAt = metaData.StartTime
+		}
+		if !metaData.EndTime.IsZero() {
+			result.Session.EndedAt = metaData.EndTime
+		}
+		if metaData.Model != "" {
+			sessionModel = metaData.Model
+		}
+		if metaData.WorkingDir != "" {
+			result.Session.Cwd = metaData.WorkingDir
+			// Derive a human-readable project name from the working
+			// directory (the enclosing git repo, or its basename),
+			// matching how Claude sessions are grouped. Falls back to
+			// "vibe" when no working directory is recorded.
+			if p := ExtractProjectFromCwdWithBranch(
+				metaData.WorkingDir, metaData.GitBranch,
+			); p != "" {
+				result.Session.Project = p
+			}
+		}
+		if metaData.GitBranch != "" {
+			result.Session.GitBranch = metaData.GitBranch
+		}
+		if metaData.GitCommit != "" {
+			result.Session.SourceVersion = metaData.GitCommit
+		}
+		// Extract token usage from stats
+		if metaData.Stats.SessionCompletionTokens > 0 {
+			result.Session.HasTotalOutputTokens = true
+			result.Session.TotalOutputTokens = metaData.Stats.SessionCompletionTokens
+		}
+
+		// Handle parent session relationship. The parent reference is a
+		// bare session_id, so prefix it to match the canonical ID scheme.
+		if metaData.ParentSessionID != nil && *metaData.ParentSessionID != "" {
+			result.Session.ParentSessionID = "vibe:" + *metaData.ParentSessionID
+			result.Session.RelationshipType = RelContinuation
+		}
+	}
+
+	return sessionModel, sessionStats, hasMetaData, nil
+}
+
+func setVibeMessageMetadata(result *ParseResult) {
+	result.Session.MessageCount = len(result.Messages)
+	for _, msg := range result.Messages {
+		if msg.Role == RoleUser && !msg.IsSystem && len(msg.ToolResults) == 0 {
+			result.Session.UserMessageCount++
+			if result.Session.FirstMessage == "" && msg.Content != "" {
+				result.Session.FirstMessage = msg.Content
+			}
+		}
+	}
 }
 
 // parseVibeMetadata parses the meta.json file for session-level metadata
@@ -306,23 +318,33 @@ func parseVibeMetadata(path string) (VibeSessionMetadata, error) {
 	return meta, nil
 }
 
-// parseVibeSessionID extracts only the canonical session_id from meta.json
-// using a minimal tolerant struct. A malformed optional field (for example a
-// bad timestamp) fails the full VibeSessionMetadata parse but must not cost the
-// session its stable identity, so the id is recovered independently. Returns an
-// error when the file cannot be read or is not even minimally valid JSON.
-func parseVibeSessionID(path string) (string, error) {
+type vibeIdentityMetadata struct {
+	SessionID   string `json:"session_id"`
+	WorkingDir  string `json:"working_dir,omitempty"`
+	GitBranch   string `json:"git_branch,omitempty"`
+	Environment struct {
+		WorkingDirectory string `json:"working_directory,omitempty"`
+	} `json:"environment,omitempty"`
+}
+
+// parseVibeIdentityMetadata extracts the canonical id and repository-bearing
+// fields with a minimal tolerant struct. A malformed optional field (for
+// example a timestamp) can fail the full metadata parse without invalidating
+// these independent strings. Corrupt JSON still returns an error so sync leaves
+// the existing row untouched and retries the source later.
+func parseVibeIdentityMetadata(path string) (vibeIdentityMetadata, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return vibeIdentityMetadata{}, err
 	}
-	var meta struct {
-		SessionID string `json:"session_id"`
-	}
+	var meta vibeIdentityMetadata
 	if err := json.Unmarshal(data, &meta); err != nil {
-		return "", err
+		return vibeIdentityMetadata{}, err
 	}
-	return meta.SessionID, nil
+	if meta.WorkingDir == "" {
+		meta.WorkingDir = meta.Environment.WorkingDirectory
+	}
+	return meta, nil
 }
 
 // convertVibeMessage converts a VibeMessage to a ParsedMessage
@@ -361,7 +383,7 @@ func convertVibeMessage(vibeMsg VibeMessage, ordinal int, defaultModel string) (
 		toolCall := ParsedToolCall{
 			ToolUseID: tc.ID,
 			ToolName:  tc.Function.Name,
-			Category:  NormalizeToolCategory(tc.Function.Name),
+			Category:  vibeToolCategory(tc.Function.Name),
 			InputJSON: vibeToolArguments(tc.Function.Arguments),
 		}
 		toolCalls = append(toolCalls, toolCall)
@@ -375,11 +397,19 @@ func convertVibeMessage(vibeMsg VibeMessage, ordinal int, defaultModel string) (
 	return msg, toolCalls
 }
 
+func vibeToolCategory(name string) string {
+	name = strings.TrimPrefix(name, "file_system.")
+	if name == "search_replace" {
+		return "Edit"
+	}
+	return NormalizeToolCategory(name)
+}
+
 // vibeToolArguments normalizes a tool call's arguments to a raw JSON object.
 // Vibe (like the OpenAI/Mistral wire format) may encode arguments either as a
 // nested JSON object or as a JSON-encoded string; the latter is unwrapped so
 // InputJSON is always the underlying object.
-func vibeToolArguments(args json.RawMessage) string {
+func vibeToolArguments(args jsontext.Value) string {
 	if len(args) > 0 && args[0] == '"' {
 		var s string
 		if err := json.Unmarshal(args, &s); err == nil {
@@ -389,7 +419,7 @@ func vibeToolArguments(args json.RawMessage) string {
 	return string(args)
 }
 
-// parseSession parses a Vibe session at path and returns the session, messages,
+// parseVibeSession parses a Vibe session at path and returns the session, messages,
 // and usage events in the shape the provider consumes: (*ParsedSession,
 // []ParsedMessage, []ParsedUsageEvent, error). It stats the file to build
 // FileInfo and optionally overrides the project and machine.
@@ -405,7 +435,12 @@ func parseVibeSession(path, project, machine string) (*ParsedSession, []ParsedMe
 		Mtime: info.ModTime().UnixNano(),
 	}
 
-	result, err := parseVibeResultFile(path, fileInfo)
+	var result ParseResult
+	if vibeIsUnifiedAnchor(path) {
+		result, err = parseVibeUnifiedResultFile(path, fileInfo)
+	} else {
+		result, err = parseVibeResultFile(path, fileInfo)
+	}
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -429,10 +464,6 @@ func parseVibeSession(path, project, machine string) (*ParsedSession, []ParsedMe
 func vibeUsageEvents(
 	stats VibeStats, model, sessionID string, startedAt, endedAt time.Time,
 ) []ParsedUsageEvent {
-	// Only emit an event if we have a model and at least some token usage data
-	if model == "" {
-		return nil
-	}
 	if stats.SessionPromptTokens == 0 && stats.SessionCompletionTokens == 0 &&
 		stats.ContextTokens == 0 && stats.SessionTotalLLMTokens == 0 {
 		return nil
@@ -441,7 +472,13 @@ func vibeUsageEvents(
 	// Use SessionPromptTokens for input tokens and SessionCompletionTokens for output tokens.
 	// SessionTotalLLMTokens appears to be the sum of input + output tokens,
 	// so we don't use it as a direct source but it can serve as validation.
-	inputTokens := stats.SessionPromptTokens
+	//
+	// SessionCachedTokens is the provider cache-hit (read) count, reported as a
+	// subset of SessionPromptTokens (OpenAI/Mistral wire shape). Split it out
+	// so cache reads are priced at the discounted cache-read rate and not
+	// double-counted against the full input rate.
+	cacheReadTokens := max(stats.SessionCachedTokens, 0)
+	inputTokens := max(stats.SessionPromptTokens-cacheReadTokens, 0)
 	outputTokens := stats.SessionCompletionTokens
 
 	return []ParsedUsageEvent{{
@@ -450,12 +487,12 @@ func vibeUsageEvents(
 		Model:        model,
 		InputTokens:  inputTokens,
 		OutputTokens: outputTokens,
-		// Vibe doesn't currently expose cache token breakdown in meta.json
+		// Vibe doesn't currently expose cache-creation breakdown
 		CacheCreationInputTokens: 0,
-		CacheReadInputTokens:     0,
+		CacheReadInputTokens:     cacheReadTokens,
 		ReasoningTokens:          0,
 		// Vibe doesn't currently expose cost information
-		CostUSD:    nil,
+		Cost:       nil,
 		CostStatus: "",
 		CostSource: "",
 		OccurredAt: vibeTimeString(endedAt, startedAt),

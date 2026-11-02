@@ -1,36 +1,56 @@
 package remotesync
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"mime"
-	"net/http"
+	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+	"time"
+
+	"go.kenn.io/kit/spill"
 
 	"go.kenn.io/agentsview/internal/db"
 	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
-type HTTPSync struct {
-	Host                    string
-	URL                     string
-	Token                   string
+// RemoteSyncLifecycle observes the preparation and atomic rebuild work for one
+// remote host. Callbacks run synchronously around the operation they describe.
+type RemoteSyncLifecycle struct {
+	PrepareStarted  func()
+	PrepareFinished func(error)
+	RebuildStarted  func()
+	RebuildFinished func(syncpkg.SyncStats, error)
+}
+
+type RemoteSync struct {
+	Host string
+	// Source fetches the remote half of the sync. Required.
+	Source                  Source
 	Full                    bool
+	FullReason              FullImportReason
 	DataDir                 string
 	DB                      *db.DB
 	BlockedResultCategories []string
 	Progress                syncpkg.ProgressFunc
-	Client                  *http.Client
-	runPrepare              func(context.Context) (*PreparedHTTP, error)
+	Lifecycle               *RemoteSyncLifecycle
+	runPrepare              func(context.Context) (*PreparedRemote, error)
 	removeArchiveSpool      func(string) error
+	acquireMirrorLock       func(context.Context, string) (*MirrorLockHandle, error)
+}
+
+// forceParseRequested distinguishes an operator-requested full sync from a
+// complete source scan required by an automatic data rebuild. A blank reason
+// retains the historical meaning of Full for direct callers.
+func (hs RemoteSync) forceParseRequested() bool {
+	return hs.Full && (hs.FullReason == "" || hs.FullReason == FullImportExplicit)
+}
+
+func (hs RemoteSync) forceFullParseAfterCacheRequested() bool {
+	return hs.Full && !hs.forceParseRequested()
 }
 
 // PreparedCleanupError reports an operation failure while retaining a prepared
@@ -40,7 +60,7 @@ type HTTPSync struct {
 type PreparedCleanupError struct {
 	mu       sync.Mutex
 	cause    error
-	prepared *PreparedHTTP
+	prepared *PreparedRemote
 }
 
 func (e *PreparedCleanupError) Error() string { return e.cause.Error() }
@@ -64,7 +84,7 @@ func (e *PreparedCleanupError) RetryCleanup() error {
 	return nil
 }
 
-func (hs HTTPSync) Run(ctx context.Context) (stats SyncStats, err error) {
+func (hs RemoteSync) Run(ctx context.Context) (stats SyncStats, err error) {
 	prepare := hs.Prepare
 	if hs.runPrepare != nil {
 		prepare = hs.runPrepare
@@ -92,18 +112,24 @@ func (hs HTTPSync) Run(ctx context.Context) (stats SyncStats, err error) {
 	return prepared.ImportActive(ctx)
 }
 
-func (hs HTTPSync) importRoot(
+func (hs RemoteSync) importRoot(
 	ctx context.Context, targets TargetSet, root string,
 ) (SyncStats, error) {
 	stats, err := Importer{
 		Host:                    hs.Host,
 		Full:                    hs.Full,
+		RequireComplete:         true,
+		completeSourceMirror:    true,
 		DB:                      hs.DB,
 		BlockedResultCategories: hs.BlockedResultCategories,
 		Progress:                hs.Progress,
 	}.ImportExtracted(ctx, targets, root)
+	stats.FullReason = hs.FullReason
+	if stats.FullReason == "" {
+		stats.FullReason = FullImportLegacy
+	}
 	if err != nil {
-		return SyncStats{}, err
+		return stats, err
 	}
 	hs.report(syncpkg.Progress{
 		Detail: fmt.Sprintf(
@@ -114,111 +140,50 @@ func (hs HTTPSync) importRoot(
 	return stats, nil
 }
 
-func (hs HTTPSync) fetchManifest(
-	ctx context.Context, client *http.Client, targets TargetSet,
-) (Manifest, bool, error) {
-	body, err := json.Marshal(targets)
-	if err != nil {
-		return Manifest{}, false, err
-	}
-	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, hs.endpoint("/api/v1/remote-sync/manifest"),
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		return Manifest{}, false, err
-	}
-	hs.authorize(req)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept-Encoding", "gzip")
-	resp, err := client.Do(req)
-	if err != nil {
-		return Manifest{}, false, err
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
-		// Old daemon without the manifest endpoint; also gates delta
-		// archive usage (an old server would ignore the files field
-		// and return the full corpus).
-		return Manifest{}, false, nil
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return Manifest{}, false, httpStatusError(resp)
-	}
-	// A real old daemon has no manifest route at all: the POST falls
-	// through to the SPA catch-all, which serves index.html with a 200
-	// and Content-Type text/html rather than a 404. Treat any 2xx
-	// response that isn't JSON as manifest-unsupported instead of
-	// failing the decode below. A malformed Content-Type is treated the
-	// same way; only a genuine JSON response goes through the decoder,
-	// so truncated/corrupt JSON (e.g. bad gzip) still surfaces as a hard
-	// error rather than silently degrading to full syncs forever.
-	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		return Manifest{}, false, nil
-	}
-	reader := io.Reader(resp.Body)
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gz, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return Manifest{}, false, fmt.Errorf("decode manifest gzip: %w", err)
-		}
-		defer gz.Close()
-		reader = gz
-	}
-	var manifest Manifest
-	if err := json.NewDecoder(reader).Decode(&manifest); err != nil {
-		return Manifest{}, false, fmt.Errorf("decode remote manifest: %w", err)
-	}
-	return manifest, true, nil
-}
-
-func (hs HTTPSync) downloadIntoMirror(
+func (hs RemoteSync) downloadIntoMirror(
 	ctx context.Context,
-	client *http.Client,
 	targets TargetSet,
 	fetch []string,
 	full bool,
 	mirrorRoot string,
+) error {
+	return hs.downloadFilesIntoMirror(
+		ctx, targets, fetch, full, mirrorRoot,
+		fmt.Sprintf("%d changed files", len(fetch)),
+	)
+}
+
+// downloadFilesIntoMirror is downloadIntoMirror with files naming the fetched
+// files in its progress labels.
+func (hs RemoteSync) downloadFilesIntoMirror(
+	ctx context.Context,
+	targets TargetSet,
+	fetch []string,
+	full bool,
+	mirrorRoot string,
+	files string,
 ) (err error) {
 	request := ArchiveRequest{TargetSet: targets}
-	downloadLabel := fmt.Sprintf(
-		"Downloading %d changed files from %s", len(fetch), hs.Host,
-	)
-	extractLabel := fmt.Sprintf(
-		"Extracting %d changed files from %s", len(fetch), hs.Host,
-	)
+	downloadLabel := fmt.Sprintf("Downloading %s from %s", files, hs.Host)
+	extractLabel := fmt.Sprintf("Extracting %s from %s", files, hs.Host)
 	if full {
-		downloadLabel = fmt.Sprintf("Downloading session archive from %s", hs.Host)
-		extractLabel = fmt.Sprintf("Extracting session archive from %s", hs.Host)
+		downloadLabel = "Downloading session archive from " + hs.Host
+		extractLabel = "Extracting session archive from " + hs.Host
 	} else {
 		request.DeltaFiles = fetch
 	}
-	body, err := json.Marshal(request)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, hs.endpoint("/api/v1/remote-sync/archive"),
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		return err
-	}
-	hs.authorize(req)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept-Encoding", "gzip")
-	resp, err := client.Do(req)
+	downloadStarted := time.Now()
+	stream, err := hs.Source.Archive(ctx, request)
 	if err != nil {
 		return err
 	}
 	archive, err := hs.downloadArchive(
-		ctx, resp, downloadLabel, filepath.Dir(mirrorRoot),
+		ctx, stream, downloadLabel, filepath.Dir(mirrorRoot),
 	)
 	if err != nil {
 		return err
 	}
+	downloadDuration := time.Since(downloadStarted)
 	defer func() {
 		if cleanupErr := archive.Close(); cleanupErr != nil {
 			err = retainDownloadedArchiveCleanup(
@@ -229,65 +194,127 @@ func (hs HTTPSync) downloadIntoMirror(
 	if err := RemoveMirrorFetchFiles(mirrorRoot, fetch); err != nil {
 		return err
 	}
-	if err := archive.extract(ctx, mirrorRoot, hs.Progress, extractLabel); err != nil {
-		return fmt.Errorf("extract archive into mirror: %w", err)
+	extractStarted := time.Now()
+	var extractErr error
+	if full && fetch != nil {
+		selected := make(map[string]struct{}, len(fetch))
+		for _, remotePath := range fetch {
+			name, nameErr := safeRemotePathArchiveName(remotePath)
+			if nameErr != nil {
+				return nameErr
+			}
+			selected[filepath.ToSlash(filepath.Clean(name))] = struct{}{}
+		}
+		extractErr = archive.extractSelected(
+			ctx, mirrorRoot, selected, hs.Progress, extractLabel,
+		)
+	} else {
+		extractErr = archive.extract(ctx, mirrorRoot, hs.Progress, extractLabel)
+	}
+	hs.logArchiveTransfer(archive, downloadDuration, extractStarted)
+	if extractErr != nil {
+		return fmt.Errorf("extract archive into mirror: %w", extractErr)
 	}
 	return nil
 }
 
-func (hs HTTPSync) fetchTargets(
+// applyLargeMirrorChange applies a change too large to hold in memory, one
+// batch of paths at a time. Deletions go first so remote file/directory type
+// changes cannot wedge the mirror. Fetches go out as delta archive requests
+// of at most mirrorBatchBytes of paths each. When every manifest file
+// changed, or the remote refuses a delta request, one full archive replaces
+// the fetched files instead. The journal is a full import by then, so
+// extracting the whole archive leaves nothing unrecorded.
+func (hs RemoteSync) applyLargeMirrorChange(
 	ctx context.Context,
-	client *http.Client,
-) (TargetSet, error) {
-	req, err := http.NewRequestWithContext(
-		ctx, http.MethodGet, hs.endpoint("/api/v1/remote-sync/targets"), nil,
-	)
-	if err != nil {
-		return TargetSet{}, err
+	targets TargetSet,
+	delta MirrorDelta,
+	mirrorRoot string,
+) error {
+	for batch, err := range pathBatches(delta.Deletions, mirrorBatchBytes) {
+		if err != nil {
+			return err
+		}
+		if err := ApplyMirrorDeletions(mirrorRoot, batch); err != nil {
+			return err
+		}
 	}
-	hs.authorize(req)
-	resp, err := client.Do(req)
-	if err != nil {
-		return TargetSet{}, err
+	if delta.Fetch.Len() == 0 {
+		return nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return TargetSet{}, httpStatusError(resp)
+	if delta.Fetch.Len() < delta.Total {
+		refused, err := hs.downloadMirrorBatches(ctx, targets, delta.Fetch, mirrorRoot)
+		if err != nil || !refused {
+			return err
+		}
+		hs.reportProgressDetail(hs.Host +
+			" refused a partial download; downloading the full session archive instead")
 	}
-	var targets TargetSet
-	if err := json.NewDecoder(resp.Body).Decode(&targets); err != nil {
-		return TargetSet{}, fmt.Errorf("decode remote targets: %w", err)
+	// The full archive omits a file that vanished after the manifest listed
+	// it, so the old copies go first.
+	for batch, err := range pathBatches(delta.Fetch, mirrorBatchBytes) {
+		if err != nil {
+			return err
+		}
+		if err := RemoveMirrorTypeConflicts(mirrorRoot, batch); err != nil {
+			return err
+		}
+		if err := RemoveMirrorFetchFiles(mirrorRoot, batch); err != nil {
+			return err
+		}
 	}
-	return targets, nil
+	return hs.downloadIntoMirror(ctx, targets, nil, true, mirrorRoot)
 }
 
-func (hs HTTPSync) downloadAndExtract(
+// downloadMirrorBatches fetches the listed files as delta archive requests,
+// one batch at a time. It stops and reports refused when the remote refuses
+// a delta request.
+func (hs RemoteSync) downloadMirrorBatches(
 	ctx context.Context,
-	client *http.Client,
+	targets TargetSet,
+	fetch *spill.List,
+	mirrorRoot string,
+) (refused bool, err error) {
+	number, done := 0, 0
+	for batch, err := range pathBatches(fetch, mirrorBatchBytes) {
+		if err != nil {
+			return false, err
+		}
+		if err := RemoveMirrorTypeConflicts(mirrorRoot, batch); err != nil {
+			return false, err
+		}
+		number++
+		done += len(batch)
+		files := fmt.Sprintf("%d changed files", len(batch))
+		if number > 1 || done < fetch.Len() {
+			files = fmt.Sprintf("batch %d (%d of %d changed files)", number, done, fetch.Len())
+		}
+		err = hs.downloadFilesIntoMirror(ctx, targets, batch, false, mirrorRoot, files)
+		if isRemoteRefusal(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func (hs RemoteSync) downloadAndExtract(
+	ctx context.Context,
 	targets TargetSet,
 ) (root string, err error) {
-	body, err := json.Marshal(targets)
+	downloadStarted := time.Now()
+	stream, err := hs.Source.Archive(ctx, ArchiveRequest{TargetSet: targets})
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, hs.endpoint("/api/v1/remote-sync/archive"), bytes.NewReader(body),
-	)
+	downloadLabel := "Downloading session archive from " + hs.Host
+	archive, err := hs.downloadArchive(ctx, stream, downloadLabel, os.TempDir())
 	if err != nil {
 		return "", err
 	}
-	hs.authorize(req)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept-Encoding", "gzip")
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	downloadLabel := fmt.Sprintf("Downloading session archive from %s", hs.Host)
-	archive, err := hs.downloadArchive(ctx, resp, downloadLabel, os.TempDir())
-	if err != nil {
-		return "", err
-	}
+	downloadDuration := time.Since(downloadStarted)
 	var tmpDir string
 	defer func() {
 		cleanupErr := archive.Close()
@@ -318,28 +345,35 @@ func (hs HTTPSync) downloadAndExtract(
 	if err != nil {
 		return "", fmt.Errorf("create temp dir: %w", err)
 	}
-	extractLabel := fmt.Sprintf("Extracting session archive from %s", hs.Host)
-	if err := archive.extract(ctx, tmpDir, hs.Progress, extractLabel); err != nil {
-		return "", err
+	extractLabel := "Extracting session archive from " + hs.Host
+	extractStarted := time.Now()
+	extractErr := archive.extract(ctx, tmpDir, hs.Progress, extractLabel)
+	hs.logArchiveTransfer(archive, downloadDuration, extractStarted)
+	if extractErr != nil {
+		return "", extractErr
 	}
 	return tmpDir, nil
 }
 
-func (hs HTTPSync) report(progress syncpkg.Progress) {
+// logArchiveTransfer records how one archive's download and extraction
+// split their time, so slow syncs show which side to look at.
+func (hs RemoteSync) logArchiveTransfer(
+	archive *downloadedArchive, download time.Duration, extractStarted time.Time,
+) {
+	log.Printf("remote sync archive: host=%s encoding=%q wire_bytes=%d "+
+		"download_duration=%s extract_duration=%s",
+		hs.Host, archive.encoding, archive.bytes, download.Round(time.Millisecond),
+		time.Since(extractStarted).Round(time.Millisecond))
+}
+
+func (hs RemoteSync) report(progress syncpkg.Progress) {
 	if hs.Progress != nil {
 		hs.Progress(progress)
 	}
 }
 
-func (hs HTTPSync) reportProgressDetail(detail string) {
+func (hs RemoteSync) reportProgressDetail(detail string) {
 	hs.report(syncpkg.Progress{Detail: detail})
-}
-
-func positiveContentLength(n int64) int64 {
-	if n > 0 {
-		return n
-	}
-	return 0
 }
 
 type progressReader struct {
@@ -356,41 +390,4 @@ func (r *progressReader) Read(p []byte) (int, error) {
 		r.report(r.done, r.total)
 	}
 	return n, err
-}
-
-func (hs HTTPSync) endpoint(path string) string {
-	return strings.TrimRight(hs.URL, "/") + path
-}
-
-func (hs HTTPSync) authorize(req *http.Request) {
-	if hs.Token == "" {
-		return
-	}
-	req.Header.Set("Authorization", "Bearer "+hs.Token)
-}
-
-// StatusError reports a non-2xx response from a remote daemon's
-// remote-sync endpoints. Detail carries the (untrusted) response
-// body for local logs; user-facing summaries should rely on Code.
-type StatusError struct {
-	Code   int
-	Status string
-	Detail string
-}
-
-func (e *StatusError) Error() string {
-	msg := e.Detail
-	if msg == "" {
-		msg = e.Status
-	}
-	return fmt.Sprintf("remote sync %s: %s", e.Status, msg)
-}
-
-func httpStatusError(resp *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return &StatusError{
-		Code:   resp.StatusCode,
-		Status: resp.Status,
-		Detail: strings.TrimSpace(string(body)),
-	}
 }

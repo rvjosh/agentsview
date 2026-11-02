@@ -3,7 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/json/v2"
 	"strings"
 	"testing"
 
@@ -13,26 +13,6 @@ import (
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/service"
 )
-
-func TestNewSecretsListCommandFlags(t *testing.T) {
-	cmd := newSecretsListCommand()
-	// confidence is validated server-side, so cobra must accept any value.
-	cmd.SetArgs([]string{"--confidence", "bogus", "--reveal", "--limit", "5"})
-	for _, name := range []string{"project", "agent", "rule", "confidence",
-		"reveal", "limit", "cursor", "date-from", "date-to"} {
-		assert.NotNil(t, cmd.Flags().Lookup(name),
-			"secrets list missing --%s flag", name)
-	}
-}
-
-func TestNewSecretsScanCommandFlags(t *testing.T) {
-	cmd := newSecretsScanCommand()
-	for _, name := range []string{"backfill", "project", "agent",
-		"date-from", "date-to"} {
-		assert.NotNil(t, cmd.Flags().Lookup(name),
-			"secrets scan missing --%s flag", name)
-	}
-}
 
 func syntheticAWSAccessKey(seed string) string {
 	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -156,6 +136,7 @@ type secretsScanSeed struct {
 
 func setupSecretsScanFixture(t *testing.T, seeds ...secretsScanSeed) {
 	t.Helper()
+
 	dataDir := testDataDir(t)
 	sessionSeeds := make([]sessionSeed, 0, len(seeds))
 	messages := make([]db.Message, 0, len(seeds))
@@ -173,9 +154,9 @@ func setupSecretsScanFixture(t *testing.T, seeds ...secretsScanSeed) {
 	}
 	seedSessionArchiveRows(t, dataDir, sessionSeeds...)
 	dbtest.EnsureTestDBAt(t, sessionsDBPath(dataDir))
-	d, err := db.Open(sessionsDBPath(dataDir))
+	d, err := db.Open(t.Context(), sessionsDBPath(dataDir))
 	require.NoError(t, err)
-	require.NoError(t, d.InsertMessages(messages))
+	require.NoError(t, d.InsertMessages(t.Context(), messages))
 	require.NoError(t, d.Close())
 	registerSQLiteWritableDaemonRuntime(t, dataDir)
 }

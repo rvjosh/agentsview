@@ -1,16 +1,19 @@
 <script lang="ts">
-  import { Card, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
+  import { errorTelemetry } from "../../utils/error-telemetry.js";
+  import { Card, Table, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import { usage } from "../../stores/usage.svelte.js";
   import { m } from "../../i18n/index.js";
   import type { UsagePairwiseDimension } from "../../api/types/usage.js";
+  import type { Money } from "../../money.js";
+  import { formatMoney, formatSignedMoney } from "../../money.js";
+  import { sumSelectedTokens } from "../../stores/usageTokenTypes.js";
 
-  function fmtCost(value: number): string {
-    return `$${value.toFixed(2)}`;
-  }
-
-  function fmtSignedCost(value: number): string {
-    return `${value >= 0 ? "+" : "-"}$${Math.abs(value).toFixed(2)}`;
-  }
+  const loadingPickers = $derived(
+    !usage.summary ||
+      (usage.loading.pairwise &&
+        !usage.pairwiseSelection.left.value &&
+        !usage.pairwiseSelection.right.value),
+  );
 
   function fmtCount(value: number): string {
     return String(value);
@@ -44,9 +47,9 @@
     return `${prefix}${(value * 100).toFixed(1)}%`;
   }
 
-  function fmtMaybeCost(value: number | null | undefined): string {
+  function fmtMaybeCost(value: Money | null | undefined): string {
     if (value == null) return m.shared_none();
-    return fmtCost(value);
+    return formatMoney(value);
   }
 
   function fmtMaybeTokens(value: number | null | undefined): string {
@@ -54,9 +57,9 @@
     return fmtTokens(value);
   }
 
-  function fmtMaybeSignedCost(value: number | null | undefined): string {
+  function fmtMaybeSignedCost(value: Money | null | undefined): string {
     if (value == null) return m.shared_none();
-    return fmtSignedCost(value);
+    return formatSignedMoney(value);
   }
 
   function fmtMaybeSignedTokens(value: number | null | undefined): string {
@@ -98,6 +101,8 @@
     },
   ]);
 
+  const isTokenMode = $derived(usage.mode === "token");
+
   type MetricRow = {
     label: string;
     left: string;
@@ -114,12 +119,80 @@
   const rows = $derived.by((): MetricRow[] => {
     const comparison = usage.pairwiseComparison;
     if (!comparison) return [];
+
+    if (isTokenMode) {
+      const leftTokens = sumSelectedTokens(
+        comparison.left,
+        usage.selectedTokenTypes,
+      );
+      const rightTokens = sumSelectedTokens(
+        comparison.right,
+        usage.selectedTokenTypes,
+      );
+      const tokenDelta = rightTokens - leftTokens;
+      const tokenRatio = leftTokens === 0
+        ? null
+        : tokenDelta / leftTokens;
+      const leftPerSession = comparison.left.sessionCount > 0
+        ? leftTokens / comparison.left.sessionCount
+        : null;
+      const rightPerSession = comparison.right.sessionCount > 0
+        ? rightTokens / comparison.right.sessionCount
+        : null;
+      const perSessionDelta =
+        leftPerSession === null || rightPerSession === null
+          ? null
+          : rightPerSession - leftPerSession;
+      const perSessionRatio =
+        leftPerSession === null || leftPerSession === 0 ||
+          perSessionDelta === null
+          ? null
+          : perSessionDelta / leftPerSession;
+      return [
+        {
+          label: m.usage_pairwise_total_tokens(),
+          left: fmtTokens(leftTokens),
+          right: fmtTokens(rightTokens),
+          delta: fmtSignedTokens(tokenDelta),
+          ratio: fmtRatio(tokenRatio),
+        },
+        {
+          label: m.analytics_col_sessions(),
+          left: fmtCount(comparison.left.sessionCount),
+          right: fmtCount(comparison.right.sessionCount),
+          delta: fmtSignedCount(comparison.deltas.sessionCountDelta),
+          ratio: fmtRatio(comparison.deltas.sessionCountDeltaRatio),
+        },
+        {
+          label: m.usage_pairwise_tokens_per_session(),
+          left: fmtMaybeTokens(leftPerSession),
+          right: fmtMaybeTokens(rightPerSession),
+          delta: fmtMaybeSignedTokens(perSessionDelta),
+          ratio: fmtRatio(perSessionRatio),
+        },
+        {
+          label: m.usage_uncached_input(),
+          left: fmtTokens(comparison.left.inputTokens),
+          right: fmtTokens(comparison.right.inputTokens),
+          delta: fmtSignedTokens(comparison.deltas.inputTokensDelta),
+          ratio: fmtRatio(comparison.deltas.inputTokensDeltaRatio),
+        },
+        {
+          label: m.analytics_metric_output_tokens(),
+          left: fmtTokens(comparison.left.outputTokens),
+          right: fmtTokens(comparison.right.outputTokens),
+          delta: fmtSignedTokens(comparison.deltas.outputTokensDelta),
+          ratio: fmtRatio(comparison.deltas.outputTokensDeltaRatio),
+        },
+      ];
+    }
+
     return [
       {
         label: m.usage_total_cost(),
-        left: fmtCost(comparison.left.totalCost),
-        right: fmtCost(comparison.right.totalCost),
-        delta: fmtSignedCost(comparison.deltas.totalCostDelta),
+        left: formatMoney(comparison.left.totalCost),
+        right: formatMoney(comparison.right.totalCost),
+        delta: formatSignedMoney(comparison.deltas.totalCostDelta),
         ratio: fmtRatio(comparison.deltas.totalCostDeltaRatio),
       },
       {
@@ -151,7 +224,7 @@
         ratio: fmtRatio(comparison.deltas.tokensPerSessionRatio),
       },
       {
-        label: m.usage_input_tokens(),
+        label: m.usage_uncached_input(),
         left: fmtTokens(comparison.left.inputTokens),
         right: fmtTokens(comparison.right.inputTokens),
         delta: fmtSignedTokens(comparison.deltas.inputTokensDelta),
@@ -171,8 +244,8 @@
 <section class="pairwise-panel">
   <div class="panel-header">
     <div>
-      <h2>{m.usage_pairwise_title()}</h2>
-      <p>{m.usage_pairwise_subtitle()}</p>
+      <h2>{isTokenMode ? m.usage_pairwise_tokens_title() : m.usage_pairwise_title()}</h2>
+      <p>{isTokenMode ? m.usage_pairwise_tokens_subtitle() : m.usage_pairwise_subtitle()}</p>
     </div>
   </div>
 
@@ -184,6 +257,7 @@
           <span>{m.usage_pairwise_dimension()}</span>
           <div class="pairwise-typeahead">
             <Typeahead
+              disabled={loadingPickers}
               options={dimensionOptions}
               value={usage.pairwiseSelection.left.dimension}
               fallbackLabel={dimensionLabel(usage.pairwiseSelection.left.dimension)}
@@ -208,7 +282,7 @@
               placeholder={m.usage_pairwise_left_value()}
               title={m.usage_pairwise_left_value()}
               emptyLabel={m.usage_pairwise_no_matching_values()}
-              disabled={optionsFor(usage.pairwiseSelection.left.dimension).length === 0}
+              disabled={loadingPickers || optionsFor(usage.pairwiseSelection.left.dimension).length === 0}
               onselect={(value) =>
                 usage.setPairwiseSide("left", {
                   value,
@@ -226,6 +300,7 @@
           <span>{m.usage_pairwise_dimension()}</span>
           <div class="pairwise-typeahead">
             <Typeahead
+              disabled={loadingPickers}
               options={dimensionOptions}
               value={usage.pairwiseSelection.right.dimension}
               fallbackLabel={dimensionLabel(usage.pairwiseSelection.right.dimension)}
@@ -250,7 +325,7 @@
               placeholder={m.usage_pairwise_right_value()}
               title={m.usage_pairwise_right_value()}
               emptyLabel={m.usage_pairwise_no_matching_values()}
-              disabled={optionsFor(usage.pairwiseSelection.right.dimension).length === 0}
+              disabled={loadingPickers || optionsFor(usage.pairwiseSelection.right.dimension).length === 0}
               onselect={(value) =>
                 usage.setPairwiseSide("right", {
                   value,
@@ -264,20 +339,23 @@
 
   {#if usage.errors.pairwise}
     <Card level="default" padding="none" class="error-bar">
-      <span>{usage.errors.pairwise}</span>
-      <button class="retry-btn" onclick={() => usage.fetchAll()}>
+      <span {@attach errorTelemetry("analytics")}>{usage.errors.pairwise}</span>
+      <button
+        class="retry-btn"
+        onclick={() => usage.fetchAll({ preserveTimeRange: true })}
+      >
         {m.shared_retry()}
       </button>
     </Card>
+  {:else if usage.loading.pairwise && rows.length === 0}
+    <Card level="default" padding="none" class="pairwise-note">{m.shared_refresh()}</Card>
   {:else if !hasSelection}
     <Card level="default" padding="none" class="pairwise-note">
       {m.usage_pairwise_not_enough_data()}
     </Card>
-  {:else if usage.loading.pairwise && rows.length === 0}
-    <Card level="default" padding="none" class="pairwise-note">{m.shared_refresh()}</Card>
   {:else if rows.length > 0}
     <div class="table-wrap">
-      <table>
+      <Table bare unsorted>
         <thead>
           <tr>
             <th>{m.usage_pairwise_metric()}</th>
@@ -299,7 +377,7 @@
         <tbody>
           {#each rows as row}
             <tr>
-              <th>{row.label}</th>
+              <th scope="row">{row.label}</th>
               <td>{row.left}</td>
               <td>{row.right}</td>
               <td>
@@ -311,7 +389,7 @@
             </tr>
           {/each}
         </tbody>
-      </table>
+      </Table>
     </div>
   {/if}
 </section>
@@ -381,7 +459,7 @@
     overflow-x: auto;
   }
 
-  table {
+  .table-wrap :global(table) {
     width: 100%;
     border-collapse: collapse;
     font-size: 12px;

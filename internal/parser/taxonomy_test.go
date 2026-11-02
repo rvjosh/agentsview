@@ -30,6 +30,8 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"apply_patch", "Edit"},
 		{"write_stdin", "Bash"},
 		{"shell", "Bash"},
+		{"spawn_agent", "Task"},
+		{"spawn_subagent", "Task"},
 
 		// Gemini tools
 		{"read_file", "Read"},
@@ -67,6 +69,20 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"finishTask", "Tool"},
 		{"switchMode", "Tool"},
 
+		// Cline tools
+		{"replace_in_file", "Edit"},
+		{"list_code_definition_names", "Read"},
+		{"read_files", "Read"},
+		{"browser_action", "Tool"},
+		{"access_mcp_resource", "Tool"},
+		{"ask_followup_question", "Tool"},
+		{"attempt_completion", "Tool"},
+		{"new_task", "Task"},
+		{"team_spawn_teammate", "Task"},
+		{"team_run_task", "Task"},
+		{"team_task", "Task"},
+		{"team_shutdown_teammate", "Task"},
+
 		// Amp tools
 		{"create_file", "Write"},
 		{"look_at", "Read"},
@@ -92,6 +108,7 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"EditFile", "Edit"},
 		{"RunTerminalCommand", "Bash"},
 		{"LaunchSubagent", "Task"},
+		{"Subagent", "Task"},
 		{"WebFetch", "Tool"},
 		{"WebSearch", "Tool"},
 		{"TodoWrite", "Tool"},
@@ -130,6 +147,20 @@ func TestNormalizeToolCategory(t *testing.T) {
 		{"newTask", "Task"},
 		{"skill", "Tool"},
 		{"search", "Tool"},
+
+		// Charm Crush tools
+		// bash, view, edit, and write are covered in earlier sections.
+		{"todos", "Tool"},
+
+		{"glob_files", "Glob"},
+		{"grep_files", "Grep"},
+		{"vision", "Read"},
+		{"read_tool_result", "Read"},
+		{"capability_search", "Tool"},
+		{"install_skill", "Tool"},
+		{"mcp_select_tool", "Tool"},
+		{"mcp_features", "Tool"},
+		{"ask_user_question", "Tool"},
 
 		// Unknown
 		{"view_image", "Other"},

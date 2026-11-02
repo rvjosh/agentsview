@@ -4,6 +4,9 @@ package postgres
 
 import (
 	"context"
+	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 // TestPGPushSecrets verifies that pg push carries secret_leak_count
@@ -24,7 +28,7 @@ func TestPGPushSecrets(t *testing.T) {
 	local := testDB(t)
 	ps, err := New(
 		pgURL, "agentsview", local, "machine-secrets", true,
-		SyncOptions{},
+		storage.PusherOptions{},
 	)
 	require.NoError(t, err, "creating sync")
 	defer ps.Close()
@@ -44,8 +48,8 @@ func TestPGPushSecrets(t *testing.T) {
 		StartedAt:    &started,
 		MessageCount: 1,
 	}
-	require.NoError(t, local.UpsertSession(sess), "upsert session")
-	require.NoError(t, local.InsertMessages([]db.Message{{
+	require.NoError(t, local.UpsertSession(t.Context(), sess), "upsert session")
+	require.NoError(t, local.InsertMessages(t.Context(), []db.Message{{
 		SessionID: "secrets-sess-001",
 		Ordinal:   0,
 		Role:      "user",
@@ -67,7 +71,7 @@ func TestPGPushSecrets(t *testing.T) {
 			RulesVersion:   "v1.0",
 		},
 	}
-	require.NoError(t, local.ReplaceSessionSecretFindings(
+	require.NoError(t, local.ReplaceSessionSecretFindings(t.Context(),
 		"secrets-sess-001", findings, 1, "v1.0",
 	), "replace secret findings")
 
@@ -126,7 +130,7 @@ func TestPushSecretFindingsReportsChange(t *testing.T) {
 	local := testDB(t)
 	ps, err := New(
 		pgURL, "agentsview", local, "machine-findings-change", true,
-		SyncOptions{},
+		storage.PusherOptions{},
 	)
 	require.NoError(t, err, "creating sync")
 	defer ps.Close()
@@ -148,8 +152,8 @@ func TestPushSecretFindingsReportsChange(t *testing.T) {
 		StartedAt:    &started,
 		MessageCount: 1,
 	}
-	require.NoError(t, local.UpsertSession(sess), "upsert session")
-	require.NoError(t, local.InsertMessages([]db.Message{{
+	require.NoError(t, local.UpsertSession(t.Context(), sess), "upsert session")
+	require.NoError(t, local.InsertMessages(t.Context(), []db.Message{{
 		SessionID: sessID,
 		Ordinal:   0,
 		Role:      "user",
@@ -189,7 +193,7 @@ func TestPushSecretFindingsReportsChange(t *testing.T) {
 	assert.False(t, pushOnce(), "empty -> empty reported a change")
 
 	// Local gains a finding: the insert is a change.
-	require.NoError(t, local.ReplaceSessionSecretFindings(
+	require.NoError(t, local.ReplaceSessionSecretFindings(t.Context(),
 		sessID, []db.SecretFinding{finding}, 1, "v1.0",
 	), "seed finding")
 	assert.True(t, pushOnce(), "insert should report change")
@@ -199,7 +203,7 @@ func TestPushSecretFindingsReportsChange(t *testing.T) {
 	assert.True(t, pushOnce(), "rewrite should report change")
 
 	// Clearing local findings deletes the PG row: that is a change.
-	require.NoError(t, local.ReplaceSessionSecretFindings(
+	require.NoError(t, local.ReplaceSessionSecretFindings(t.Context(),
 		sessID, nil, 0, "v1.0",
 	), "clear findings")
 	assert.True(t, pushOnce(), "delete should report change")
@@ -208,29 +212,32 @@ func TestPushSecretFindingsReportsChange(t *testing.T) {
 	assert.False(t, pushOnce(), "post-clear empty -> empty reported a change")
 }
 
-func TestPGConnectivity(t *testing.T) {
+// TestPGPassfileConnects verifies that the passfile URL parameter survives
+// the connection settings Open adds.
+func TestPGPassfileConnects(t *testing.T) {
 	pgURL := testPGURL(t)
+	u, err := url.Parse(pgURL)
+	require.NoError(t, err)
+	password, ok := u.User.Password()
+	if !ok || password == "" {
+		t.Skip("TEST_PG_URL carries no password to move into a passfile")
+	}
+	u.User = url.User(u.User.Username())
+	t.Setenv("PGPASSWORD", "")
+	passfile := filepath.Join(t.TempDir(), "pgpass")
+	require.NoError(t, os.WriteFile(passfile,
+		[]byte("*:*:*:*:"+password+"\n"), 0o600))
 
-	local := testDB(t)
-	ps, err := New(
-		pgURL, "agentsview", local,
-		"connectivity-test-machine", true,
-		SyncOptions{},
-	)
-	require.NoError(t, err, "creating sync")
-	defer ps.Close()
-
-	ctx, cancel := context.WithTimeout(
-		context.Background(), 10*time.Second,
-	)
-	defer cancel()
-
-	require.NoError(t, ps.EnsureSchema(ctx), "ensure schema")
-
-	status, err := ps.Status(ctx)
-	require.NoError(t, err, "get status")
-
-	t.Logf("PG Sync Status: %+v", status)
+	t.Run("passfile parameter", func(t *testing.T) {
+		t.Setenv("PGPASSFILE", "")
+		q := u.Query()
+		q.Set("passfile", passfile)
+		withParam := *u
+		withParam.RawQuery = q.Encode()
+		pg, err := Open(withParam.String(), "agentsview", true)
+		require.NoError(t, err)
+		assert.NoError(t, pg.Close())
+	})
 }
 
 func TestPGPushCycle(t *testing.T) {
@@ -242,7 +249,7 @@ func TestPGPushCycle(t *testing.T) {
 	local := testDB(t)
 	ps, err := New(
 		pgURL, "agentsview", local, "machine-a", true,
-		SyncOptions{},
+		storage.PusherOptions{},
 	)
 	require.NoError(t, err, "creating sync")
 	defer ps.Close()
@@ -261,8 +268,8 @@ func TestPGPushCycle(t *testing.T) {
 		StartedAt:    &started,
 		MessageCount: 1,
 	}
-	require.NoError(t, local.UpsertSession(sess), "upsert session")
-	require.NoError(t, local.InsertMessages([]db.Message{{
+	require.NoError(t, local.UpsertSession(t.Context(), sess), "upsert session")
+	require.NoError(t, local.InsertMessages(t.Context(), []db.Message{{
 		SessionID: "pg-sess-001",
 		Ordinal:   0,
 		Role:      "user",

@@ -1,10 +1,10 @@
 package parser
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,21 +18,15 @@ func assertDevinErrorRedacted(t *testing.T, err error, secretFragments ...string
 	}
 }
 
-func TestDevinProviderCapabilities(t *testing.T) {
-	caps := devinProviderCapabilities()
-	assert.Equal(t, CapabilitySupported, caps.Content.PerMessageTokenUsage)
-	assert.Equal(t, CapabilityUnsupported, caps.Content.AggregateUsageEvents)
-}
-
 func TestDevinProviderDiscoverFindParse(t *testing.T) {
 	const sessionID = "session-123"
 	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{
-		ID:                 sessionID,
-		Title:              "DB title wins",
-		WorkingDirectory:   "/Users/alice/code/my-app",
-		Model:              "db-model",
-		CreatedAtMillis:    new(int64(1704103199000)),
-		LastActivityMillis: new(int64(1704103265000)),
+		ID:               sessionID,
+		Title:            "DB title wins",
+		WorkingDirectory: "/Users/alice/code/my-app",
+		Model:            "db-model",
+		CreatedAt:        new(int64(1704103199)),
+		LastActivityAt:   new(int64(1704103265)),
 	}, `{
 		"agent":{"model_name":"devin-1"},
 		"steps":[
@@ -46,28 +40,27 @@ func TestDevinProviderDiscoverFindParse(t *testing.T) {
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}, Machine: "devbox"})
 	require.True(t, ok)
 
-	plan, err := provider.WatchPlan(context.Background())
+	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
 	require.Len(t, plan.Roots, 2)
 	assert.Equal(t, filepath.Join(root, "cli"), plan.Roots[0].Path)
 	assert.False(t, plan.Roots[0].Recursive)
-	assert.ElementsMatch(t,
-		[]string{devinDBFilename, devinDBFilename + "-*"},
+	assert.ElementsMatch(t, []string{devinDBFilename, devinDBFilename + "-*"},
 		plan.Roots[0].IncludeGlobs,
 	)
 	assert.Equal(t, filepath.Join(root, "cli", "transcripts"), plan.Roots[1].Path)
 	assert.False(t, plan.Roots[1].Recursive)
 	assert.Equal(t, []string{"*.json"}, plan.Roots[1].IncludeGlobs)
 
-	discovered, err := provider.Discover(context.Background())
+	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
 	assert.Equal(t, virtualPath, discovered[0].Key)
 	assert.Equal(t, virtualPath, discovered[0].DisplayPath)
 	assert.Equal(t, virtualPath, discovered[0].FingerprintKey)
-	assert.Equal(t, int64(1704103265000000000), discovered[0].DiscoveryMTimeNS)
+	assert.Equal(t, int64(1704103265_000_000_000), discovered[0].DiscoveryMTimeNS)
 
-	changed, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
+	changed, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
 		Path:      filepath.Join(root, "cli", "transcripts", sessionID+".json"),
 		EventKind: "write",
 		WatchRoot: filepath.Join(root, "cli", "transcripts"),
@@ -76,26 +69,26 @@ func TestDevinProviderDiscoverFindParse(t *testing.T) {
 	require.Len(t, changed, 1)
 	assert.Equal(t, virtualPath, changed[0].DisplayPath)
 
-	fullIDSource, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	fullIDSource, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		FullSessionID: "host~devin:" + sessionID,
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, virtualPath, fullIDSource.DisplayPath)
 
-	storedSource, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	storedSource, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		StoredFilePath: virtualPath,
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, virtualPath, storedSource.DisplayPath)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), storedSource)
+	fingerprint, err := provider.Fingerprint(t.Context(), storedSource)
 	require.NoError(t, err)
 	assert.Equal(t, virtualPath, fingerprint.Key)
 	assert.NotZero(t, fingerprint.MTimeNS)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: storedSource})
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: storedSource})
 	require.NoError(t, err)
 	require.True(t, outcome.ResultSetComplete)
 	require.True(t, outcome.ForceReplace)
@@ -111,8 +104,8 @@ func TestDevinProviderDiscoverFindParse(t *testing.T) {
 func TestDevinProviderDBEventsFanOutAndPreserveTombstones(t *testing.T) {
 	const liveSessionID = "session-live"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: liveSessionID, Title: "Live", WorkingDirectory: "/tmp/live", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))},
-		devinSessionRow{ID: "session-deleted", Title: "Deleted", WorkingDirectory: "/tmp/deleted", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103264000))},
+		devinSessionRow{ID: liveSessionID, Title: "Live", WorkingDirectory: "/tmp/live", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
+		devinSessionRow{ID: "session-deleted", Title: "Deleted", WorkingDirectory: "/tmp/deleted", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103264))},
 	)
 	fixture.writeTranscript(t, liveSessionID, `{"steps":[]}`)
 	root := fixture.Root
@@ -124,8 +117,8 @@ func TestDevinProviderDBEventsFanOutAndPreserveTombstones(t *testing.T) {
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	for _, changedPath := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
-		changed, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
+	for _, changedPath := range []string{dbPath, dbPath + "-wal"} {
+		changed, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
 			Path:              changedPath,
 			EventKind:         "write",
 			WatchRoot:         filepath.Join(root, "cli"),
@@ -143,8 +136,8 @@ func TestDevinProviderDBEventsFanOutAndPreserveTombstones(t *testing.T) {
 func TestDevinProviderTranscriptEventsTargetLiveOrStoredSession(t *testing.T) {
 	const liveSessionID = "session-live"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: liveSessionID, Title: "Live", WorkingDirectory: "/tmp/live", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))},
-		devinSessionRow{ID: "session-deleted", Title: "Deleted", WorkingDirectory: "/tmp/deleted", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103264000))},
+		devinSessionRow{ID: liveSessionID, Title: "Live", WorkingDirectory: "/tmp/live", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
+		devinSessionRow{ID: "session-deleted", Title: "Deleted", WorkingDirectory: "/tmp/deleted", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103264))},
 	)
 	fixture.writeTranscript(t, liveSessionID, `{"steps":[]}`)
 	root := fixture.Root
@@ -156,7 +149,7 @@ func TestDevinProviderTranscriptEventsTargetLiveOrStoredSession(t *testing.T) {
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	liveChanged, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
+	liveChanged, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
 		Path:      filepath.Join(root, "cli", "transcripts", liveSessionID+".json"),
 		EventKind: "write",
 		WatchRoot: filepath.Join(root, "cli", "transcripts"),
@@ -165,7 +158,7 @@ func TestDevinProviderTranscriptEventsTargetLiveOrStoredSession(t *testing.T) {
 	require.Len(t, liveChanged, 1)
 	assert.Equal(t, liveVirtualPath, liveChanged[0].DisplayPath)
 
-	deletedChanged, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
+	deletedChanged, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
 		Path:              filepath.Join(root, "cli", "transcripts", "session-deleted.json"),
 		EventKind:         "write",
 		WatchRoot:         filepath.Join(root, "cli", "transcripts"),
@@ -178,7 +171,7 @@ func TestDevinProviderTranscriptEventsTargetLiveOrStoredSession(t *testing.T) {
 
 func TestDevinProviderRejectsUnrelatedChangedPaths(t *testing.T) {
 	const sessionID = "session-123"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
@@ -187,6 +180,12 @@ func TestDevinProviderRejectsUnrelatedChangedPaths(t *testing.T) {
 	for _, req := range []ChangedPathRequest{
 		{
 			Path:      filepath.Join(root, "cli", "sessions.db-backup"),
+			EventKind: "write",
+			WatchRoot: filepath.Join(root, "cli"),
+		},
+		{
+			// The provider's own read connection rewrites the -shm index.
+			Path:      filepath.Join(root, "cli", devinDBFilename+"-shm"),
 			EventKind: "write",
 			WatchRoot: filepath.Join(root, "cli"),
 		},
@@ -206,7 +205,7 @@ func TestDevinProviderRejectsUnrelatedChangedPaths(t *testing.T) {
 			WatchRoot: filepath.Join(root, "other"),
 		},
 	} {
-		changed, err := provider.SourcesForChangedPath(context.Background(), req)
+		changed, err := provider.SourcesForChangedPath(t.Context(), req)
 		require.NoError(t, err)
 		assert.Empty(t, changed, "%+v", req)
 	}
@@ -215,21 +214,21 @@ func TestDevinProviderRejectsUnrelatedChangedPaths(t *testing.T) {
 func TestDevinProviderMissingTranscriptUsesMessageNodeFallback(t *testing.T) {
 	const sessionID = "session-db-only"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/db-only-project", Model: "db-only-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))},
+		devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/db-only-project", Model: "db-only-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))},
 	)
 	root := fixture.Root
 	fixture.insertMessageNodes(t,
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"fallback user"}`, CreatedAtMillis: 1704103201000},
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ChatMessage: `{"role":"assistant","content":"fallback assistant"}`, CreatedAtMillis: 1704103205000},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"fallback user"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ChatMessage: `{"role":"assistant","content":"fallback assistant"}`, CreatedAt: 1704103205},
 	)
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}, Machine: "devbox"})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
-	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: source})
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
 	require.NoError(t, err)
 	assert.True(t, outcome.ResultSetComplete)
 	assert.True(t, outcome.ForceReplace)
@@ -243,41 +242,41 @@ func TestDevinProviderMissingTranscriptUsesMessageNodeFallback(t *testing.T) {
 func TestDevinProviderMissingTranscriptWithoutDBMessagesReturnsProviderError(t *testing.T) {
 	const sessionID = "session-db-only-empty"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/db-only-project", Model: "db-only-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))},
+		devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/db-only-project", Model: "db-only-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))},
 	)
 	root := fixture.Root
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}, Machine: "devbox"})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
-	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: source})
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
 	require.Error(t, err)
 	assert.Empty(t, outcome.Results)
 	assert.Empty(t, outcome.SourceErrors)
-	assert.ErrorContains(t, err, "missing devin transcript")
+	require.ErrorContains(t, err, "missing devin transcript")
 	assert.NotContains(t, err.Error(), source.DisplayPath)
 	assert.NotContains(t, err.Error(), sessionID)
 }
 
 func TestDevinProviderCompositeFingerprintStableAndRedacted(t *testing.T) {
 	const sessionID = "session-fingerprint"
-	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Stable title", WorkingDirectory: "/Users/alice/.config/devin/project", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000)), MetadataJSON: `{"token_hint":"redacted"}`}, `{"token":"secret-token-123","steps":[{"step_id":"step-1","source":"user","message":"hello"}]}`)
+	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Stable title", WorkingDirectory: "/Users/alice/.config/devin/project", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209)), MetadataJSON: `{"token_hint":"redacted"}`}, `{"token":"secret-token-123","steps":[{"step_id":"step-1","source":"user","message":"hello"}]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	first, err := provider.Fingerprint(context.Background(), source)
+	first, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
-	second, err := provider.Fingerprint(context.Background(), source)
+	second, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 
 	assert.Equal(t, first, second)
@@ -291,17 +290,17 @@ func TestDevinProviderCompositeFingerprintStableAndRedacted(t *testing.T) {
 
 func TestDevinProviderFingerprintChangesWhenTranscriptChangesWithoutDBMetadataChange(t *testing.T) {
 	const sessionID = "session-transcript-change"
-	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Transcript change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))}, `{"steps":[{"step_id":"step-1","source":"user","message":"alpha"}]}`)
+	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Transcript change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))}, `{"steps":[{"step_id":"step-1","source":"user","message":"alpha"}]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	before, err := provider.Fingerprint(context.Background(), source)
+	before, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 	transcriptInfo, err := os.Stat(transcriptPath)
 	require.NoError(t, err)
@@ -309,7 +308,7 @@ func TestDevinProviderFingerprintChangesWhenTranscriptChangesWithoutDBMetadataCh
 	require.NoError(t, os.WriteFile(transcriptPath, []byte(`{"steps":[{"step_id":"step-1","source":"user","message":"omega"}]}`), 0o644))
 	require.NoError(t, os.Chtimes(transcriptPath, transcriptInfo.ModTime(), transcriptInfo.ModTime()))
 
-	after, err := provider.Fingerprint(context.Background(), source)
+	after, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 
 	assert.Equal(t, before.Key, after.Key)
@@ -319,47 +318,54 @@ func TestDevinProviderFingerprintChangesWhenTranscriptChangesWithoutDBMetadataCh
 
 func TestDevinProviderFingerprintChangesWhenLastActivityChanges(t *testing.T) {
 	const sessionID = "session-last-activity"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "DB change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))}, `{"steps":[]}`)
+	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "DB change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
+	// Keep filesystem timestamps older than the session activity so the
+	// fingerprint change measures metadata, independent of filesystem timing.
+	fileTime := time.Unix(1704103200, 0)
+	require.NoError(t, os.Chtimes(dbPath, fileTime, fileTime))
+	require.NoError(t, os.Chtimes(transcriptPath, fileTime, fileTime))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	before, err := provider.Fingerprint(context.Background(), source)
+	before, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 
-	execDevinTestSQL(t, dbPath, `UPDATE sessions SET last_activity_at = 1704103215000 WHERE id = 'session-last-activity'`)
+	execDevinTestSQL(t, dbPath, `UPDATE sessions SET last_activity_at = 1704103215 WHERE id = 'session-last-activity'`)
+	require.NoError(t, os.Chtimes(dbPath, fileTime, fileTime))
 
-	after, err := provider.Fingerprint(context.Background(), source)
+	after, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 
 	assert.Equal(t, before.Key, after.Key)
-	assert.Greater(t, after.MTimeNS, before.MTimeNS)
+	assert.Equal(t, int64(1704103209000000000), before.MTimeNS)
+	assert.Equal(t, int64(1704103215000000000), after.MTimeNS)
 	assert.NotEqual(t, before.Hash, after.Hash)
 }
 
 func TestDevinProviderFingerprintChangesWhenWorkingDirectoryChanges(t *testing.T) {
 	const sessionID = "session-cwd-change"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "CWD change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "CWD change", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	before, err := provider.Fingerprint(context.Background(), source)
+	before, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 
 	execDevinTestSQL(t, dbPath, `UPDATE sessions SET working_directory = '/tmp/renamed-app' WHERE id = 'session-cwd-change'`)
 
-	after, err := provider.Fingerprint(context.Background(), source)
+	after, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 
 	assert.Equal(t, before.Key, after.Key)
@@ -368,7 +374,7 @@ func TestDevinProviderFingerprintChangesWhenWorkingDirectoryChanges(t *testing.T
 
 func TestDevinProviderFingerprintWithoutTranscriptUsesDBFreshnessOnly(t *testing.T) {
 	const sessionID = "session-missing-transcript"
-	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))}, `{"steps":[]}`)
+	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "DB only session", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
 	require.NoError(t, os.Remove(transcriptPath))
@@ -376,11 +382,11 @@ func TestDevinProviderFingerprintWithoutTranscriptUsesDBFreshnessOnly(t *testing
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), source)
+	fingerprint, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 
 	assert.Equal(t, virtualPath, fingerprint.Key)
@@ -393,25 +399,61 @@ func TestDevinProviderFingerprintWithoutTranscriptUsesDBFreshnessOnly(t *testing
 func TestDevinProviderFingerprintWithoutTranscriptChangesWhenMessageNodesChange(t *testing.T) {
 	const sessionID = "session-message-node-change"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: sessionID, Title: "DB messages", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103200000)), LastActivityMillis: new(int64(1704103209000))},
+		devinSessionRow{ID: sessionID, Title: "DB messages", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103200)), LastActivityAt: new(int64(1704103209))},
 	)
 	fixture.insertMessageNodes(t,
-		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"alpha"}`, CreatedAtMillis: 1704103201000},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"alpha"}`, CreatedAt: 1704103201},
 	)
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{fixture.Root}})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	before, err := provider.Fingerprint(context.Background(), source)
+	before, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 
 	execDevinTestSQL(t, fixture.DBPath, `UPDATE message_nodes SET chat_message = '{"role":"user","content":"omega"}' WHERE session_id = 'session-message-node-change'`)
 
-	after, err := provider.Fingerprint(context.Background(), source)
+	after, err := provider.Fingerprint(t.Context(), source)
+	require.NoError(t, err)
+
+	assert.Equal(t, before.Key, after.Key)
+	assert.NotEqual(t, before.Hash, after.Hash)
+}
+
+func TestDevinProviderFingerprintWithoutTranscriptChangesWhenMainChainChanges(t *testing.T) {
+	const sessionID = "session-main-chain-change"
+	fixture := newDevinTestFixture(t,
+		devinSessionRow{
+			ID:               sessionID,
+			Title:            "DB messages",
+			WorkingDirectory: "/tmp/app",
+			Model:            "db-model",
+			CreatedAt:        new(int64(1704103200)),
+			LastActivityAt:   new(int64(1704103209)),
+			MainChainID:      new(int64(2)),
+		},
+	)
+	fixture.insertMessageNodes(t,
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 1, ChatMessage: `{"role":"user","content":"question"}`, CreatedAt: 1704103201},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 2, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","content":"first branch"}`, CreatedAt: 1704103205},
+		devinSyntheticMessageNodeRow{SessionID: sessionID, NodeID: 3, ParentNodeID: new(int64(1)), ChatMessage: `{"role":"assistant","content":"second branch"}`, CreatedAt: 1704103205},
+	)
+
+	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{fixture.Root}})
+	require.True(t, ok)
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	before, err := provider.Fingerprint(t.Context(), source)
+	require.NoError(t, err)
+	execDevinTestSQL(t, fixture.DBPath,
+		`UPDATE sessions SET main_chain_id = 3 WHERE id = 'session-main-chain-change'`)
+	after, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 
 	assert.Equal(t, before.Key, after.Key)
@@ -421,8 +463,8 @@ func TestDevinProviderFingerprintWithoutTranscriptChangesWhenMessageNodesChange(
 func TestDevinProviderRejectsInvalidStoredVirtualPaths(t *testing.T) {
 	const sessionID = "session-123"
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))},
-		devinSessionRow{ID: "session-999", Title: "Other", WorkingDirectory: "/tmp/other", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))},
+		devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
+		devinSessionRow{ID: "session-999", Title: "Other", WorkingDirectory: "/tmp/other", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
 	)
 	fixture.writeTranscript(t, sessionID, `{"steps":[]}`)
 	root := fixture.Root
@@ -439,7 +481,7 @@ func TestDevinProviderRejectsInvalidStoredVirtualPaths(t *testing.T) {
 		filepath.Join(root, devinDBFilename) + "#" + sessionID,
 		filepath.Join(root, "cli", "nested", devinDBFilename) + "#" + sessionID,
 	} {
-		_, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+		_, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 			StoredFilePath:     path,
 			RequireFreshSource: true,
 		})
@@ -447,7 +489,7 @@ func TestDevinProviderRejectsInvalidStoredVirtualPaths(t *testing.T) {
 		assert.False(t, ok, "stored path %q", path)
 	}
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID:       sessionID,
 		StoredFilePath:     otherPath,
 		RequireFreshSource: true,
@@ -459,33 +501,33 @@ func TestDevinProviderRejectsInvalidStoredVirtualPaths(t *testing.T) {
 
 func TestDevinProviderDedupesDuplicateRoots(t *testing.T) {
 	const sessionID = "session-123"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root, root, filepath.Join(root, ".")}})
 	require.True(t, ok)
 
-	discovered, err := provider.Discover(context.Background())
+	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
 }
 
 func TestDevinProviderDeletedRowFingerprintsTombstoneAndSkips(t *testing.T) {
 	const sessionID = "session-123"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, virtualPath, source.DisplayPath)
 	execDevinTestSQL(t, dbPath, `DELETE FROM sessions WHERE id = 'session-123'`)
 
-	changed, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
+	changed, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
 		Path:              dbPath,
 		EventKind:         "write",
 		WatchRoot:         filepath.Join(root, "cli"),
@@ -494,11 +536,11 @@ func TestDevinProviderDeletedRowFingerprintsTombstoneAndSkips(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, changed, 1)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), changed[0])
+	fingerprint, err := provider.Fingerprint(t.Context(), changed[0])
 	require.NoError(t, err)
 	assert.Equal(t, SourceFingerprint{Key: virtualPath}, fingerprint)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: changed[0]})
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: changed[0]})
 	require.NoError(t, err)
 	assert.True(t, outcome.ResultSetComplete)
 	assert.True(t, outcome.ForceReplace)
@@ -508,20 +550,20 @@ func TestDevinProviderDeletedRowFingerprintsTombstoneAndSkips(t *testing.T) {
 
 func TestDevinProviderHiddenRowFingerprintsTombstoneAndSkips(t *testing.T) {
 	const sessionID = "session-hidden"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000)), Hidden: false}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265)), Hidden: false}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, virtualPath, source.DisplayPath)
 	execDevinTestSQL(t, dbPath, `UPDATE sessions SET hidden = 1 WHERE id = 'session-hidden'`)
 
-	changed, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
+	changed, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
 		Path:              dbPath,
 		EventKind:         "write",
 		WatchRoot:         filepath.Join(root, "cli"),
@@ -530,11 +572,11 @@ func TestDevinProviderHiddenRowFingerprintsTombstoneAndSkips(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, changed, 1)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), changed[0])
+	fingerprint, err := provider.Fingerprint(t.Context(), changed[0])
 	require.NoError(t, err)
 	assert.Equal(t, SourceFingerprint{Key: virtualPath}, fingerprint)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: changed[0]})
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: changed[0]})
 	require.NoError(t, err)
 	assert.True(t, outcome.ResultSetComplete)
 	assert.True(t, outcome.ForceReplace)
@@ -544,22 +586,22 @@ func TestDevinProviderHiddenRowFingerprintsTombstoneAndSkips(t *testing.T) {
 
 func TestDevinProviderCorruptTranscriptReturnsProviderError(t *testing.T) {
 	const sessionID = "session-corrupt"
-	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Corrupt transcript", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))}, `{"steps":[]}`)
+	dbPath, transcriptPath := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Corrupt transcript", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	require.NoError(t, os.WriteFile(transcriptPath, []byte(`{"secret":"token-123","steps":[`), 0o644))
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: source})
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
 	assert.Empty(t, outcome.Results)
 	assert.Empty(t, outcome.SourceErrors)
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "invalid devin transcript")
+	require.ErrorContains(t, err, "invalid devin transcript")
 	assert.NotContains(t, err.Error(), transcriptPath)
 	assert.NotContains(t, err.Error(), sessionID)
 	assert.NotContains(t, err.Error(), "token-123")
@@ -571,7 +613,7 @@ func TestDevinProviderIgnoresCredentialPathsAndRedactsSecretBearingErrors(t *tes
 		secretSentinel = "oauth-token-SYNTHETIC-SECRET-SENTINEL"
 	)
 	fixture := newDevinTestFixture(t,
-		devinSessionRow{ID: sessionID, Title: "Privacy", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))},
+		devinSessionRow{ID: sessionID, Title: "Privacy", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))},
 	)
 	transcriptPath := fixture.writeTranscript(t, sessionID, `{"api_key":"oauth-token-SYNTHETIC-SECRET-SENTINEL","steps":[`)
 
@@ -600,21 +642,21 @@ func TestDevinProviderIgnoresCredentialPathsAndRedactsSecretBearingErrors(t *tes
 			WatchRoot: filepath.Join(secretRoot, "cli"),
 		},
 	} {
-		changed, err := provider.SourcesForChangedPath(context.Background(), req)
+		changed, err := provider.SourcesForChangedPath(t.Context(), req)
 		require.NoError(t, err)
 		assert.Empty(t, changed, "%+v", req)
 	}
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{RawSessionID: sessionID})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{RawSessionID: sessionID})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, VirtualSourcePath(dbPath, sessionID), source.DisplayPath)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: source})
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
 	assert.Empty(t, outcome.Results)
 	assert.Empty(t, outcome.SourceErrors)
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "invalid devin transcript")
+	require.ErrorContains(t, err, "invalid devin transcript")
 	assertDevinErrorRedacted(t, err,
 		secretSentinel,
 		"mcp/oauth",
@@ -626,19 +668,19 @@ func TestDevinProviderIgnoresCredentialPathsAndRedactsSecretBearingErrors(t *tes
 
 func TestDevinProviderMissingDBSkipsAndPreservesSessions(t *testing.T) {
 	const sessionID = "session-123"
-	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAtMillis: new(int64(1704103199000)), LastActivityMillis: new(int64(1704103265000))}, `{"steps":[]}`)
+	dbPath, _ := newDevinSessionFixture(t, devinSessionRow{ID: sessionID, Title: "Title", WorkingDirectory: "/tmp/app", Model: "db-model", CreatedAt: new(int64(1704103199)), LastActivityAt: new(int64(1704103265))}, `{"steps":[]}`)
 	root := filepath.Dir(filepath.Dir(dbPath))
 	virtualPath := VirtualSourcePath(dbPath, sessionID)
 
 	provider, ok := NewProvider(AgentDevin, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
 
-	source, ok, err := provider.FindSource(context.Background(), FindSourceRequest{StoredFilePath: virtualPath})
+	source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{StoredFilePath: virtualPath})
 	require.NoError(t, err)
 	require.True(t, ok)
 
 	require.NoError(t, os.Remove(dbPath))
-	changed, err := provider.SourcesForChangedPath(context.Background(), ChangedPathRequest{
+	changed, err := provider.SourcesForChangedPath(t.Context(), ChangedPathRequest{
 		Path:              dbPath,
 		EventKind:         "remove",
 		WatchRoot:         filepath.Join(root, "cli"),
@@ -647,11 +689,11 @@ func TestDevinProviderMissingDBSkipsAndPreservesSessions(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, changed, 1)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), source)
+	fingerprint, err := provider.Fingerprint(t.Context(), source)
 	require.NoError(t, err)
 	assert.Equal(t, SourceFingerprint{Key: virtualPath}, fingerprint)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{Source: changed[0]})
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: changed[0]})
 	require.NoError(t, err)
 	assert.True(t, outcome.ResultSetComplete)
 	assert.False(t, outcome.ForceReplace)
